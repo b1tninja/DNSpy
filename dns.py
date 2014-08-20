@@ -35,7 +35,7 @@ class DomainName(object):
         while (data[offset]):
             if data[offset] < 64:
                 label = data[offset + 1:offset + 1 + data[offset]].decode('ascii')
-                assert (allowed_charset.issuperset(label))
+                assert(allowed_charset.issuperset(label))
                 offset += data[offset]
                 sequence.append(label)
             elif data[offset] >= 0b11000000:
@@ -172,7 +172,7 @@ class DnsPacket(object):
         # Query/Response 1
         QR = (data[2] & 0b1000000)
         # OpCode 4
-        OPCODE = DnsOpCode((data[2] & 0b01111000))
+        OPCODE = DnsOpCode((data[2] & 0b01111000) >> 3)
         # Authoratative Answer 1
         AA = data[2] & 0b100 != 0
         # Truncation 1
@@ -256,7 +256,6 @@ class Response(DnsPacket):
 
 class DnsServer:
     def connection_made(self, transport):
-        print('DNSpy listening on ', transport)
         self.transport = transport
 
     def datagram_received(self, data, addr):
