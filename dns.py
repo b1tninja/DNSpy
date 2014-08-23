@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 # setcap cap_net_bind_service=+ep /usr/bin/python3.4
+from dns_packet import DnsRecord, DnsPacket, Response
 
 __author__ = 'Justin Capella'
 
-from enums import DnsResponseCode, DnsOpCode, DnsRType, DnsQType, DnsRClass, DnsQClass, DnsQR
+from enums import DnsResponseCode, DnsOpCode, DnsQR
 
+from dns_packet import *
 
-import string
-import struct
-import binascii
+from contextlib import closing
+
 import random
-
 import asyncio
+import urllib.request
+
+import re
+import os
+import logging
+import mysql.connector
+
+import ipaddress
+
+console = logging.StreamHandler()
+console.setLevel(logging.DEBUG)
+
+console.setFormatter(logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s'))
 
 
 try:
@@ -19,274 +32,291 @@ try:
 except ImportError:
     signal = None
 
+class Nameserver(DomainName):
+    pass
+    #TODO: would be nice if nameservers could get a database context to look up their address records... maybe
 
-class DomainName(object):
-    def __init__(self, sequence):
-        assert (isinstance(sequence, list))
-        self.sequence = sequence
+class DnsResolver(asyncio.Protocol):
+    loop = asyncio.get_event_loop()
 
-    def __str__(self):
-        return '.'.join(self.sequence)
+    def record_reader(self, root_hints_path):
+        with open(root_hints_path,'r') as root_hints_file:
+            for line in root_hints_file:
+                if not line or line[0] == ';':
+                    continue
+                tokens = re.split(r'\s*\s',line.rstrip())
+                if len(tokens) == 5:
+                    (name, ttl, rclass, rtype, rdata) = tokens
+                    rclass = DnsRClass[rclass]
+                elif len(tokens) == 4:
+                    (name, ttl, rtype, rdata) = tokens
+                    rclass = DnsRClass.IN  # lets just assume
+                else:
+                    continue # Don't know what this is
+                try:
+                    rtype = DnsRType[rtype]
+                    ttl = int(ttl)
+                except ValueError:
+                    self.log.critical('Malformed glue records.')
+                    continue
 
-    @staticmethod
-    def parse(data, offset):
-        allowed_charset = set(string.ascii_letters + string.digits + '-')
-        sequence = []
-        while (data[offset]):
-            if data[offset] < 64:
-                label = data[offset + 1:offset + 1 + data[offset]].decode('ascii')
-                assert(allowed_charset.issuperset(label))
-                offset += data[offset]
-                sequence.append(label)
-            elif data[offset] >= 0b11000000:
-                # pointer
-                assert (data[data[offset]] < 64)  # Don't allow pointers to pointers
-                # TODO: shouldn't allow pointing to 'same label offset' either
-                (label, n,) = DomainName.parse(data, data[offset] & 0b111111)  # RECURSE
-                sequence.extend(label)
-            else:
-                raise Exception('Unknown/Invalid DNS Label')
+                name = DomainName.from_string(name)
+                if rtype == DnsRType.NS:
+                    record = DnsRecord(name,rtype,rclass,ttl,rdata=DomainName.from_string(rdata).encode())
+                elif rtype == DnsRType.A:
+                    record = DnsRecord(name,rtype,rclass,ttl,rdata=ipaddress.IPv4Address(rdata).packed)
+                elif rtype == DnsRType.AAAA:
+                    record = DnsRecord(name,rtype,rclass,ttl,rdata=ipaddress.IPv6Address(rdata).packed)
+                self.log.debug('Glue record: %s' % record)
+                yield record
 
-            offset += 1
-            assert (sum(map(len, sequence)) < 256)
-
-        else:
-            offset += 1  # consume the null terminator
-            return (DomainName(sequence), offset,)
-
-        # Should not reach the following...
-        raise Exception('Malformed DNS label')
-
-    def encode(self):
-        data = bytearray()
-        for label in self.sequence:
-            data.append(len(label))
-            if label:
-                data.extend(bytes(label, 'ascii'))
-            else:
-                # Root Label
-                break
-        data.append(0)
-        return data
-
-class DnsQuestion(object):
-    def __init__(self, qname, qtype=DnsQType.ANY, qclass=DnsRClass.IN):
-        self.name = qname
-        self.qtype = qtype
-        self.qclass = qclass
-
-    @staticmethod
-    def parse(data, offset):
-        (name, offset) = DomainName.parse(data, offset)
-        (qtype, qclass,) = struct.unpack_from('!HH', data, offset)
-        offset += 4
-
-        try:
-            qtype = DnsQType(qtype)
-            qclass = DnsQClass(qclass)
-        except ValueError:
-            pass
-
-        return (DnsQuestion(name, qtype, qclass), offset,)
-
-    def __repr__(self):
-        return "<DnsQuestion:%s,%s,%s>" % (self.name, self.qtype, self.qclass)
-
-    def encode(self):
-        return self.name.encode() + struct.pack('!HH', self.qtype, self.qclass)
-
-class DnsRecord(object):
-    def __init__(self, name, rtype=DnsRType.A, rclass=DnsRClass.IN , ttl=0, rdlength=None, rdata=b""):
-        if rdlength is None:
-            rdlength = len(rdata)
-
-        self.name = name
-        self.rtype = rtype
-        self.rclass = rclass
-        self.ttl = ttl
-        self.rdlength = rdlength
-        self.rdata = rdata
-        assert (len(rdata) == rdlength)
-
-    @staticmethod
-    def parse(data, offset):
-        (name, offset) = DomainName.parse(data, offset)
-        (rtype, rclass, ttl, rdlength) = struct.unpack_from('!HHIH', data, offset)
-        offset += 10
-        rdata = data[offset:offset + rdlength]
-        offset += rdlength
-
-        try:
-            rtype = DnsRType(rtype)
-            rclass = DnsRClass(rclass)
-        except ValueError:
-            pass
-
-        return (DnsRecord(name, rtype, rclass, ttl, rdlength, rdata), offset,)
-
-    def __repr__(self):
-        return "<Record:%s,%s,%s,%d,%d,%s>" % (
-        self.name, self.rtype, self.rclass, self.ttl, self.rdlength, binascii.b2a_hex(self.rdata))
-
-    def encode(self):
-        return self.name.encode() + struct.pack('!HHIH', self.rtype, self.rclass, self.ttl, self.rdlength) + self.rdata
-
-class DnsPacket(object):
-
-    def __init__(self, ID=random.getrandbits(16), QR=DnsQR.query, OPCODE=DnsOpCode.query, AA = False, TC = False, RD = True, RA = True, Z = 0, RCODE=DnsResponseCode.no_error, QDCOUNT=None, ANCOUNT=None, NSCOUNT=None, ARCOUNT=None, questions=[], answers=[], nameservers=[], additional_records=[]):
-        if QDCOUNT is None:
-            QDCOUNT = len(questions)
-        if ANCOUNT is None:
-            ANCOUNT = len(answers)
-        if NSCOUNT is None:
-            NSCOUNT = len(nameservers)
-        if ARCOUNT is None:
-            ARCOUNT = len(additional_records)
-
-        self.ID = ID
-        self.QR = QR
-        self.OPCODE = OPCODE
-        self.AA = AA
-        self.TC = TC
-        self.RD = RD
+    def __init__(self, db, RA=False):
+        self.queue = {}
+        self.db = db
         self.RA = RA
-        self.Z = Z
-        self.RCODE = RCODE
-        self.QDCOUNT = QDCOUNT
-        self.ANCOUNT = ANCOUNT
-        self.NSCOUNT = NSCOUNT
-        self.ARCOUNT = ARCOUNT
-        self.questions = questions
-        self.answers = answers
-        self.nameservers = nameservers
-        self.additional_records = additional_records
+        self.log = logging.Logger('resolver')
+        self.log.addHandler(console)
+        root_hints_path = 'named.root'
 
-    def __repr__(self):
-        return "<DnsPacket:%s, questions:%s, answers:%s, nameservers:%s, additional_records: %s>" % (hex(self.ID), self.questions, self.answers, self.nameservers, self.additional_records)
-
-    @staticmethod
-    def parse(data, offset=None):
-        # self.datagram = data
-        # Transaction ID 16
-        (ID,) = struct.unpack_from('!H', data)
-        # Query/Response 1
-        QR = (data[2] & 0b1000000)
-        # OpCode 4
-        OPCODE = DnsOpCode((data[2] & 0b01111000) >> 3)
-        # Authoratative Answer 1
-        AA = data[2] & 0b100 != 0
-        # Truncation 1
-        TC = data[2] & 0b10 != 0
-        # Recursion Desired 1
-        RD = data[2] & 0b1 != 0
-        # Recursion Available 1
-        RA = data[3] & 0b10000000 != 0
-        # Reserved for future, zero value
-        Z = (data[3] & 0b01110000) >> 4
-        #assert(Z == 0) # Newer RFCs obsolete this
-        RCODE = DnsResponseCode(data[3] & 0b1111)
-        (QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT,) = struct.unpack_from('!HHHH', data, 4)
-
-        if offset is None:
-            offset = 12
-
-        questions = []
-        while (len(questions) < QDCOUNT):
-            (question, offset) = DnsQuestion.parse(data, offset)
-            questions.append(question)
-
-        answers = []
-        nameservers = []
-        additional_records = []
-        while offset < len(data):
-            (rr, offset) = DnsRecord.parse(data, offset)
-            if (len(answers) < ANCOUNT):
-                answers.append(rr)
-            elif (len(nameservers) < NSCOUNT):
-                nameservers.append(rr)
-            elif (len(additional_records) < ARCOUNT):
-                additional_records.append(rr)
+        try:
+            if not os.path.isfile(root_hints_path):
+                urllib.request.urlretrieve('http://www.internic.net/domain/named.root', root_hints_path)
+                self.log.info('Attempting to retrieve root hints from internic.')
             else:
-                raise Exception('Too many/too few records.')
-        else:
-            assert(len(questions) == QDCOUNT)
-            assert(len(answers) == ANCOUNT)
-            assert(len(nameservers) == NSCOUNT)
-            assert(len(additional_records) == ARCOUNT)
-            cls = (Query if QR else Response)
-            return (cls(ID, QR, OPCODE, AA, TC, RD, RA, Z, RCODE, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT, questions, answers, nameservers, additional_records),offset,)
+                self.log.debug('Found root hints, %s' % os.path.basename(root_hints_path))
 
-    def encode(self):
-        data = struct.pack('!HBBHHHH', self.ID,
-                           ((0b10000000 if self.QR == DnsQR.response else 0) |
-                            (self.OPCODE << 3) |
-                            (0b100 if self.AA else 0) |
-                            (0b010 if self.TC else 0) |
-                            (0b001 if self.RD else 0)),
-                           ((0b10000000 if self.RA else 0) |
-                            self.Z << 4 |
-                            self.RCODE),
-                           self.QDCOUNT,
-                           self.ANCOUNT,
-                           self.NSCOUNT,
-                           self.ARCOUNT,
-                           )
+            for record in self.record_reader(root_hints_path):
+                self.db.cache(record)
+        except IOError:
+            self.log.critical('Unable to parse root hints.')
 
-        for record in self.questions:
-            data += record.encode()
-
-        for record in self.answers:
-            data += record.encode()
-
-        for record in self.nameservers:
-            data += record.encode()
-
-        for record in self.additional_records:
-            data += record.encode()
-
-        return data
-
-class Query(DnsPacket):
-    pass
-
-
-class Response(DnsPacket):
-    pass
-
-
-class DnsServer:
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
         try:
             (dns_packet,offset) = DnsPacket.parse(data)
+        except AssertionError:
+            self.log.warning("Unable to parse packet:", data)
+        else:
             print(dns_packet)
-            assert(dns_packet.QDCOUNT == 1) # Apparently the internet is lame.
-            print(dns_packet.questions[0])
+            key = (dns_packet.ID, addr)
+            if key in self.queue:
+                self.queue[key].set_result(dns_packet)
+            else:
+                self.log.warn("Unexpected packet.")
+
+    @asyncio.coroutine
+    def answer(self, question):
+        for ns in self.db.get_root_nameservers():
+            print(ns)
+
+
+        # Generate a set of questions that once answered, can allow for the next question to be formed.
+        # We must determine the nameservers for a zone, this should be done starting from the root.
+        # If we were unable to find a nameserver, we need to do this entire process for the parent zone.
+        # Once we have the name servers, we can ask all of them, the question.
+        # Try the datbaase
+
+
+        # try:
+        #     rtype = DnsRType(question.qtype)
+        #     rclass = DnsRClass(question.qclass)
+        # except ValueError:
+        #     # a qclass that does not cast directly into a record, such as ANY, or just junk?
+        #     return None
+
+
+
+#            label_id
+            # for name in [obj.name[-n:] for n in range(len(obj.name))][::-1]:
+            #     print(name)
+
+            # for ns in self.delegate_nameservers(question.name):
+            #     print(ns)
+            #
+            #     print("Looking up nameservers for: %s." % name)
+            #     for nameserver in self.db.lookup(DnsQuestion(name, DnsQType.NS)):
+            #         print(nameserver)
+
+class Database(object):
+    def __init__(self, database='dns', user=None, password=None, host='localhost', port=3306):
+        self.db = mysql.connector.connect(database=database, user=user, password=password, host=host, port=port)
+        self.log = logging.Logger('db')
+        self.log.addHandler(console)
+        self._cached_names = {}
+        self._cached_questions = {}
+
+    def get_root_nameservers(self):
+        name_id = self.get_name_id(DomainName.from_string('.'))
+        with closing(self.db.cursor()) as cursor:
+            cursor.execute('SELECT `rdata` FROM records WHERE `query` IS NULL AND `name`=%s AND `type`=%s AND `class`=%s AND (`ttl`+`cached`) >= UNIX_TIMESTAMP() GROUP BY `name`, `type`, `class`, `rdata` ORDER BY `cached` DESC', (name_id, DnsRType.NS.value, DnsRClass.IN.value))
+            for tokens in cursor.fetchall():
+                rdata = tokens[0]
+                yield Nameserver(DomainName.parse(rdata))
+
+    # def lookup_query(self, question):
+    #     assert(isinstance(question, DnsQuestion))
+    #     #
+    #     try:
+    #         rtype = DnsRType(question.qtype)
+    #         if DnsRType.NS == rtype:
+    #             return [DnsRecord(question.name, rtype, rdata=DomainName(['example','com']).encode())]
+    #         if DnsRType.A == rtype:
+    #             return [DnsRecord(question.name, rtype, rdata=bytearray([127,0,0,1]) )]
+    #
+    #     except ValueError:
+    #         pass
+    #
+    def create_name(self, label, parent):
+        if not label and parent is None:
+            label = '.'
+        with closing(self.db.cursor()) as cursor:
+            cursor.execute('INSERT INTO names (`name`, `parent`) VALUES (%s, %s)', (label, parent))
+            self.db.commit()
+            self.log.debug('create_name(%s,%s) created with id: %d' % (label, parent, cursor.lastrowid))
+            return cursor.lastrowid
+
+    def create_question(self, question):
+        name_id = self.get_name_id(question.name)
+        with closing(self.db.cursor()) as cursor:
+            cursor.execute('INSERT INTO questions (`name`, `type`, `class`) VALUES (%s, %s, %s)', (name_id, int(question.qtype), int(question.qclass)))
+            self.db.commit()
+            self.log.debug('create_question(%s,%s,%s) created with id: %d' % (question.name, question.qtype, question.qclass, cursor.lastrowid))
+            return cursor.lastrowid
+
+    @asyncio.coroutine
+    def get_question_id(self, question):
+        self.log.debug('get_question(%s)' % question)
+
+        key = (str(question.name).lower(), question.qclass, question.qtype)
+        if key in self._cached_questions:
+            return self._cached_questions[key]
+
+        name_id = self.get_name_id(question.name)
+        with closing(self.db.cursor()) as cursor:
+            cursor.execute('SELECT * FROM questions WHERE `name`=%s AND `type`=%s AND `class`=%s AND (`ttl`+`cached`) >= UNIX_TIMESTAMP() ORDER BY `cached` DESC GROUP BY `name`, `type`, `class` LIMIT 1', (name_id, int(question.qtype), int(question.qclass)))
+            r = cursor.fetchone()
+            if r is None:
+                question_id = self.create_question(question)
+            else:
+                question_id = int(r[0])
+                self.log.debug('get_name(%s) Found: %s (%d)' % (name, label, node))
+
+            self._cached_questions[key] = question_id
+            return question_id
+
+    def get_name_id(self, name):
+        key = str(name).lower()
+        if key in self._cached_names:
+            return self._cached_names[key]
+
+        with closing(self.db.cursor()) as cursor:
+            node = None
+            for label in reversed(name):
+                with closing(self.db.cursor()) as cursor:
+                    if node:
+                        cursor.execute('SELECT id FROM names WHERE name=%s AND parent=%s LIMIT 1', (label, node)) # %d
+                    else:
+                        if not label:
+                            label = '.'
+                        cursor.execute('SELECT id FROM names WHERE name=%s AND parent IS NULL LIMIT 1', (label,)) # (label,) is a tuple (label) is a string...
+
+                    r = cursor.fetchone()
+                    if r is None:
+                        node = self.create_name(label, node)
+                    else:
+                        node = int(r[0])
+                        self.log.debug('get_name(%s) Found: %s (%d)' % (name, label, node))
+
+            self._cached_names[key] = node
+            return node
+
+    def lookup(self, obj):
+        if isinstance(obj, DnsQuestion):
+            question_id = self.get_question_id(obj)
+
+
+    def get_record(self, record, query=None):
+        self.log.debug('get_record(%s,%s)' % (record, query))
+        name_id = self.get_name_id(record.name)
+        with closing(self.db.cursor()) as cursor:
+            if query is None:
+                cursor.execute('SELECT * FROM records WHERE `query` IS NULL AND `name`=%s AND `type`=%s AND `class`=%s AND `rdata`=%s AND (`ttl`+`cached`) >= UNIX_TIMESTAMP() ORDER BY `cached` DESC LIMIT 1', (name_id, int(record.rtype), int(record.rclass), record.rdata))
+            else:
+                cursor.execute('SELECT * FROM records WHERE `query`=%d AND `name`=%d AND `type`=%d AND `class`=%d AND `rdata`=%s AND (`ttl`+`cached`) >= UNIX_TIMESTAMP() ORDER BY `cached` DESC LIMIT 1', (query, name_id, int(record.rtype), int(record.rclass), record.rdata))
+            return cursor.fetchone()
+
+
+    def cache(self, obj, query=None):
+        self.log.info('cache: %s' % obj)
+        if isinstance(obj, DnsRecord):
+            name_id = self.get_name_id(obj.name)
+            record = self.get_record(obj)
+            if record:
+                self.log.debug("cache_record(%s,%s,%s) Record already cached! %s" % (name_id, query, obj, record))
+                return
+            else:
+                self.log.info('cache_record(%s,%s,%s)' % (name_id, query, obj))
+                with closing(self.db.cursor()) as cursor:
+                    cursor.execute('INSERT INTO `records` (`query`, `name`, `type`, `class`, `ttl`, `rdata`) VALUES (%s, %s, %s, %s, %s, %s)', (query, name_id, int(obj.rtype), int(obj.rclass), obj.ttl, bytes(obj.rdata)))
+                    self.db.commit()
+
+
+class DnsServer(asyncio.Protocol):
+    loop = asyncio.get_event_loop()
+
+    def __init__(self, resolver):
+        assert(isinstance(resolver, DnsResolver))
+        self.resolver = resolver
+        self.log = logging.Logger('server')
+        self.log.addHandler(console)
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    @asyncio.coroutine
+    def respond_to_packet(self, dns_packet, addr):
+        try:
+            if dns_packet.QR == DnsQR.query:
+                assert(dns_packet.QDCOUNT == 1) # Apparently the internet is lame.
+                answer = yield from self.resolver.answer(dns_packet.questions[0])
+                if answer is None:
+                    answer = []
+                response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, answers=answer)
+                self.transport.sendto(response.encode(), addr)
+        except asyncio.CancelledError:
+            print("Task cancelled.")
+            pass
+        except asyncio.InvalidStateError:
+            print("Got result, but future was already cancelled.")
+
+    def datagram_received(self, data, addr):
+        try:
+            (dns_packet,offset) = DnsPacket.parse(data)
         except AssertionError:
             print("Unable to parse packet:", data)
         else:
-            question = dns_packet.questions[0]
-            answer = DnsRecord(question.name, rdata=bytearray([127,0,0,1]))
-            response = Response(dns_packet.ID,DnsQR.response,DnsOpCode.query,False, False, True, False, 0, DnsResponseCode.no_error, answers=[answer])
-            self.transport.sendto(response.encode(), addr)
+            print(dns_packet)
+            task = asyncio.async(self.respond_to_packet(dns_packet, addr))
+            loop.call_later(3, task.cancel)
 
-    # def connection_refused(self, exc):
-    #     print('Connection refused:', exc)
-    #
-    # def connection_lost(self, exc):
-    #     print('stop', exc)
-
-
-def start_server(loop, addr):
-    t = asyncio.Task(loop.create_datagram_endpoint(DnsServer, local_addr=addr))
-    loop.run_until_complete(t)
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
+
     if signal is not None:
         loop.add_signal_handler(signal.SIGINT, loop.stop)
 
-    start_server(loop, ('127.0.0.1', 53))
+    assert(DomainName.from_string('a.b.c') == DomainName.from_string('a.b.c.') == DomainName.parse(bytearray([1,97,1,98,1,99,00])))
+    db = Database('dns', 'dns', '123qwe', 'ninjaserv')
+
+    resolver_startup_task = asyncio.Task(loop.create_datagram_endpoint(lambda: DnsResolver(db), local_addr=('0.0.0.0',0)))
+    loop.run_until_complete(resolver_startup_task)
+    (resolver_transport, resolver_protocol) = resolver_startup_task.result()
+
+    start_server_task = asyncio.Task(loop.create_datagram_endpoint(lambda: DnsServer(resolver_protocol), local_addr=('127.0.0.1',53)))
+    loop.run_until_complete(start_server_task)
+    # (server_transport, server_protocol) = start_server_task.result()
+
     loop.run_forever()

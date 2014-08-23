@@ -104,6 +104,9 @@ class DnsRType(IntEnum):
     #    Private use = 65280-65534,
     Reserved = 65535,
 
+    def __repr__(self):
+        return self.name
+
 
 class DnsQType(IntEnum):
     A = 1,
