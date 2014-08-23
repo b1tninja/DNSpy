@@ -110,15 +110,25 @@ class DnsResolver(asyncio.Protocol):
     @asyncio.coroutine
     def answer(self, question):
         # TODO: should be given the full DnsPacket, so that the RD/RA flags can be set properly. Or have a lookup for both.
-        query = None
-        for ns in self.db.get_nameserver_records(question.name):
-            ns_name = DomainName.parse(ns.rdata)
-            print(ns_name)
-            for record in self.db.lookup_records(DnsQuestion(ns_name, DnsQType.A), query):
-                print(ipaddress.IPv4Address(record.rdata))
-            for record in self.db.lookup_records(DnsQuestion(ns_name, DnsQType.AAAA), query):
-                print(ipaddress.IPv6Address(record.rdata))
 
+        question_id = self.db.get_question_id(question)
+        answers = yield from self.db.lookup_records(question)
+        nameservers = []
+        additional_records = []
+        query = None
+        for ns_record in self.db.get_nameserver_records(question.name):
+            nameservers.append(ns_record)
+            ns_name = DomainName.parse(ns_record.rdata)
+            self.log.debug("Nameserver: %s" % ns_name)
+            self.log.debug("Additional Records:")
+            for record in self.db.lookup_records(DnsQuestion(ns_name, DnsQType.A), query):
+                self.log.debug(ipaddress.IPv4Address(record.rdata))
+                additional_records.append(record)
+            for record in self.db.lookup_records(DnsQuestion(ns_name, DnsQType.AAAA), query):
+                self.log.debug(ipaddress.IPv6Address(record.rdata))
+                additional_records.append(record)
+
+        return (answers, nameservers, additional_records)
 
 class DnsServer(asyncio.Protocol):
     loop = asyncio.get_event_loop()
@@ -137,9 +147,10 @@ class DnsServer(asyncio.Protocol):
         try:
             if dns_packet.QR == DnsQR.query:
                 assert(dns_packet.QDCOUNT == 1) # Apparently the internet is lame. TODO:  make proposal with TC bit
-                answer = yield from self.resolver.answer(dns_packet.questions[0])
+                (answer,nameservers,additional_records) = yield from self.resolver.answer(dns_packet.questions[0])
                 if answer is None:
-                    answer = []
+                        answer = []
+#                response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, answers=answer, nameservers=nameservers, additional_records=additional_records)
                 response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, answers=answer)
                 self.transport.sendto(response.encode(), addr)
         except asyncio.CancelledError:
@@ -169,7 +180,7 @@ class Database(object):
 
     def lookup_records(self, question, query = None):
         assert(isinstance(question, DnsQuestion))
-        #TODO: self.get_question_id(question)
+        self.get_question_id(question)
 
         try:
             rtype = int(DnsRType(question.qtype))
@@ -234,7 +245,6 @@ class Database(object):
             self.log.debug('create_question(%s,%s,%s) created with id: %d' % (question.name, question.qtype, question.qclass, cursor.lastrowid))
             return cursor.lastrowid
 
-    @asyncio.coroutine
     def get_question_id(self, question):
         self.log.debug('get_question(%s)' % question)
 
@@ -244,13 +254,13 @@ class Database(object):
 
         name_id = self.get_name_id(question.name)
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('SELECT * FROM questions WHERE `name`=%s AND `type`=%s AND `class`=%s AND (`ttl`+`cached`) >= UNIX_TIMESTAMP() ORDER BY `cached` DESC GROUP BY `name`, `type`, `class` LIMIT 1', (name_id, int(question.qtype), int(question.qclass)))
+            cursor.execute('SELECT * FROM questions WHERE `name`=%s AND `type`=%s AND `class`=%s GROUP BY `name`, `type`, `class` LIMIT 1', (name_id, int(question.qtype), int(question.qclass)))
             r = cursor.fetchone()
             if r is None:
                 question_id = self.create_question(question)
             else:
                 question_id = int(r[0])
-                self.log.debug('get_name(%s) Found: %s (%d)' % (name, label, node))
+                self.log.debug('get_name(%s) Found: %d' % (question, question_id))
 
             self._cached_questions[key] = question_id
             return question_id
