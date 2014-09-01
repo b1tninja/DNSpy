@@ -1,6 +1,6 @@
 from enum import IntEnum
 
-__author__ = 'Justin Capella'
+__author__ = 'unpro'
 
 
 class DnsResponseCode(IntEnum):

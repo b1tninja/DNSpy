@@ -6,10 +6,13 @@ import string
 import struct
 from enums import DnsQType, DnsRClass, DnsQClass, DnsRType, DnsQR, DnsOpCode, DnsResponseCode
 
-__author__ = 'Justn Capella'
+__author__ = 'unpro'
 
 
 class DnsQuestion(object):
+    def __hash__(self):
+        return hash((self.name, self.qtype, self.qclass))
+
     def __init__(self, qname, qtype=DnsQType.ANY, qclass=DnsRClass.IN):
         self.name = qname
         self.qtype = qtype
@@ -201,6 +204,8 @@ class Response(DnsPacket):
 
 
 class DomainName(list):
+    def __hash__(self):
+        return hash(str(self).lower())
     def __str__(self):
         return '.'.join(self)
 
@@ -219,37 +224,41 @@ class DomainName(list):
         sequence = []
         while (data[offset]):
             if data[offset] < 64:
+                print(data[offset + 1:offset + 1 + data[offset]])
                 label = data[offset + 1:offset + 1 + data[offset]].decode('ascii')
                 assert(allowed_charset.issuperset(label))
-                offset += data[offset]
+                offset += data[offset] + 1
                 sequence.append(label)
             elif data[offset] >= 0b11000000:
-                # pointer
-                assert (data[data[offset]] < 64)  # Don't allow pointers to pointers
-                # TODO: shouldn't allow pointing to 'same label offset' either
-                (label, n,) = DomainName.parse_from(data, data[offset] & 0b111111)  # RECURSE
+                # A pointer is two bytes
+                ptr = ((data[offset] & 0b00111111) << 8) | data[offset+1]
+                offset += 2
+                # #TODO: shouldn't allow pointing to 'same label offset' either?
+                assert (data[ptr] < 64)  # Don't allow pointers to pointers
+                (label, n,) = DomainName.parse_from(data, ptr)  # RECURSE
+#                (label, n,) = DomainName.parse_from(data, data[offset])  # RECURSE
                 sequence.extend(label)
+                break
             else:
                 raise Exception('Unknown/Invalid DNS Label')
 
-            offset += 1
             assert (sum(map(len, sequence)) < 256)
 
         else:
             offset += 1  # consume the null terminator
-            return (DomainName(sequence if sequence != [] else ['']), offset,)
 
-        # Should not reach the following...
-        raise Exception('Malformed DNS label')
+        if sequence == []:
+            return (DomainName.from_string('.'), offset,)
+        else:
+            return (DomainName(sequence), offset,)
 
     def encode(self):
         data = bytearray()
         for label in self:
-            data.append(len(label))
             if label:
+                data.append(len(label))
                 data.extend(bytes(label, 'ascii'))
             else:
-                # Root Label
-                break
+                break #?
         data.append(0)
         return bytes(data)
