@@ -6,9 +6,6 @@ import string
 import struct
 from enums import DnsQType, DnsRClass, DnsQClass, DnsRType, DnsQR, DnsOpCode, DnsResponseCode
 
-__author__ = 'unpro'
-
-
 class DnsQuestion(object):
     def __hash__(self):
         return hash((self.name, self.qtype, self.qclass))
@@ -78,7 +75,6 @@ class DnsRecord(object):
     def encode(self):
         return self.name.encode() + struct.pack('!HHIH', self.rtype, self.rclass, self.ttl, self.rdlength) + self.rdata
 
-
 class DnsPacket(object):
 
     def __init__(self, ID=random.getrandbits(16), QR=DnsQR.query, OPCODE=DnsOpCode.query, AA = False, TC = False, RD = True, RA = True, Z = 0, RCODE=DnsResponseCode.no_error, QDCOUNT=None, ANCOUNT=None, NSCOUNT=None, ARCOUNT=None, questions=[], answers=[], nameservers=[], additional_records=[]):
@@ -112,8 +108,8 @@ class DnsPacket(object):
     def __repr__(self):
         return "<DnsPacket:%s, questions:%s, answers:%s, nameservers:%s, additional_records: %s>" % (hex(self.ID), self.questions, self.answers, self.nameservers, self.additional_records)
 
-    @staticmethod
-    def parse(data, offset=None):
+    @classmethod
+    def parse(cls, data, offset=None):
         # self.datagram = data
         # Transaction ID 16
         (ID,) = struct.unpack_from('!H', data)
@@ -202,7 +198,6 @@ class Query(DnsPacket):
 class Response(DnsPacket):
     pass
 
-
 class DomainName(list):
     def __hash__(self):
         return hash(str(self).lower())
@@ -253,6 +248,7 @@ class DomainName(list):
             return (DomainName(sequence), offset,)
 
     def encode(self):
+        # TODO: label name compression, with context of current packet_buffer?
         data = bytearray()
         for label in self:
             if label:
