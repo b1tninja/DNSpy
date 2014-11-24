@@ -131,11 +131,14 @@ class DnsResolver(asyncio.Protocol):
             else:
                 self.log.warn("Unexpected packet.")
 
+    def bootstrap(self):
+        root_label = DomainName.from_string('.')
+        (answer)
 
 
 
     @asyncio.coroutine
-    def resolve(self, packet):
+    def resolve(self, packet, ns=None, addr=None):
         # Enumerate NS for zone, starting from root label
         #  Enumerate addresses for given NS
         #   Query <SOA.zone> from NS,ADDR
@@ -148,10 +151,20 @@ class DnsResolver(asyncio.Protocol):
         #    Query <MX,zone> from NS,ADDR
         #    Query <MX,zone> from NS,ADDR
 
+        # TODO: consider http://tools.ietf.org/html/draft-ietf-dnsext-edns1-03
+        assert(packet.QDCOUNT == 1)
+        question = packet.questions[0]
+        for label in reversed(question.name):
+            zone_cut = yield from self.query(DnsQuestion(label, DnsQType.NS))
+            print(zone_cut)
+
+            print(label)
+
         return ([],[],[])
 
         root_label = DomainName.from_string('.')
-        (answers, nameservers, additional_records) = self.query(DnsQuestion(root_label, DnsQType.SOA))
+        response = yield from self.query(DnsQuestion(root_label, DnsQType.SOA))
+        resposne
 
         if len(answers) == 0:
             ns_map = {}
@@ -194,7 +207,7 @@ class DnsResolver(asyncio.Protocol):
 
     def _query(self, ns_id, addr_id, host, question):
         future = asyncio.Future()
-        question_id = self.db.get_question_id(question)
+        question_id = self.db.get_resource_header_id(question)
         query_id = self.db.get_query_id(question_id, ns_id, addr_id)
         dns_packet = Query(questions=[question], RD=False)
         addr = (str(host),53)
@@ -203,7 +216,9 @@ class DnsResolver(asyncio.Protocol):
         self.transport.sendto(dns_packet.encode(), addr)
 
 
-    def query(self, target_question):
+    def query(self, question, ns=None, addr=None):
+        future = asyncio.Future()
+        return future
 #        question_id = self.db.get_question_id(question)
         # Walk the database starting form the root
         question = DnsQuestion(DomainName.from_string('.'), DnsQType.SOA)
@@ -284,10 +299,11 @@ class DnsServer(asyncio.Protocol):
             self.log.debug("Got result, but future was already cancelled.")
 
     def datagram_received(self, data, addr):
+        (host,port) = addr
         try:
             (dns_packet, offset) = DnsPacket.parse(data)
         except AssertionError:
-            self.log.warn("Unable to parse packet:", data)
+            self.log.warn('Unable to parse packet %s from %s.' % (data, host))
         else:
             self.log.info('Incoming packet: %s' % dns_packet)
             packet_id = self.resolver.db.store_packet(dns_packet, source=addr)
@@ -315,14 +331,13 @@ class Database(object):
             return sha1
 
 
-    def get_ipaddr_blob(self, ip):
+    def get_ipaddr_blob_id(self, ip):
         ip = ipaddress.ip_address(ip)
         return self.get_blob_id(ip.packed)
 
     def _get_digest(self, blob):
         # TODO: consider adding salt
         return hashlib.sha1(blob).digest()
-
 
 
     def store_packet(self, dns_packet, source=None, destination=None):
@@ -402,47 +417,27 @@ class Database(object):
 
             return cursor.lastrowid
 
-
-
-    def get_query_id(self, question_id, ns_id, addr_id):
-        key = (question_id,ns_id,addr_id,)
-
-        self.log.debug('get_query(%d,%d,%d)' % (ns_id, addr_id, question_id))
-
-        if key in self._cached_queries:
-            return self._cached_queries[key]
-
-        with closing(self.db.cursor()) as cursor:
-            cursor.execute('SELECT id FROM queries WHERE `question`=%s AND `nameserver`=%s AND `address`=%s LIMIT 1', (question_id, ns_id, addr_id))
-            r = cursor.fetchone()
-            if r is None:
-                id = self.create_query(question_id,ns_id,addr_id)
-            else:
-                id = int(r[0])
-                self.log.debug('get_query(%d,%d,%d) Found: %d' % (question_id, ns_id, addr_id, id))
-
-            self._cached_queries[key] = id
-            return id
-
-
-    def get_question_id(self, question):
-        self.log.debug('get_question(%s)' % question)
-
-        if question in self._cached_questions:
-            return self._cached_questions[question]
-
-        name_id = self.get_name_id(question.name)
-        with closing(self.db.cursor()) as cursor:
-            cursor.execute('SELECT * FROM questions WHERE `name`=%s AND `type`=%s AND `class`=%s GROUP BY `name`, `type`, `class` LIMIT 1', (name_id, int(question.qtype), int(question.qclass)))
-            r = cursor.fetchone()
-            if r is None:
-                question_id = self.create_question(question)
-            else:
-                question_id = int(r[0])
-                self.log.debug('get_name(%s) Found: %d' % (question, question_id))
-
-            self._cached_questions[key] = question_id
-            return question_id
+    # def get_query_id(self, question_id, ns_id, addr_id):
+    #     key = (question_id,ns_id,addr_id,)
+    #
+    #     self.log.debug('get_query(%d,%d,%d)' % (ns_id, addr_id, question_id))
+    #
+    #     if key in self._cached_queries:
+    #         return self._cached_queries[key]
+    #
+    #     with closing(self.db.cursor()) as cursor:
+    #         cursor.execute('SELECT id FROM query WHERE `question`=%s AND `nameserver`=%s AND `address`=%s LIMIT 1',
+    #                        (question_id, ns_id, addr_id))
+    #
+    #         r = cursor.fetchone()
+    #         if r is None:
+    #             id = self.create_query(question_id,ns_id,addr_id)
+    #         else:
+    #             id = int(r[0])
+    #             self.log.debug('get_query(%d,%d,%d) Found: %d' % (question_id, ns_id, addr_id, id))
+    #
+    #         self._cached_queries[key] = id
+    #         return id
 
 
     def resolve_name(self, name_id):
@@ -504,13 +499,21 @@ class Database(object):
             self.log.debug('create_name(%s,%s) created with id: %d' % (label, parent, cursor.lastrowid))
             return cursor.lastrowid
 
-    def create_question(self, question):
-        assert(isinstance(question, DnsQuestion))
-        name_id = self.get_name_id(question.name)
+    def create_resource_header(self, resource):
+        if(isinstance(resource, DnsQuestion)):
+            (resource_type, resource_class) = (int(resource.qtype), int(resource.qclass))
+        elif(isinstance(resource, DnsRecord)):
+            (resource_type, resource_class) = (int(resource.rtype), int(resource.rclass))
+        else:
+            raise ValueError # TODO: exception handling
+
+        name_id = self.get_name_id(resource.name)
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO question (`name`, `qtype`, `qclass`) VALUES (%s, %s, %s)', (name_id, int(question.qtype), int(question.qclass)))
+            cursor.execute('INSERT INTO resource_header (`name`, `type`, `class`) VALUES (%s, %s, %s)',
+                           (name_id, resource_type, resource_class))
             self.db.commit()
-            self.log.debug('create_question(%s,%s,%s) created with id: %d' % (question.name, question.qtype, question.qclass, cursor.lastrowid))
+            self.log.debug('create_resource_header(%s,%s,%s) created with id: %d' %
+                           (resource.name, resource_type, resource_class, cursor.lastrowid))
             return cursor.lastrowid
     #
     # def create_query(self, question_id, ns_id, addr_id):
@@ -531,7 +534,7 @@ class Database(object):
             cursor.execute('SELECT id FROM question WHERE `name`=%s AND `qtype`=%s AND `qclass`=%s LIMIT 1', (name_id, int(question.qtype), int(question.qclass)))
             r = cursor.fetchone()
             if r is None:
-                question_id = self.create_question(question)
+                question_id = self.create_resource_header(question)
             else:
                 question_id = int(r[0])
                 self.log.debug('get_name(%s) Found: %d' % (question, question_id))
@@ -571,10 +574,14 @@ class Database(object):
 
     def get_record_id(self, record):
         assert(isinstance(record, DnsRecord))
-        name_id = self.get_name_id(record.name)
-        rdata_blob = self.get_blob_id(record.rdata)
+
+        resource_header_id = self.get_resource_header_id(record)
+        rdata_blob_id = self.get_blob_id(record.rdata)
+
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('SELECT id FROM record WHERE `name`=%s AND `rtype`=%s AND `rclass`=%s AND `rdata`=%s LIMIT 1', (name_id, int(record.rtype), int(record.rclass), rdata_blob))
+            cursor.execute('SELECT id FROM resource_record WHERE `header`=%s AND `rdata`=%s LIMIT 1',
+                           (resource_header_id, rdata_blob_id))
+
             r = cursor.fetchone()
             if r is None:
                 id = self.create_record(record)
@@ -584,41 +591,49 @@ class Database(object):
             self.log.debug('get_record_id(%s): %d' % (record, id))
             return id
 
-    def get_question_id(self, question):
-        assert(isinstance(question, DnsQuestion))
-        name_id = self.get_name_id(question.name)
+    def get_resource_header_id(self, resource):
+        if(isinstance(resource, DnsQuestion)):
+            (resource_type, resource_class) = (int(resource.qtype), int(resource.qclass))
+        elif(isinstance(resource, DnsRecord)):
+            (resource_type, resource_class) = (int(resource.rtype), int(resource.rclass))
+        else:
+            raise ValueError # TODO: exception handling
+
+        name_id = self.get_name_id(resource.name)
         # TODO: question id cache
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('SELECT id FROM question WHERE `name`=%s AND `qtype`=%s AND `qclass`=%s LIMIT 1', (name_id, int(question.qtype), int(question.qclass)))
+            cursor.execute('SELECT id FROM resource_header WHERE `name`=%s AND `type`=%s AND `class`=%s LIMIT 1',
+                           (name_id, resource_type, resource_class))
+
             r = cursor.fetchone()
             if r is None:
-                id = self.create_question(question)
+                id = self.create_resource_header(resource)
             else:
                 id = int(r[0])
 
-            self.log.debug('get_question_id(%s): %d' % (question, id))
+            self.log.debug('get_resource_header_id(%s): %d' % (resource, id))
             return id
 
 
     def create_record(self, record):
         self.log.info('create_record(%s)' % record)
         assert(isinstance(record, DnsRecord))
-        name_id = self.get_name_id(record.name)
+        record_header_id = self.get_resource_header_id(record)
         rdata_blob = self.get_blob_id(record.rdata)
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO `record` (`name`, `rtype`, `rclass`, `rdata`) '
-                           'VALUES (%s, %s, %s, %s)',
-                           (name_id, int(record.rtype), int(record.rclass), rdata_blob))
+            cursor.execute('INSERT INTO `resource_record` (`header`, `rdata`) '
+                           'VALUES (%s, %s)',
+                           (record_header_id, rdata_blob))
             self.db.commit()
             return cursor.lastrowid
 
     # the queryset id and recordset id is designed to match:
     # select packet.id,unhex(sha1(group_concat(packet_question.`question` ORDER BY `question` ASC))) as `queryset`,unhex(sha1(group_concat(packet_record.`record` ORDER BY `record` ASC))) as `recordset` FROM packet JOIN  packet_question on packet.id=packet_question.packet JOIN packet_record ON packet_question.packet=packet_record.packet GROUP BY `packet`.`id`;
-    # TODO: consider alternative implementation, perhaps one that uses the values instead of the database IDs
+    # TODO: consider alternative implementation, perhaps one that uses the values instead of the database IDs for "offline" calculation
 
     def get_queryset_id(self, questions):
-        self.log.debug('get_queryset_id(%s)')
-        return self._get_digest(','.join(map(str,(sorted(map(self.get_question_id, questions))))).encode('ascii'))
+        self.log.debug('get_queryset_id(%s)' % questions)
+        return self._get_digest(','.join(map(str,(sorted(map(self.get_resource_header_id, questions))))).encode('ascii'))
 
     def get_recordset_id(self, records):
         self.log.debug('get_recordset_id(%s)')
@@ -632,7 +647,7 @@ class Database(object):
 
     def create_packet_question(self, packet_id, question):
         assert(isinstance(packet_id, int))
-        question_id = self.get_question_id(question)
+        question_id = self.get_resource_header_id(question)
         with closing(self.db.cursor()) as cursor:
             cursor.execute('INSERT INTO `packet_question` (`packet`, `question`) VALUES (%s, %s)', (packet_id, question_id,))
 

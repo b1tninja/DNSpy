@@ -15,8 +15,7 @@ CREATE TABLE IF NOT EXISTS `blob` (
 CREATE TABLE IF NOT EXISTS `blacklist` (
   `ip` VARBINARY(16) NOT NULL,
 --  `reason` TINYINT(3) UNSIGNED NOT NULL DEFAULT 0,
-  PRIMARY KEY (`ip`),
-  CONSTRAINT `blacklist_ip_fk` FOREIGN KEY (`ip`) REFERENCES `blob` (`sha1`)
+  PRIMARY KEY (`ip`)
 ) ENGINE=InnoDB;
 
 
@@ -62,31 +61,27 @@ CREATE TABLE IF NOT EXISTS `name` (
 
 
 -- Dumping structure for table dns.question
-CREATE TABLE IF NOT EXISTS `question` (
+CREATE TABLE IF NOT EXISTS resource_header (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
   `name` bigint(20) unsigned NOT NULL,
-  `qtype` smallint(5) unsigned NOT NULL,
-  `qclass` smallint(5) unsigned NOT NULL,
+  `type` smallint(5) unsigned NOT NULL,
+  `class` smallint(5) unsigned NOT NULL,
   PRIMARY KEY (`id`),
   KEY `name` (`name`),
-  CONSTRAINT `question_name_fk` FOREIGN KEY (`name`) REFERENCES `name` (`id`)
+  CONSTRAINT `rh_name_fk` FOREIGN KEY (`name`) REFERENCES `name` (`id`)
 ) ENGINE=InnoDB;
 
 
--- TODO: consider folding name,rtype,rclass into "question" table, may help with deduplication/search later on...
--- especially in the event of lots of rtypes,rclass,rdata pairs under one name
--- Dumping structure for table dns.record
-CREATE TABLE IF NOT EXISTS `record` (
+--  Dumping structure for table dns.record
+CREATE TABLE IF NOT EXISTS `resource_record` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  `name` bigint(20) unsigned NOT NULL,
-  `rtype` smallint(5) unsigned NOT NULL,
-  `rclass` smallint(5) unsigned NOT NULL,
+  `header` bigint(20) unsigned NOT NULL,
   `rdata` binary(20) NOT NULL,
   PRIMARY KEY (`id`),
-  KEY `name` (`name`),
+  KEY `resource_header` (`header`),
   KEY `rdata` (`rdata`),
-  CONSTRAINT `record_name_fk` FOREIGN KEY (`name`) REFERENCES `name` (`id`),
-  CONSTRAINT `record_rdata_fk` FOREIGN KEY (`rdata`) REFERENCES `blob` (`sha1`)
+  CONSTRAINT `rr_header_fk` FOREIGN KEY (`header`) REFERENCES `resource_header` (`id`),
+  CONSTRAINT `rr_rdata_fk` FOREIGN KEY (`rdata`) REFERENCES `blob` (`sha1`)
 ) ENGINE=InnoDB;
 
 -- Dumping structure for table dns.packet_question
@@ -98,7 +93,7 @@ CREATE TABLE IF NOT EXISTS `packet_question` (
   KEY `packet` (`packet`),
   KEY `question` (`question`),
   CONSTRAINT `packet_question_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
-  CONSTRAINT `packet_question_question_fk` FOREIGN KEY (`question`) REFERENCES `question` (`id`)
+  CONSTRAINT `packet_question_rh_fk` FOREIGN KEY (`question`) REFERENCES `resource_header` (`id`)
 ) ENGINE=InnoDB;
 
 
@@ -117,8 +112,8 @@ CREATE TABLE IF NOT EXISTS `query` (
   KEY `response` (`response`),
 --  CONSTRAINT `query_parent_fk` FOREIGN KEY (`parent`) REFERENCES `query` (`id`),
   CONSTRAINT `query_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
-  CONSTRAINT `query_nameserver_fk` FOREIGN KEY (`nameserver`) REFERENCES `record` (`id`),
-  CONSTRAINT `query_address_fk` FOREIGN KEY (`address`) REFERENCES `record` (`id`),
+  CONSTRAINT `query_nameserver_fk` FOREIGN KEY (`nameserver`) REFERENCES resource_record (`id`),
+  CONSTRAINT `query_address_fk` FOREIGN KEY (`address`) REFERENCES resource_record (`id`),
   CONSTRAINT `query_response_fk` FOREIGN KEY (`response`) REFERENCES `packet` (`id`)
 ) ENGINE=InnoDB;
 
@@ -135,7 +130,7 @@ CREATE TABLE IF NOT EXISTS `packet_record` (
   KEY `packet` (`packet`),
   KEY `record` (`record`),
   CONSTRAINT `packet_record_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
-  CONSTRAINT `packet_record_record_fk` FOREIGN KEY (`record`) REFERENCES `record` (`id`)
+  CONSTRAINT `packet_record_record_fk` FOREIGN KEY (`record`) REFERENCES resource_record (`id`)
 ) ENGINE=InnoDB;
 
 
