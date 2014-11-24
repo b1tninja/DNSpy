@@ -199,6 +199,7 @@ class Response(DnsPacket):
     pass
 
 class DomainName(list):
+    # TODO: support preservation of the over-the-wire encoding (the raw bytes)
     def __hash__(self):
         return hash(str(self).lower())
     def __str__(self):

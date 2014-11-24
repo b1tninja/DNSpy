@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS `blob` (
 
 -- Dumping structure for table dns.blacklist
 CREATE TABLE IF NOT EXISTS `blacklist` (
-  `ip` BINARY(20) NOT NULL,
+  `ip` VARBINARY(16) NOT NULL,
 --  `reason` TINYINT(3) UNSIGNED NOT NULL DEFAULT 0,
   PRIMARY KEY (`ip`),
   CONSTRAINT `blacklist_ip_fk` FOREIGN KEY (`ip`) REFERENCES `blob` (`sha1`)
@@ -23,9 +23,9 @@ CREATE TABLE IF NOT EXISTS `blacklist` (
 -- Dumping structure for table dns.packet
 CREATE TABLE IF NOT EXISTS `packet` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  `source` binary(20) NULL,
+  `source` varbinary(16) NULL,
   `source_port` smallint(6) unsigned NOT NULL DEFAULT 0,
-  `destination` binary(20) NULL,
+  `destination` varbinary(16) NULL,
   `destination_port` smallint(6) unsigned NOT NULL DEFAULT 53,
   `txnid` int(10) unsigned NOT NULL,
   `qr` bit(1),
@@ -39,8 +39,14 @@ CREATE TABLE IF NOT EXISTS `packet` (
   `ancount` smallint(6) unsigned NOT NULL,
   `nscount` smallint(6) unsigned NOT NULL,
   `arcount` smallint(6) unsigned NOT NULL,
+  `queryset` binary(20) NOT NULL,
+  `recordset` binary(20) NOT NULL,
   `cached` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (`id`)
+  PRIMARY KEY (`id`),
+  KEY `source` (`source`),
+  KEY `destination` (`destination`),
+  KEY `queryset` (`queryset`),
+  KEY `recordset` (`recordset`)
 ) ENGINE=InnoDB;
 
 
@@ -67,13 +73,14 @@ CREATE TABLE IF NOT EXISTS `question` (
 ) ENGINE=InnoDB;
 
 
+-- TODO: consider folding name,rtype,rclass into "question" table, may help with deduplication/search later on...
+-- especially in the event of lots of rtypes,rclass,rdata pairs under one name
 -- Dumping structure for table dns.record
 CREATE TABLE IF NOT EXISTS `record` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
   `name` bigint(20) unsigned NOT NULL,
   `rtype` smallint(5) unsigned NOT NULL,
   `rclass` smallint(5) unsigned NOT NULL,
-  `ttl` int(10) unsigned NOT NULL,
   `rdata` binary(20) NOT NULL,
   PRIMARY KEY (`id`),
   KEY `name` (`name`),
@@ -82,11 +89,12 @@ CREATE TABLE IF NOT EXISTS `record` (
   CONSTRAINT `record_rdata_fk` FOREIGN KEY (`rdata`) REFERENCES `blob` (`sha1`)
 ) ENGINE=InnoDB;
 
-
 -- Dumping structure for table dns.packet_question
 CREATE TABLE IF NOT EXISTS `packet_question` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
   `packet` bigint(20) unsigned NOT NULL,
   `question` bigint(20) unsigned NOT NULL,
+  PRIMARY KEY (`id`),
   KEY `packet` (`packet`),
   KEY `question` (`question`),
   CONSTRAINT `packet_question_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
@@ -100,24 +108,30 @@ CREATE TABLE IF NOT EXISTS `query` (
   `parent` bigint(20) unsigned NULL,
   `nameserver` bigint(20) unsigned NULL,
   `address` bigint(20) unsigned NULL,
+-- TODO: consider "multiple response" case, as well as TC
   `response` bigint(20) unsigned NULL,
   PRIMARY KEY (`packet`),
   KEY `parent` (`parent`),
   KEY `nameserver` (`nameserver`),
   KEY `address` (`address`),
-  KEY `response` (`response`), -- TODO: consider "multiple response" case, as well as TC
+  KEY `response` (`response`),
 --  CONSTRAINT `query_parent_fk` FOREIGN KEY (`parent`) REFERENCES `query` (`id`),
   CONSTRAINT `query_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
   CONSTRAINT `query_nameserver_fk` FOREIGN KEY (`nameserver`) REFERENCES `record` (`id`),
-  CONSTRAINT `query_address_fk` FOREIGN KEY (`address`) REFERENCES `record` (`id`)
+  CONSTRAINT `query_address_fk` FOREIGN KEY (`address`) REFERENCES `record` (`id`),
   CONSTRAINT `query_response_fk` FOREIGN KEY (`response`) REFERENCES `packet` (`id`)
 ) ENGINE=InnoDB;
 
 
 -- Dumping structure for table dns.packet_record
 CREATE TABLE IF NOT EXISTS `packet_record` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
   `packet` bigint(20) unsigned NOT NULL,
   `record` bigint(20) unsigned NOT NULL,
+  -- TODO: Might be nice to have a field for the over-the-wire bytes of a given name
+  -- TODO: RFC2181 suggests ttl be "ignored" when considering record sets, log as part of the packet instead of the record
+  `ttl` int(10) unsigned NOT NULL,
+  PRIMARY KEY (`id`),
   KEY `packet` (`packet`),
   KEY `record` (`record`),
   CONSTRAINT `packet_record_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),

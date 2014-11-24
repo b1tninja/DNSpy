@@ -1,3 +1,5 @@
+from __future__ import unicode_literals
+
 #!/usr/bin/env python3
 # setcap cap_net_bind_service=+ep /usr/bin/python3.4
 
@@ -7,6 +9,7 @@ __author__ = 'b1tninja'
 import re
 import os
 import urllib.request
+
 
 # For the database
 from contextlib import closing
@@ -276,17 +279,17 @@ class DnsServer(asyncio.Protocol):
                 self.resolver.db.store_packet(response, destination=addr)
                 self.transport.sendto(response.encode(), addr)
         except asyncio.CancelledError:
-            print("Task cancelled.")
+            self.log.debug("Task cancelled.")
         except asyncio.InvalidStateError:
-            print("Got result, but future was already cancelled.")
+            self.log.debug("Got result, but future was already cancelled.")
 
     def datagram_received(self, data, addr):
         try:
             (dns_packet, offset) = DnsPacket.parse(data)
         except AssertionError:
-            print("Unable to parse packet:", data)
+            self.log.warn("Unable to parse packet:", data)
         else:
-            print(dns_packet)
+            self.log.info('Incoming packet: %s' % dns_packet)
             packet_id = self.resolver.db.store_packet(dns_packet, source=addr)
             task = asyncio.async(self.respond_to_packet(dns_packet, addr))
             loop.call_later(3, task.cancel)
@@ -323,17 +326,24 @@ class Database(object):
 
 
     def store_packet(self, dns_packet, source=None, destination=None):
+        assert(len(dns_packet.questions) == dns_packet.QDCOUNT)
+        assert(len(dns_packet.answers) == dns_packet.ANCOUNT)
+        assert(len(dns_packet.nameservers) == dns_packet.NSCOUNT)
+        assert(len(dns_packet.additional_records) == dns_packet.ARCOUNT)
+
+        record_set = dns_packet.answers + dns_packet.nameservers + dns_packet.additional_records
+
         if source is None:
-            (source_addr, source_port) = ('0.0.0.0', 53)
+            (source_addr, source_port) = (None, 0)
         else:
             (source_addr, source_port) = source
-            source = self.get_ipaddr_blob(source_addr)
+            source = ipaddress.ip_address(source_addr).packed
 
         if destination is None:
-            (destination_addr, destination_port) = (None, 0)
+            (destination_addr, destination_port) = (None, 53)
         else:
             (destination_addr, destination_port) = destination
-            destination = self.get_ipaddr_blob(destination_addr)
+            destination = ipaddress.ip_address(destination_addr).packed
 
         with closing(self.db.cursor()) as cursor:
             cursor.execute('INSERT INTO packet ('
@@ -352,8 +362,10 @@ class Database(object):
                            '`qdcount`,'
                            '`ancount`,'
                            '`nscount`,'
-                           '`arcount`'
-                           ') VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                           '`arcount`,'
+                           '`queryset`,'
+                           '`recordset`'
+                           ') VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
                            (source,
                             source_port,
                             destination,
@@ -369,7 +381,12 @@ class Database(object):
                             dns_packet.QDCOUNT,
                             dns_packet.ANCOUNT,
                             dns_packet.NSCOUNT,
-                            dns_packet.ARCOUNT))
+                            dns_packet.ARCOUNT,
+                            self.get_queryset_id(dns_packet.questions),
+                            # TODO: reread RFC2181, unsure if ameservers+additional_records are part of the "record set"
+                            self.get_recordset_id(record_set)
+                           )
+                          )
 
             self.db.commit()
             packet_id = cursor.lastrowid
@@ -379,12 +396,9 @@ class Database(object):
             for question in dns_packet.questions:
                 self.create_packet_question(packet_id, question)
 
-            # Answers
-            # Nameservers
-            # Additional Records
-            for section in [dns_packet.answers, dns_packet.nameservers, dns_packet.additional_records]:
-                for record in section:
-                    self.create_packet_record(packet_id, record)
+            # Answers + Nameservers + Additional Records
+            for record in record_set:
+                self.create_packet_record(packet_id, record)
 
             return cursor.lastrowid
 
@@ -410,9 +424,6 @@ class Database(object):
             self._cached_queries[key] = id
             return id
 
-
-    def lookup_query(self, query_id):
-        pass
 
     def get_question_id(self, question):
         self.log.debug('get_question(%s)' % question)
@@ -576,6 +587,7 @@ class Database(object):
     def get_question_id(self, question):
         assert(isinstance(question, DnsQuestion))
         name_id = self.get_name_id(question.name)
+        # TODO: question id cache
         with closing(self.db.cursor()) as cursor:
             cursor.execute('SELECT id FROM question WHERE `name`=%s AND `qtype`=%s AND `qclass`=%s LIMIT 1', (name_id, int(question.qtype), int(question.qclass)))
             r = cursor.fetchone()
@@ -594,17 +606,29 @@ class Database(object):
         name_id = self.get_name_id(record.name)
         rdata_blob = self.get_blob_id(record.rdata)
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO `record` (`name`, `rtype`, `rclass`, `ttl`, `rdata`) '
-                           'VALUES (%s, %s, %s, %s, %s)',
-                           (name_id, int(record.rtype), int(record.rclass), record.ttl, rdata_blob))
+            cursor.execute('INSERT INTO `record` (`name`, `rtype`, `rclass`, `rdata`) '
+                           'VALUES (%s, %s, %s, %s)',
+                           (name_id, int(record.rtype), int(record.rclass), rdata_blob))
             self.db.commit()
             return cursor.lastrowid
+
+    # the queryset id and recordset id is designed to match:
+    # select packet.id,unhex(sha1(group_concat(packet_question.`question` ORDER BY `question` ASC))) as `queryset`,unhex(sha1(group_concat(packet_record.`record` ORDER BY `record` ASC))) as `recordset` FROM packet JOIN  packet_question on packet.id=packet_question.packet JOIN packet_record ON packet_question.packet=packet_record.packet GROUP BY `packet`.`id`;
+    # TODO: consider alternative implementation, perhaps one that uses the values instead of the database IDs
+
+    def get_queryset_id(self, questions):
+        self.log.debug('get_queryset_id(%s)')
+        return self._get_digest(','.join(map(str,(sorted(map(self.get_question_id, questions))))).encode('ascii'))
+
+    def get_recordset_id(self, records):
+        self.log.debug('get_recordset_id(%s)')
+        return self._get_digest(','.join(map(str,(sorted(map(self.get_record_id, records))))).encode('ascii'))
 
     def create_packet_record(self, packet_id, record):
         assert(isinstance(packet_id, int))
         record_id = self.get_record_id(record)
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO `packet_record` (`packet`, `record`) VALUES (%s, %s)', (packet_id, record_id,))
+            cursor.execute('INSERT INTO `packet_record` (`packet`, `record`, `ttl`) VALUES (%s, %s, %s)', (packet_id, record_id, record.ttl))
 
     def create_packet_question(self, packet_id, question):
         assert(isinstance(packet_id, int))
