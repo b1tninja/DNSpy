@@ -139,9 +139,8 @@ class DnsResolver(asyncio.Protocol):
 
         return response
 
-
     @asyncio.coroutine
-    def resolve(self, packet, ns=None, addr=None):
+    def resolve(self, dns_packet):
         # Enumerate NS for zone, starting from root label
         #  Enumerate addresses for given NS
         #   Query <SOA.zone> from NS,ADDR
@@ -154,16 +153,30 @@ class DnsResolver(asyncio.Protocol):
         #    Query <MX,zone> from NS,ADDR
         #    Query <MX,zone> from NS,ADDR
 
+        assert(isinstance(dns_packet, DnsPacket))
+        assert(hasattr(dns_packet, 'pk')) # The packet must be stored in the database
+
         # TODO: consider http://tools.ietf.org/html/draft-ietf-dnsext-edns1-03
-        assert(packet.QDCOUNT == 1)
-        question = packet.questions[0]
-        for label in reversed(question.name):
-            zone_cut = yield from self.query(DnsQuestion(label, DnsQType.NS))
+        # TODO: try/except to set proper RCODE
+        assert(dns_packet.QDCOUNT > 0)
+        if dns_packet.QDCOUNT > 1:
+            assert(all(map(lambda question: question.name == dns_packet.questions[0].name, dns_packet.questions)))
+            assert(all(map(lambda question: question.qclass == dns_packet.questions[0].qclass, dns_packet.questions)))
+
+        response = self.db.lookup_response(dns_packet.questions)
+        if response:
+            return response
+
+        self.db.create_query(dns_packet.pk)
+
+        for label in reversed(dns_packet.questions[0].name):
+            # TODO: opportunity here for async operation
+            zone_cut = self.db.lookup_response(DnsQuestion(label, DnsQType.NS))
+
             print(zone_cut)
 
             print(label)
 
-        return ([],[],[])
 
         response = yield from self.query(DnsQuestion(root_label, DnsQType.SOA))
 
@@ -239,23 +252,22 @@ class DnsServer(asyncio.Protocol):
 
     @asyncio.coroutine
     def respond_to_packet(self, dns_packet, addr):
-        try:
-            if dns_packet.QR == DnsQR.query:
-                # Apparently the internet is lame.
-                #assert(dns_packet.QDCOUNT == 1)
-                # TODO: make proposal with TC bit
+        self.resolver.db.store_packet(dns_packet, source=addr)
 
-                # TODO: wait_for?
-                (answers, nameservers, additional_records) = yield from self.resolver.resolve(dns_packet)
+        if dns_packet.QR == DnsQR.query:
+            try:
+                response = yield from self.resolver.resolve(dns_packet)
+            except asyncio.CancelledError:
+                self.log.debug("Task cancelled.")
+            except asyncio.InvalidStateError:
+                self.log.debug("Got result, but future was already cancelled.")
+            else:
                 # TODO: RFC2181 FORBIDS mixed TTL values in a record set.
-                response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, questions=dns_packet.questions, answers=answers, nameservers=nameservers, additional_records=additional_records)
-
+                #response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, questions=dns_packet.questions, answers=answers, nameservers=nameservers, additional_records=additional_records)
+                # TODO: consider making a responses table that refrences a packet to a destination addr,port
                 self.resolver.db.store_packet(response, destination=addr)
                 self.transport.sendto(response.encode(), addr)
-        except asyncio.CancelledError:
-            self.log.debug("Task cancelled.")
-        except asyncio.InvalidStateError:
-            self.log.debug("Got result, but future was already cancelled.")
+
 
     def datagram_received(self, data, addr):
         (host,port) = addr
@@ -265,7 +277,6 @@ class DnsServer(asyncio.Protocol):
             self.log.warn('Unable to parse packet %s from %s.' % (data, host))
         else:
             self.log.info('Incoming packet: %s' % dns_packet)
-            packet_id = self.resolver.db.store_packet(dns_packet, source=addr)
             task = asyncio.async(self.respond_to_packet(dns_packet, addr))
             loop.call_later(3, task.cancel)
 
@@ -380,6 +391,8 @@ class Database(object):
             for record in record_set:
                 self.create_packet_record(packet_id, record)
 
+            # TODO: reconsider using the dns_packet as a mutable object...
+            dns_packet.pk = packet_id
             return cursor.lastrowid
 
 
@@ -534,13 +547,15 @@ class Database(object):
             return cursor.lastrowid
 
 
-    def lookup_response(self, questions, **kwargs):
-        response_id = self.lookup_response_id(questions, **kwargs)
+    def lookup_response(self, *args, **kwargs):
+        response_id = self.lookup_response_id(*args, **kwargs)
         if response_id:
             return self.get_packet(response_id)
 
 
     def lookup_response_id(self, questions, ns_id=None, addr_id=None):
+        if isinstance(questions, DnsQuestion):
+            questions = [questions]
         questionset = self.get_questionset_id(questions)
         with closing(self.db.cursor()) as cursor:
             if ns_id is not None and addr_id is not None:
@@ -562,31 +577,37 @@ class Database(object):
 
 
     def get_packet_questions(self, packet_id):
+        # TODO: consider using yield?
         questions = []
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_questions(%d)' % (packet_id,))
-            cursor.execute('SELECT resource_header.name,resource_header.type,resource_header.class FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id  WHERE packet_question.packet=%s ORDER BY packet_question.id ASC', (packet_id,))
+            cursor.execute('SELECT resource_header.id, resource_header.name,resource_header.type,resource_header.class FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id  WHERE packet_question.packet=%s ORDER BY packet_question.id ASC', (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
             for row in rows:
-                (name_id, qtype, qclass) = row
+                (pk, name_id, qtype, qclass) = row
                 name = self.get_name(name_id)
-                questions.append(DnsQuestion(name, qtype, qclass))
+                question = DnsQuestion(name, qtype, qclass)
+                question.pk = pk
+                questions.append(question)
 
         return questions
 
 
     def get_packet_records(self, packet_id):
+        # TODO: consider using yield?
         records = []
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_records(%d)' % (packet_id,))
-            cursor.execute('SELECT resource_header.name,resource_header.type,resource_header.class,packet_record.ttl,dns.blob.blob FROM packet_record JOIN resource_record JOIN resource_header JOIN dns.blob ON packet_record.record = resource_record.id AND resource_header.id = resource_record.header AND dns.blob.sha1=resource_record.rdata WHERE packet_record.packet = %s ORDER BY packet_record.id ASC', (packet_id,))
+            cursor.execute('SELECT resource_record.id, resource_header.name,resource_header.type,resource_header.class,packet_record.ttl,dns.blob.blob FROM packet_record JOIN resource_record JOIN resource_header JOIN dns.blob ON packet_record.record = resource_record.id AND resource_header.id = resource_record.header AND dns.blob.sha1=resource_record.rdata WHERE packet_record.packet = %s ORDER BY packet_record.id ASC', (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
             for row in rows:
-                (name_id, rtype, rclass, ttl, rdata) = row
+                (pk, name_id, rtype, rclass, ttl, rdata) = row
                 name = self.get_name(name_id)
-                records.append(DnsRecord(name, rtype, rclass, ttl, rdata=rdata))
+                record = DnsRecord(name, rtype, rclass, ttl, rdata=rdata)
+                record.pk = pk
+                records.append(record)
 
         return records
 
@@ -595,12 +616,12 @@ class Database(object):
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet(%s)' % (packet_id,))
             # TODO: `source`, `source_port`, `destination`, `destination_port`, `effective_ttl`, `questionset`, `recordset`
-            cursor.execute('SELECT `txnid`, `qr`, `opcode`, `aa`, `tc`, `rd`, `z`, `rcode`, `qdcount`, `ancount`, `nscount`, `arcount` FROM packet WHERE packet.id=%s LIMIT 1', (packet_id,))
+            cursor.execute('SELECT `id`,`txnid`, `qr`, `opcode`, `aa`, `tc`, `rd`, `z`, `rcode`, `qdcount`, `ancount`, `nscount`, `arcount` FROM packet WHERE packet.id=%s LIMIT 1', (packet_id,))
             self.queries += 1
             row = cursor.fetchone()
 
         if row is not None:
-            (ID, QR, OPCODE, AA, TC, RD, Z, RCODE, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT) = row
+            (ID, TXNID, QR, OPCODE, AA, TC, RD, Z, RCODE, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT) = row
             QR = DnsQR(QR)
             OPCODE = DnsOpCode(OPCODE)
             RCODE = DnsResponseCode(RCODE)
@@ -618,12 +639,13 @@ class Database(object):
 
             cls = Query if QR == DnsQR.query else Response
 
-            dns_packet = cls(ID=ID,QR=QR,OPCODE=OPCODE,AA=AA,TC=TC,RD=RD,Z=Z,RCODE=RCODE,
+            dns_packet = cls(ID=TXNID,QR=QR,OPCODE=OPCODE,AA=AA,TC=TC,RD=RD,Z=Z,RCODE=RCODE,
                              QDCOUNT=QDCOUNT,ANCOUNT=ANCOUNT,NSCOUNT=NSCOUNT,ARCOUNT=ARCOUNT,
                              questions=questions,
                              answers=answers,
                              nameservers=nameservers,
                              additional_records=additional_records)
+            dns_packet.pk = ID
             return dns_packet
 
 
@@ -642,6 +664,7 @@ class Database(object):
     def create_packet_record(self, packet_id, record):
         assert(isinstance(packet_id, int))
         record_id = self.get_record_id(record)
+        record.pk = record_id
         with closing(self.db.cursor()) as cursor:
             cursor.execute('INSERT INTO `packet_record` (`packet`, `record`, `ttl`) VALUES (%s, %s, %s)', (packet_id, record_id, record.ttl))
             self.queries += 1
@@ -650,6 +673,7 @@ class Database(object):
     def create_packet_question(self, packet_id, question):
         assert(isinstance(packet_id, int))
         question_id = self.get_resource_header_id(question)
+        question.pk = question_id
         with closing(self.db.cursor()) as cursor:
             cursor.execute('INSERT INTO `packet_question` (`packet`, `question`) VALUES (%s, %s)', (packet_id, question_id,))
             self.queries += 1
