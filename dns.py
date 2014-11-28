@@ -75,7 +75,7 @@ class DnsResolver(asyncio.Protocol):
                 yield record
 
 
-    def __init__(self, db, root_hints_path=None):
+    def __init__(self, db, root_hints_path='named.root'):
         self.queue = {}
         self.db = db
         self.log = logging.Logger('resolver')
@@ -101,7 +101,7 @@ class DnsResolver(asyncio.Protocol):
             else:
                 self.log.warn("Unexpected packet.")
 
-    def bootstrap(self,root_hints_path='named.root'):
+    def bootstrap(self, root_hints_path):
         questions = [DnsQuestion(root_label, qtype=DnsQType.NS)]
         response = self.db.lookup_response(questions)
 
@@ -128,7 +128,6 @@ class DnsResolver(asyncio.Protocol):
 
                 query = Query(QR=DnsQR.query, RD=False, questions = questions)
                 response = Response(QR=DnsQR.response, ID=query.ID, AA=True, RD=False, RA=False,
-                                    questions=questions,
                                     nameservers=nameservers,
                                     additional_records=additional_records)
 
@@ -597,31 +596,33 @@ class Database(object):
             # TODO: `source`, `source_port`, `destination`, `destination_port`, `effective_ttl`, `questionset`, `recordset`
             cursor.execute('SELECT `txnid`, `qr`, `opcode`, `aa`, `tc`, `rd`, `z`, `rcode`, `qdcount`, `ancount`, `nscount`, `arcount` FROM packet WHERE packet.id=%s LIMIT 1', (packet_id,))
             self.queries += 1
-            r = cursor.fetchone()
+            row = cursor.fetchone()
 
-        if r is not None:
+        if row is not None:
+            (ID, QR, OPCODE, AA, TC, RD, Z, RCODE, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT) = row
+            QR = DnsQR(QR)
+            OPCODE = DnsOpCode(OPCODE)
+            RCODE = DnsResponseCode(RCODE)
             questions = self.get_packet_questions(packet_id)
+            assert(len(questions) == QDCOUNT)
+
             records = self.get_packet_records(packet_id)
 
-            cls = Query if r[1] == DnsQR.query else Response
-            # TODO: dictionary, or some type of mapping?
-            dns_packet = cls(ID=r[0],
-                                   QR=r[1],
-                                   OPCODE=r[2],
-                                   AA=r[3],
-                                   TC=r[4],
-                                   RD=r[5],
-                                   Z=r[6],
-                                   RCODE=r[7],
-                                   QDCOUNT=r[8],
-                                   ANCOUNT=r[9],
-                                   NSCOUNT=r[10],
-                                   ARCOUNT=r[11],
-                                   questions=questions, # [:r[8]] implied
-                                   answers=records[:r[9]],
-                                   nameservers=records[r[9]:r[9]+r[10]],
-                                   additional_records=records[r[9]+r[10]:]  # :r[11] implied, could also use -r[11]
-                                   )
+            answers = records[:ANCOUNT]
+            assert(len(answers) == ANCOUNT)
+            nameservers = records[ANCOUNT:ANCOUNT+NSCOUNT]
+            assert(len(nameservers) == NSCOUNT)
+            additional_records = records[ANCOUNT+NSCOUNT:]
+            assert(len(additional_records) == ARCOUNT)
+
+            cls = Query if QR == DnsQR.query else Response
+
+            dns_packet = cls(ID=ID,QR=QR,OPCODE=OPCODE,AA=AA,TC=TC,RD=RD,Z=Z,RCODE=RCODE,
+                             QDCOUNT=QDCOUNT,ANCOUNT=ANCOUNT,NSCOUNT=NSCOUNT,ARCOUNT=ARCOUNT,
+                             questions=questions,
+                             answers=answers,
+                             nameservers=nameservers,
+                             additional_records=additional_records)
             return dns_packet
 
 

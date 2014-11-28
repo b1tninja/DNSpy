@@ -93,22 +93,30 @@ class DnsPacket(object):
         if not isinstance(RCODE, DnsResponseCode):
             RCODE = DnsResponseCode(RCODE)
 
-        self.ID = ID
+        self.ID = int(ID)
         self.QR = QR
         self.OPCODE = OPCODE
-        self.AA = AA
-        self.TC = TC
-        self.RD = RD
-        self.RA = RA
-        self.Z = Z
+        self.AA = bool(AA)
+        self.TC = bool(TC)
+        self.RD = bool(RD)
+        self.RA = bool(RA)
+        self.Z = int(Z)
         self.RCODE = RCODE
-        self.QDCOUNT = QDCOUNT
-        self.ANCOUNT = ANCOUNT
-        self.NSCOUNT = NSCOUNT
-        self.ARCOUNT = ARCOUNT
+        self.QDCOUNT = int(QDCOUNT)
+        self.ANCOUNT = int(ANCOUNT)
+        self.NSCOUNT = int(NSCOUNT)
+        self.ARCOUNT = int(ARCOUNT)
+
+        assert(isinstance(questions, list))
         self.questions = questions
+
+        assert(isinstance(answers, list))
         self.answers = answers
+
+        assert(isinstance(nameservers, list))
         self.nameservers = nameservers
+
+        assert(isinstance(additional_records, list))
         self.additional_records = additional_records
 
     def __repr__(self):
