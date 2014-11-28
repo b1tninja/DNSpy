@@ -1,5 +1,5 @@
 /*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
-/*!40101 SET NAMES utf8 */;
+/*!40101 SET NAMES ascii */;
 /*!40014 SET FOREIGN_KEY_CHECKS=0 */;
 
 
@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS `blacklist` (
   `ip` VARBINARY(16) NOT NULL,
 --  `reason` TINYINT(3) UNSIGNED NOT NULL DEFAULT 0,
   PRIMARY KEY (`ip`)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
 
 
 -- Dumping structure for table dns.packet
@@ -38,15 +38,16 @@ CREATE TABLE IF NOT EXISTS `packet` (
   `ancount` smallint(6) unsigned NOT NULL,
   `nscount` smallint(6) unsigned NOT NULL,
   `arcount` smallint(6) unsigned NOT NULL,
-  `queryset` binary(20) NOT NULL,
+  `questionset` binary(20) NOT NULL,
   `recordset` binary(20) NOT NULL,
+  `effective_ttl` int(10) unsigned NOT NULL DEFAULT 0, -- SELECT MIN(ttl) from packet_record WHERE packet=id
   `cached` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `source` (`source`),
   KEY `destination` (`destination`),
-  KEY `queryset` (`queryset`),
+  KEY `questionset` (`questionset`),
   KEY `recordset` (`recordset`)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
 
 
 -- Dumping structure for table dns.names
@@ -82,7 +83,7 @@ CREATE TABLE IF NOT EXISTS `resource_record` (
   KEY `rdata` (`rdata`),
   CONSTRAINT `rr_header_fk` FOREIGN KEY (`header`) REFERENCES `resource_header` (`id`),
   CONSTRAINT `rr_rdata_fk` FOREIGN KEY (`rdata`) REFERENCES `blob` (`sha1`)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
 
 -- Dumping structure for table dns.packet_question
 CREATE TABLE IF NOT EXISTS `packet_question` (
@@ -123,7 +124,7 @@ CREATE TABLE IF NOT EXISTS `packet_record` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
   `packet` bigint(20) unsigned NOT NULL,
   `record` bigint(20) unsigned NOT NULL,
-  -- TODO: Might be nice to have a field for the over-the-wire bytes of a given name
+  -- TODO: Might be nice to have a field for the over-the-wire bytes of a given name VARCHAR(255)/blob_id?
   -- TODO: RFC2181 suggests ttl be "ignored" when considering record sets, log as part of the packet instead of the record
   `ttl` int(10) unsigned NOT NULL,
   PRIMARY KEY (`id`),

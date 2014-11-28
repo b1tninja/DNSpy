@@ -45,8 +45,8 @@ class DnsRecord(object):
             rdata = bytes(rdata, 'ascii')
 
         self.name = name
-        self.rtype = rtype
-        self.rclass = rclass
+        self.rtype = DnsRType(rtype)
+        self.rclass = DnsRClass(rclass)
         self.ttl = ttl
         self.rdlength = rdlength
         self.rdata = rdata
@@ -86,6 +86,12 @@ class DnsPacket(object):
             NSCOUNT = len(nameservers)
         if ARCOUNT is None:
             ARCOUNT = len(additional_records)
+        if not isinstance(QR, DnsQR):
+            QR = DnsQR(QR)
+        if not isinstance(OPCODE, DnsOpCode):
+            OPCODE = DnsOpCode(OPCODE)
+        if not isinstance(RCODE, DnsResponseCode):
+            RCODE = DnsResponseCode(RCODE)
 
         self.ID = ID
         self.QR = QR
@@ -259,3 +265,5 @@ class DomainName(list):
                 break #?
         data.append(0)
         return bytes(data)
+
+root_label = DomainName.from_string('.')
