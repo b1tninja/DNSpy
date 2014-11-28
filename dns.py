@@ -128,6 +128,7 @@ class DnsResolver(asyncio.Protocol):
 
                 query = Query(QR=DnsQR.query, RD=False, questions = questions)
                 response = Response(QR=DnsQR.response, ID=query.ID, AA=True, RD=False, RA=False,
+                                    questions=questions,
                                     nameservers=nameservers,
                                     additional_records=additional_records)
 
@@ -564,7 +565,7 @@ class Database(object):
         questions = []
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_questions(%d)' % (packet_id,))
-            cursor.execute('SELECT resource_header.name,resource_header.type,resource_header.class FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id  WHERE packet_question.question=%s ORDER BY packet_question.id ASC', (packet_id,))
+            cursor.execute('SELECT resource_header.name,resource_header.type,resource_header.class FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id  WHERE packet_question.packet=%s ORDER BY packet_question.id ASC', (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
             for row in rows:
