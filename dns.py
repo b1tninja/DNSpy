@@ -22,9 +22,12 @@ try:
 except ImportError:
     signal = None
 
+from socket import gaierror, has_ipv6
+
 import logging
 
 from dns_packet import DnsPacket, DnsQuestion, DnsRecord, DomainName, Query, Response
+from dns_packet import RData_SOA
 # Enums
 from enums import DnsQR, DnsQType, DnsQClass, DnsRType, DnsRClass, DnsOpCode, DnsResponseCode
 # Constants
@@ -41,6 +44,11 @@ class Nameserver(DomainName):
 
 class DnsResolver(asyncio.Protocol):
     loop = asyncio.get_event_loop()
+
+    def error_received(self, exception):
+        if isinstance(exception, gaierror):
+            pass
+        self.log.critical(exception)
 
     def record_reader(self, zone_file):
         with open(zone_file,'r') as root_hints_file:
@@ -92,11 +100,14 @@ class DnsResolver(asyncio.Protocol):
             self.log.warning('Unable to parse packet:', data)
         else:
             self.log.info('resolver_datagram_recieved(%s, %s)' % (dns_packet, addr))
-            packet_id = self.db.store_packet(dns_packet, source=addr)
+            self.db.store_packet(dns_packet, source=addr)
             (host,port) = addr
             key = (str(host),dns_packet.ID)
             if key in self.queue:
-                (packet_id, future) = self.queue[key]
+                (query_packet, future) = self.queue[key]
+                del self.queue[key]
+                # TODO: asserts about answer matching query_packet
+                self.db.update_query_response(query_packet.pk, dns_packet.pk)
                 future.set_result(dns_packet)
             else:
                 self.log.warn("Unexpected packet.")
@@ -132,27 +143,15 @@ class DnsResolver(asyncio.Protocol):
                                     nameservers=nameservers,
                                     additional_records=additional_records)
 
-                query_id = self.db.store_packet(query)
-                response_id = self.db.store_packet(response)
+                self.db.store_packet(query)
+                self.db.store_packet(response)
 
-                self.db.create_query(query_id, response_id=response_id)
+                self.db.create_query(query.pk, response_id=response.pk)
 
         return response
 
     @asyncio.coroutine
     def resolve(self, dns_packet):
-        # Enumerate NS for zone, starting from root label
-        #  Enumerate addresses for given NS
-        #   Query <SOA.zone> from NS,ADDR
-        #   On response,
-        #    resolve
-        #   If error, try next A/AAAA?
-        #  Next NS
-        #
-        #    Query <NS,zone> from NS,ADDR
-        #    Query <MX,zone> from NS,ADDR
-        #    Query <MX,zone> from NS,ADDR
-
         assert(isinstance(dns_packet, DnsPacket))
         assert(hasattr(dns_packet, 'pk')) # The packet must be stored in the database
 
@@ -167,76 +166,81 @@ class DnsResolver(asyncio.Protocol):
         if response:
             return response
 
+
+        # TODO: deduplicate at the packet level?
         self.db.create_query(dns_packet.pk)
 
-        for label in reversed(dns_packet.questions[0].name):
+        parent_ns = self.db.lookup_response(DnsQuestion(root_label, DnsQType.NS))
+        # TODO: if not parent_ns bootstrap() ?
+        assert(isinstance(parent_ns, Response))
+
+        # Determine SOA
+        for zone in dns_packet.questions[0].name.enumerate_hierarchy():
             # TODO: opportunity here for async operation
-            zone_cut = self.db.lookup_response(DnsQuestion(label, DnsQType.NS))
+            question = DnsQuestion(zone, DnsQType.SOA)
+            zone_soa = self.db.lookup_response(question)
+            if not zone_soa:
+                for nameserver in parent_ns.nameservers:
+                    assert(isinstance(nameserver, DnsRecord))
+                    assert(nameserver.rtype == DnsRType.NS)
+                    # TODO: Use/Check resolved AA queries from cached records, from parent_ns
+                    # As fallback, use glue
+                    # TODO: Nameserver(nameserver_record)?
+                    ns_name = DomainName.parse(nameserver.rdata)
+                    for additional_record in parent_ns.additional_records:
+                        assert(isinstance(additional_record, DnsRecord))
+                        # Not interested in anything other than A/AAAA
+                        if additional_record.name == ns_name and additional_record.rtype in [DnsRType.A, DnsRType.AAAA]:
+                            try:
+                                result = yield from self.query([question], nameserver, additional_record, parent_id=dns_packet.pk)
+                            except asyncio.CancelledError:
+                                pass
+                            except asyncio.InvalidStateError:
+                                pass
+                            else:
+                                self.log.debug('resolve() %s' % result)
+                                assert(isinstance(result,Response))
+                                # TODO: ANCOUNT == 1 probably shouldn't be a requirement
+                                if result.AA and result.RCODE == DnsResponseCode.no_error and result.ANCOUNT == 1:
+                                    # TODO: and rtype = SOA etc
+                                    zone_soa_dict = RData_SOA.parse(result.answers[0].rdata)
+                                    zone_soa = result
 
-            print(zone_cut)
 
-            print(label)
+                # TODO: if still not zone_soa
 
+            break # for debugging purposes
+        print(bool(zone_soa))
+        return "somestuff"
 
-        response = yield from self.query(DnsQuestion(root_label, DnsQType.SOA))
+    def query(self, questions, nameserver_record, address_record, parent_id=None):
+        if nameserver_record:
+            assert(isinstance(nameserver_record, DnsRecord))
+            assert(hasattr(nameserver_record, 'pk'))
+        if address_record:
+            assert(isinstance(address_record, DnsRecord))
+            assert(hasattr(address_record, 'pk'))
 
-        if len(answers) == 0:
-            ns_map = {}
-            for record in additional_records:
-                if record.rtype == DnsRType.A:
-                    ns_map[record.name] = ipaddress.IPv4Address(record.rdata)
-                elif record.rtype == DnsRType.AAAA:
-                    ns_map[record.name] = ipaddress.IPv6Address(record.rdata)
-            for ns_record in nameservers:
-                if DomainName.parse(ns_record.rdata) in ns_map:
-                    print(ns_map[ns_record.name])
+        future = asyncio.Future()
 
-        for name in  [question.name[n-1:] for n in range(len(question.name),0,-1)]:
-            (answers, nameservers, additional_records) = self.query(DnsQuestion(name, DnsQType.SOA), query)
-            print(name, answers, nameservers, additional_records)
+        cached_record = self.db.lookup_response(questions, nameserver_record.pk, address_record.pk)
+        if cached_record:
+            future.set_result(cached_record)
+        else:
+            ip = ipaddress.ip_address(address_record.rdata)
 
-    # TODO: query()
-    # @asyncio.coroutine
-    # def query(self, questions):
-    #     if isinstance(questions, DnsQuestion):
-    #         questions = [questions]
-    #     assert(isinstance(questions, list))
-    #     for question in questions:
-    #         assert(isinstance(question, DnsQuestion))
-    #
-    #     response = self.db.lookup_response(questions)
-    #     if response:
-    #         # Cached
-    #         pass
-    #         # TODO: return response?
-    #     else:
-    #         # Not cached
-    #         query = Query(QR=DnsQR.query, RD=False, questions=questions)
-    #         query_id = self.db.store_packet(query)
-    #         self.db.create_query(query_id)
-    # TODO: subquery()
-    # def subquery(self, ns_id, addr_id, host, question):
-    #     future = asyncio.Future()
-    #     question_id = self.db.get_resource_header_id(question)
-    #     query_id = self.db.get_query_id(question_id, ns_id, addr_id)
-    #     dns_packet = Query(questions=[question], RD=False)
-    #     addr = (str(host),53)
-    #     self.db.store_packet(dns_packet, destination=addr)
-    #     self.queue[(str(host), dns_packet.ID)] = (packet_id, future)
-    #     self.transport.sendto(dns_packet.encode(), addr)
+            dns_packet = Query(questions=questions, RD=False)
+            key = (ip.exploded, dns_packet.ID)
+            self.db.store_packet(dns_packet, destination=(ip.exploded,53))
+            self.db.create_query(dns_packet.pk, nameserver_record.pk, address_record.pk, parent_id)
+            self.queue[key] = (dns_packet, future)
+            self.transport.sendto(dns_packet.encode(), (ip.exploded,53))
+            #TODO: try to catch the exception on giaerror
+            # TODO: handle condition when IPV6 fails?
+            # del self.queue[key]
+            # future.cancel()
 
-    # TODO: discover_soa()
-    # @asyncio.coroutine
-    # def discover_soa(self, domain_name):
-    #     return asyncio.Future()
-    #     question = DnsQuestion(DomainName.from_string('.'), DnsQType.SOA)
-    #     question_id = self.db.get_question_id(question)
-    #     # Walk the database starting form the root
-    #     root_hints = self.get_root_servers()
-    #     for ns_name in root_hints:
-    #         (ns_id, address_records) = root_hints[ns_name]
-    #         for (addr_id, addr) in address_records:
-    #             self._query(ns_id, addr_id, addr, question)
+        return future
 
 class DnsServer(asyncio.Protocol):
     loop = asyncio.get_event_loop()
@@ -278,7 +282,8 @@ class DnsServer(asyncio.Protocol):
         else:
             self.log.info('Incoming packet: %s' % dns_packet)
             task = asyncio.async(self.respond_to_packet(dns_packet, addr))
-            loop.call_later(3, task.cancel)
+            #loop.call_later(60, task.cancel) # TODO: play around with timeout parameter
+
 
 
 class Database(object):
@@ -393,7 +398,7 @@ class Database(object):
 
             # TODO: reconsider using the dns_packet as a mutable object...
             dns_packet.pk = packet_id
-            return cursor.lastrowid
+            #return cursor.lastrowid
 
 
     def get_name(self, name_id):
@@ -466,21 +471,21 @@ class Database(object):
             return node
 
 
-    def create_query(self, packet_id, ns_id=None, addr_id=None, response_id=None):
+    def create_query(self, packet_id, ns_id=None, addr_id=None, parent=None, response_id=None):
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO query (`packet`, `nameserver`, `address`, `response`) VALUES (%s, %s, %s, %s)',
-                           (packet_id, ns_id, addr_id, response_id))
+            cursor.execute('INSERT INTO query (`packet`,`nameserver`,`address`,`parent`,`response`) VALUES (%s,%s,%s,%s,%s)',
+                           (packet_id, ns_id, addr_id, parent, response_id))
             self.queries += 1
             self.db.commit()
-            self.log.debug('create_query(%s,%s,%s,%s) created with id: %d' %
-                           (packet_id, ns_id, addr_id, response_id, cursor.lastrowid))
+            self.log.debug('create_query(%s,%s,%s,%s,%s) created with id: %d' %
+                           (packet_id, parent, ns_id, addr_id, response_id, cursor.lastrowid))
             return cursor.lastrowid
 
 
     def update_query_response(self, query_id, response_id):
         with closing(self.db.cursor()) as cursor:
             cursor.execute('UPDATE query SET `response` = %s WHERE `packet` = %s LIMIT 1',
-                           (query_id, response_id))
+                           (response_id, query_id))
             self.queries += 1
             self.db.commit()
             self.log.debug('update_query_response(%s,%s)' %

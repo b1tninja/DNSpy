@@ -35,6 +35,24 @@ class DnsQuestion(object):
     def encode(self):
         return self.name.encode() + struct.pack('!HH', self.qtype, self.qclass)
 
+class RData(object):
+    pass
+
+class RData_SOA(RData):
+    @staticmethod
+    def parse(rdata):
+        # TODO: consider some wizardry with locals()
+        offset = 0
+        (mname,offset) = DomainName.parse_from(rdata, offset)
+        (rname,offset) = DomainName.parse_from(rdata, offset)
+        (serial, refresh, retry, expire) = struct.unpack_from('!IIII', rdata, offset)
+        return {'mname': mname,
+                'rname': rname,
+                'serial': serial,
+                'refresh': refresh,
+                'retry': retry,
+                'expire': expire}
+
 
 class DnsRecord(object):
     def __init__(self, name, rtype=DnsRType.A, rclass=DnsRClass.IN , ttl=0, rdlength=None, rdata=b""):
@@ -45,10 +63,16 @@ class DnsRecord(object):
             rdata = bytes(rdata, 'ascii')
 
         self.name = name
-        self.rtype = DnsRType(rtype)
-        self.rclass = DnsRClass(rclass)
-        self.ttl = ttl
-        self.rdlength = rdlength
+        try:
+            self.rtype = DnsRType(rtype)
+        except ValueError:
+            self.rtype = int(rtype)
+        try:
+            self.rclass = DnsRClass(rclass)
+        except ValueError:
+            self.rclass = int(rclass)
+        self.ttl = int(ttl)
+        self.rdlength = int(rdlength)
         self.rdata = rdata
         assert (len(rdata) == rdlength)
 
@@ -128,7 +152,7 @@ class DnsPacket(object):
         # Transaction ID 16
         (ID,) = struct.unpack_from('!H', data)
         # Query/Response 1
-        QR = (data[2] & 0b1000000)
+        QR = (data[2] & 0b10000000) >>7
         # OpCode 4
         OPCODE = DnsOpCode((data[2] & 0b01111000) >> 3)
         # Authoratative Answer 1
@@ -216,8 +240,25 @@ class DomainName(list):
     # TODO: support preservation of the over-the-wire encoding (the raw bytes)
     def __hash__(self):
         return hash(str(self).lower())
+
+    def __eq__(self, other):
+        assert(isinstance(other, DomainName))
+        return hash(self)==hash(other)
+
     def __str__(self):
         return '.'.join(self)
+
+    # def __init__(self, labels):
+    #     if labels == []:
+    #         # TODO: auto upgrade [] into the root_label? may be better to force compliance elsewhere
+    #         list.__init__(self, [''])
+    #     else:
+    #         list.__init__(self, labels)
+
+    def enumerate_hierarchy(self):
+        yield root_label
+        for n in range(len(self)-1,0,-1):
+            yield DomainName(self[n:])
 
     @staticmethod
     def from_string(name):
@@ -234,7 +275,7 @@ class DomainName(list):
         sequence = []
         while (data[offset]):
             if data[offset] < 64:
-                print(data[offset + 1:offset + 1 + data[offset]])
+                #print(data[offset + 1:offset + 1 + data[offset]])
                 label = data[offset + 1:offset + 1 + data[offset]].decode('ascii')
                 assert(allowed_charset.issuperset(label))
                 offset += data[offset] + 1
