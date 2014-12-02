@@ -1,10 +1,10 @@
-import random
-
 import binascii
 import random
 import string
 import struct
+
 from enums import DnsQType, DnsRClass, DnsQClass, DnsRType, DnsQR, DnsOpCode, DnsResponseCode
+
 
 class DnsQuestion(object):
     def __hash__(self):
@@ -35,16 +35,18 @@ class DnsQuestion(object):
     def encode(self):
         return self.name.encode() + struct.pack('!HH', self.qtype, self.qclass)
 
+
 class RData(object):
     pass
+
 
 class RData_SOA(RData):
     @staticmethod
     def parse(rdata):
         # TODO: consider some wizardry with locals()
         offset = 0
-        (mname,offset) = DomainName.parse_from(rdata, offset)
-        (rname,offset) = DomainName.parse_from(rdata, offset)
+        (mname, offset) = DomainName.parse_from(rdata, offset)
+        (rname, offset) = DomainName.parse_from(rdata, offset)
         (serial, refresh, retry, expire) = struct.unpack_from('!IIII', rdata, offset)
         return {'mname': mname,
                 'rname': rname,
@@ -55,29 +57,28 @@ class RData_SOA(RData):
 
 
 class DnsRecord(object):
-    def __init__(self, name, rtype=DnsRType.A, rclass=DnsRClass.IN , ttl=0, rdlength=None, rdata=b""):
-        if rdlength is None:
-            rdlength = len(rdata)
-
+    def __init__(self, name, rtype=DnsRType.A, rclass=DnsRClass.IN, ttl=0, rdata=b""):
         if isinstance(rdata, str):
             rdata = bytes(rdata, 'ascii')
 
         self.name = name
+
         try:
             self.rtype = DnsRType(rtype)
         except ValueError:
             self.rtype = int(rtype)
+
         try:
             self.rclass = DnsRClass(rclass)
         except ValueError:
             self.rclass = int(rclass)
-        self.ttl = int(ttl)
-        self.rdlength = int(rdlength)
-        self.rdata = rdata
-        assert (len(rdata) == rdlength)
 
-    @staticmethod
-    def parse(data, offset):
+        self.ttl = int(ttl)
+        self.rdlength = len(rdata)
+        self.rdata = rdata
+
+    @classmethod
+    def parse(cls, data, offset):
         (name, offset) = DomainName.parse_from(data, offset)
         (rtype, rclass, ttl, rdlength) = struct.unpack_from('!HHIH', data, offset)
         offset += 10
@@ -86,22 +87,27 @@ class DnsRecord(object):
 
         try:
             rtype = DnsRType(rtype)
+        except ValueError:
+            rtype = int(rtype)
+        try:
             rclass = DnsRClass(rclass)
         except ValueError:
-            pass
+            rclass = int(rclass)
 
-        return (DnsRecord(name, rtype, rclass, ttl, rdlength, rdata), offset,)
+        return cls(name, rtype, rclass, ttl, rdata), offset,
 
     def __repr__(self):
         return "<Record:%s,%s,%s,%d,%d,%s>" % (
-        self.name, self.rtype, self.rclass, self.ttl, self.rdlength, binascii.b2a_hex(self.rdata))
+            self.name, self.rtype, self.rclass, self.ttl, self.rdlength, binascii.b2a_hex(self.rdata))
 
     def encode(self):
         return self.name.encode() + struct.pack('!HHIH', self.rtype, self.rclass, self.ttl, self.rdlength) + self.rdata
 
-class DnsPacket(object):
 
-    def __init__(self, ID=random.getrandbits(16), QR=DnsQR.query, OPCODE=DnsOpCode.query, AA = False, TC = False, RD = True, RA = True, Z = 0, RCODE=DnsResponseCode.no_error, QDCOUNT=None, ANCOUNT=None, NSCOUNT=None, ARCOUNT=None, questions=[], answers=[], nameservers=[], additional_records=[]):
+class DnsPacket(object):
+    def __init__(self, ID=random.getrandbits(16), QR=DnsQR.query, OPCODE=DnsOpCode.query, AA=False, TC=False, RD=True,
+                 RA=True, Z=0, RCODE=DnsResponseCode.no_error, QDCOUNT=None, ANCOUNT=None, NSCOUNT=None, ARCOUNT=None,
+                 questions=[], answers=[], nameservers=[], additional_records=[]):
         if QDCOUNT is None:
             QDCOUNT = len(questions)
         if ANCOUNT is None:
@@ -144,7 +150,8 @@ class DnsPacket(object):
         self.additional_records = additional_records
 
     def __repr__(self):
-        return "<DnsPacket:%s, questions:%s, answers:%s, nameservers:%s, additional_records: %s>" % (hex(self.ID), self.questions, self.answers, self.nameservers, self.additional_records)
+        return "<DnsPacket:%s, questions:%s, answers:%s, nameservers:%s, additional_records: %s>" % (
+            hex(self.ID), self.questions, self.answers, self.nameservers, self.additional_records)
 
     @classmethod
     def parse(cls, data, offset=None):
@@ -152,7 +159,7 @@ class DnsPacket(object):
         # Transaction ID 16
         (ID,) = struct.unpack_from('!H', data)
         # Query/Response 1
-        QR = (data[2] & 0b10000000) >>7
+        QR = (data[2] & 0b10000000) >> 7
         # OpCode 4
         OPCODE = DnsOpCode((data[2] & 0b01111000) >> 3)
         # Authoratative Answer 1
@@ -165,7 +172,7 @@ class DnsPacket(object):
         RA = data[3] & 0b10000000 != 0
         # Reserved for future, zero value
         Z = (data[3] & 0b01110000) >> 4
-        #assert Z == 0 # Newer RFCs obsolete this
+        # assert Z == 0 # Newer RFCs obsolete this
         RCODE = DnsResponseCode(data[3] & 0b1111)
         (QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT,) = struct.unpack_from('!HHHH', data, 4)
 
@@ -173,7 +180,7 @@ class DnsPacket(object):
             offset = 12
 
         questions = []
-        while (len(questions) < QDCOUNT):
+        while len(questions) < QDCOUNT:
             (question, offset) = DnsQuestion.parse(data, offset)
             questions.append(question)
 
@@ -182,11 +189,11 @@ class DnsPacket(object):
         additional_records = []
         while offset < len(data):
             (rr, offset) = DnsRecord.parse(data, offset)
-            if (len(answers) < ANCOUNT):
+            if len(answers) < ANCOUNT:
                 answers.append(rr)
-            elif (len(nameservers) < NSCOUNT):
+            elif len(nameservers) < NSCOUNT:
                 nameservers.append(rr)
-            elif (len(additional_records) < ARCOUNT):
+            elif len(additional_records) < ARCOUNT:
                 additional_records.append(rr)
             else:
                 raise Exception('Too many/too few records.')
@@ -196,7 +203,10 @@ class DnsPacket(object):
             assert len(nameservers) == NSCOUNT
             assert len(additional_records) == ARCOUNT
             cls = (Query if QR else Response)
-            return (cls(ID, QR, OPCODE, AA, TC, RD, RA, Z, RCODE, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT, questions, answers, nameservers, additional_records),offset,)
+            return (cls(ID, QR, OPCODE, AA, TC, RD, RA, Z, RCODE,
+                        QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT,
+                        questions, answers, nameservers, additional_records),
+                    offset,)
 
     def encode(self):
         data = struct.pack('!HBBHHHH', self.ID,
@@ -236,6 +246,7 @@ class Query(DnsPacket):
 class Response(DnsPacket):
     pass
 
+
 class DomainName(list):
     # TODO: support preservation of the over-the-wire encoding (the raw bytes)
     def __hash__(self):
@@ -252,17 +263,17 @@ class DomainName(list):
     def __str__(self):
         return '.'.join(self)
 
-    # def __init__(self, labels):
-    #     if labels == []:
-    #         # TODO: auto upgrade [] into the root_label? may be better to force compliance elsewhere
-    #         list.__init__(self, [''])
-    #     else:
-    #         list.__init__(self, labels)
+    def __init__(self, labels):
+        if labels == []:
+            # TODO: auto upgrade [] into the root_label? may be better to force compliance elsewhere
+            list.__init__(self, [''])
+        else:
+            list.__init__(self, labels)
 
     def enumerate_hierarchy(self):
         yield root_label
         for n in range(len(self)):
-            yield DomainName(self[-(n+1):])
+            yield DomainName(self[-(n + 1):])
 
     @staticmethod
     def from_string(name):
@@ -279,25 +290,25 @@ class DomainName(list):
         sequence = []
         while (data[offset]):
             if data[offset] < 64:
-                #print(data[offset + 1:offset + 1 + data[offset]])
                 label = data[offset + 1:offset + 1 + data[offset]].decode('ascii')
                 assert allowed_charset.issuperset(label)
                 offset += data[offset] + 1
                 sequence.append(label)
             elif data[offset] >= 0b11000000:
                 # A pointer is two bytes
-                ptr = ((data[offset] & 0b00111111) << 8) | data[offset+1]
+                ptr = ((data[offset] & 0b00111111) << 8) | data[offset + 1]
                 offset += 2
                 # #TODO: shouldn't allow pointing to 'same label offset' either?
-                assert (data[ptr] < 64)  # Don't allow pointers to pointers
+                assert data[ptr] < 64  # Don't allow pointers to pointers
                 (label, n,) = DomainName.parse_from(data, ptr)  # RECURSE
-#                (label, n,) = DomainName.parse_from(data, data[offset])  # RECURSE
+                # (label, n,) = DomainName.parse_from(data, data[offset])  # RECURSE
                 sequence.extend(label)
                 break
             else:
                 raise Exception('Unknown/Invalid DNS Label')
 
             assert (sum(map(len, sequence)) < 256)
+            # TODO: The limit should actually include the label-length bytes
 
         else:
             offset += 1  # consume the null terminator
@@ -315,8 +326,9 @@ class DomainName(list):
                 data.append(len(label))
                 data.extend(bytes(label, 'ascii'))
             else:
-                break #?
+                break  # ?
         data.append(0)
         return bytes(data)
+
 
 root_label = DomainName.from_string('.')

@@ -17,6 +17,7 @@ import hashlib
 import ipaddress
 
 import asyncio
+
 try:
     import signal
 except ImportError:
@@ -40,7 +41,8 @@ console.setFormatter(logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s
 
 class Nameserver(DomainName):
     pass
-    #TODO: would be nice if nameservers could get a database context to look up their address records... maybe
+    # TODO: would be nice if nameservers could get a database context to look up their address records... maybe
+
 
 class DnsResolver(asyncio.Protocol):
     loop = asyncio.get_event_loop()
@@ -51,11 +53,11 @@ class DnsResolver(asyncio.Protocol):
         self.log.critical(exception)
 
     def record_reader(self, zone_file):
-        with open(zone_file,'r') as root_hints_file:
+        with open(zone_file, 'r') as root_hints_file:
             for line in root_hints_file:
                 if not line or line[0] == ';':
                     continue
-                tokens = re.split(r'\s*\s',line.rstrip())
+                tokens = re.split(r'\s*\s', line.rstrip())
                 if len(tokens) == 5:
                     (name, ttl, rclass, rtype, rdata) = tokens
                     rclass = DnsRClass[rclass]
@@ -74,11 +76,11 @@ class DnsResolver(asyncio.Protocol):
 
                 name = DomainName.from_string(name)
                 if rtype == DnsRType.NS:
-                    record = DnsRecord(name,rtype,rclass,ttl,rdata=DomainName.from_string(rdata).encode())
+                    record = DnsRecord(name, rtype, rclass, ttl, rdata=DomainName.from_string(rdata).encode())
                 elif rtype == DnsRType.A:
-                    record = DnsRecord(name,rtype,rclass,ttl,rdata=ipaddress.IPv4Address(rdata).packed)
+                    record = DnsRecord(name, rtype, rclass, ttl, rdata=ipaddress.IPv4Address(rdata).packed)
                 elif rtype == DnsRType.AAAA:
-                    record = DnsRecord(name,rtype,rclass,ttl,rdata=ipaddress.IPv6Address(rdata).packed)
+                    record = DnsRecord(name, rtype, rclass, ttl, rdata=ipaddress.IPv6Address(rdata).packed)
                 self.log.debug('Glue record: %s' % record)
                 yield record
 
@@ -95,14 +97,14 @@ class DnsResolver(asyncio.Protocol):
 
     def datagram_received(self, data, addr):
         try:
-            (dns_packet,offset) = DnsPacket.parse(data)
+            (dns_packet, offset) = DnsPacket.parse(data)
         except AssertionError as e:
             self.log.warning('Unable to parse packet:', data)
         else:
             self.log.info('resolver_datagram_recieved(%s, %s)' % (dns_packet, addr))
             self.db.store_packet(dns_packet, source=addr)
-            (host,port) = addr
-            key = (str(host),dns_packet.ID)
+            (host, port) = addr
+            key = (str(host), dns_packet.ID)
             if key in self.queue:
                 (query_packet, future) = self.queue[key]
                 del self.queue[key]
@@ -137,7 +139,7 @@ class DnsResolver(asyncio.Protocol):
                     if record.rtype == DnsRType.A or record.rtype == DnsRType.AAAA:
                         additional_records.append(record)
 
-                query = Query(QR=DnsQR.query, RD=False, questions = questions)
+                query = Query(QR=DnsQR.query, RD=False, questions=questions)
                 response = Response(QR=DnsQR.response, ID=query.ID, AA=True, RD=False, RA=False,
                                     questions=questions,
                                     nameservers=nameservers,
@@ -174,7 +176,8 @@ class DnsResolver(asyncio.Protocol):
         assert dns_packet.QDCOUNT > 0
         if dns_packet.QDCOUNT > 1:
             assert all(map(lambda question: question.name == dns_packet.questions[0].name, dns_packet.questions[1:]))
-            assert all(map(lambda question: question.qclass == dns_packet.questions[0].qclass, dns_packet.questions[1:]))
+            assert all(
+                map(lambda question: question.qclass == dns_packet.questions[0].qclass, dns_packet.questions[1:]))
 
         response = self.db.lookup_response(dns_packet.questions)
         if response:
@@ -188,13 +191,14 @@ class DnsResolver(asyncio.Protocol):
         assert isinstance(zone_cut, Response)
 
         # Determine SOA
-        for zone in dns_packet.questions[0].name.enumerate_hierarchy():
+        for zone in dns_packet.questions[0].name.enumerate_hierarchy:
             # TODO: opportunity here for async operation
             question = DnsQuestion(zone, DnsQType.SOA)
-            #zone_soa = self.db.lookup_response(question)
+            # zone_soa = self.db.lookup_response(question)
             #if not zone_soa:
 
-            for (nameserver,additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers, zone_cut.additional_records):
+            for (nameserver, additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers,
+                                                                                       zone_cut.additional_records):
                 # TODO: Use/Check resolved AA queries from cached records, from zone_cut
                 # As fallback, use glue
                 # TODO: Nameserver(nameserver_record)?
@@ -218,10 +222,10 @@ class DnsResolver(asyncio.Protocol):
                             pass
                             # We received an authorative SOA response, but not from the preferred NS
 
-                        # TODO: consider using zone_soa as parent_id?
-                        # TODO: enforce expires/refresh/minimum TTL values
-                        # TODO: support negative caching
-                        # next_zone_cut = yield from self.query([DnsQuestion(zone, DnsQType.NS)], nameserver, additional_record, parent_id=dns_packet.pk)
+                            # TODO: consider using zone_soa as parent_id?
+                            # TODO: enforce expires/refresh/minimum TTL values
+                            # TODO: support negative caching
+                            # next_zone_cut = yield from self.query([DnsQuestion(zone, DnsQType.NS)], nameserver, additional_record, parent_id=dns_packet.pk)
                     zone_cut = zone_soa
                     break
 
@@ -230,9 +234,13 @@ class DnsResolver(asyncio.Protocol):
                 # consider this the apex?
 
         if zone_soa and zone_soa.AA:
-            for nameserver in filter(lambda record: isinstance(record, DnsRecord) and record.rtype == DnsRType.NS, zone_soa.answers):
-                for additional_record in filter(lambda record: isinstance(record, DnsRecord) and record.rtype in [DnsRType.A], zone_soa.additional_records):
-                    result = yield from self.query(dns_packet.questions, nameserver, additional_record, parent_id=dns_packet.pk)
+            for nameserver in filter(lambda record: isinstance(record, DnsRecord) and record.rtype == DnsRType.NS,
+                                     zone_soa.answers):
+                for additional_record in filter(
+                        lambda record: isinstance(record, DnsRecord) and record.rtype in [DnsRType.A],
+                        zone_soa.additional_records):
+                    result = yield from self.query(dns_packet.questions, nameserver, additional_record,
+                                                   parent_id=dns_packet.pk)
                     if result:
                         return result
 
@@ -254,20 +262,21 @@ class DnsResolver(asyncio.Protocol):
         else:
             ip = ipaddress.ip_address(address_record.rdata)
             dns_packet = Query(questions=questions, RD=False)
-            self.db.store_packet(dns_packet, destination=(ip.exploded,53))
+            self.db.store_packet(dns_packet, destination=(ip.exploded, 53))
             self.db.create_query(dns_packet.pk, nameserver_record.pk, address_record.pk, parent_id)
             key = (ip.exploded, dns_packet.ID)
             if isinstance(ip, ipaddress.IPv4Address):
                 self.queue[key] = (dns_packet, future)
-                self.transport.sendto(dns_packet.encode(), (ip.exploded,53))
+                self.transport.sendto(dns_packet.encode(), (ip.exploded, 53))
             else:
                 future.cancel()
-            #TODO: try to catch the exception on giaerror
-            # TODO: handle condition when IPV6 fails?
-            # del self.queue[key]
-            # future.cancel()
+                # TODO: try to catch the exception on giaerror
+                # TODO: handle condition when IPV6 fails?
+                # del self.queue[key]
+                # future.cancel()
 
         return future
+
 
 class DnsServer(asyncio.Protocol):
     loop = asyncio.get_event_loop()
@@ -295,14 +304,14 @@ class DnsServer(asyncio.Protocol):
                 self.log.debug("Got result, but future was already cancelled.")
             else:
                 # TODO: RFC2181 FORBIDS mixed TTL values in a record set.
-                #response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, questions=dns_packet.questions, answers=answers, nameservers=nameservers, additional_records=additional_records)
+                # response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, questions=dns_packet.questions, answers=answers, nameservers=nameservers, additional_records=additional_records)
                 # TODO: consider making a responses table that refrences a packet to a destination addr,port
                 self.resolver.db.store_packet(response, destination=addr)
                 self.transport.sendto(response.encode(), addr)
 
 
     def datagram_received(self, data, addr):
-        (host,port) = addr
+        (host, port) = addr
         try:
             (dns_packet, offset) = DnsPacket.parse(data)
         except AssertionError:
@@ -310,13 +319,11 @@ class DnsServer(asyncio.Protocol):
         else:
             self.log.info('Incoming packet: %s' % dns_packet)
             task = asyncio.async(self.respond_to_packet(dns_packet, addr))
-            #loop.call_later(60, task.cancel) # TODO: play around with timeout parameter
+            # loop.call_later(60, task.cancel) # TODO: play around with timeout parameter
             #loop.run_until_complete(task)
 
 
-
 class Database(object):
-
     def __init__(self, database='dns', user=None, password=None, host='localhost', port=3306):
         self.db = mysql.connector.connect(database=database, user=user, password=password, host=host, port=port)
         self.log = logging.Logger('db')
@@ -411,7 +418,7 @@ class Database(object):
                             # TODO: reread RFC2181, unsure if ameservers+additional_records are part of the "record set"
                             self.get_recordset_id(record_set)
                            )
-                          )
+            )
             self.queries += 1
             self.db.commit()
             packet_id = cursor.lastrowid
@@ -427,16 +434,16 @@ class Database(object):
 
             # TODO: reconsider using the dns_packet as a mutable object...
             dns_packet.pk = packet_id
-            #return cursor.lastrowid
+            # return cursor.lastrowid
 
 
     def get_name(self, name_id):
         with closing(self.db.cursor()) as cursor:
             sequence = []
-            for foo in range(256): # dns labels are limited to 256 depths anyway
+            for foo in range(256):  # dns labels are limited to 256 depths anyway
                 cursor.execute('SELECT parent,name FROM name WHERE `id`=%s LIMIT 1', (name_id,))
                 self.queries += 1
-                (name_id,label) = cursor.fetchone()
+                (name_id, label) = cursor.fetchone()
                 sequence.append(label)
                 if name_id is None:
                     return DomainName(sequence)
@@ -455,12 +462,12 @@ class Database(object):
             return cursor.lastrowid
 
     def create_resource_header(self, resource):
-        if(isinstance(resource, DnsQuestion)):
+        if (isinstance(resource, DnsQuestion)):
             (resource_type, resource_class) = (int(resource.qtype), int(resource.qclass))
-        elif(isinstance(resource, DnsRecord)):
+        elif (isinstance(resource, DnsRecord)):
             (resource_type, resource_class) = (int(resource.rtype), int(resource.rclass))
         else:
-            raise ValueError # TODO: exception handling
+            raise ValueError  # TODO: exception handling
 
         name_id = self.get_name_id(resource.name)
         with closing(self.db.cursor()) as cursor:
@@ -482,11 +489,12 @@ class Database(object):
             for label in reversed(name):
                 with closing(self.db.cursor()) as cursor:
                     if node:
-                        cursor.execute('SELECT id FROM name WHERE name=%s AND parent=%s LIMIT 1', (label, node)) # %d
+                        cursor.execute('SELECT id FROM name WHERE name=%s AND parent=%s LIMIT 1', (label, node))  # %d
                     else:
                         if not label:
                             label = '.'
-                        cursor.execute('SELECT id FROM name WHERE name=%s AND parent IS NULL LIMIT 1', (label,)) # (label,) is a tuple (label) is a string...
+                        cursor.execute('SELECT id FROM name WHERE name=%s AND parent IS NULL LIMIT 1',
+                                       (label,))  # (label,) is a tuple (label) is a string...
 
                     self.queries += 1
                     r = cursor.fetchone()
@@ -502,8 +510,9 @@ class Database(object):
 
     def create_query(self, packet_id, ns_id=None, addr_id=None, parent=None, response_id=None):
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO query (`packet`,`nameserver`,`address`,`parent`,`response`) VALUES (%s,%s,%s,%s,%s)',
-                           (packet_id, ns_id, addr_id, parent, response_id))
+            cursor.execute(
+                'INSERT INTO query (`packet`,`nameserver`,`address`,`parent`,`response`) VALUES (%s,%s,%s,%s,%s)',
+                (packet_id, ns_id, addr_id, parent, response_id))
             self.queries += 1
             self.db.commit()
             self.log.debug('create_query(%s,%s,%s,%s,%s) created with id: %d' %
@@ -544,12 +553,12 @@ class Database(object):
             return id
 
     def get_resource_header_id(self, resource):
-        if(isinstance(resource, DnsQuestion)):
+        if (isinstance(resource, DnsQuestion)):
             (resource_type, resource_class) = (int(resource.qtype), int(resource.qclass))
-        elif(isinstance(resource, DnsRecord)):
+        elif (isinstance(resource, DnsRecord)):
             (resource_type, resource_class) = (int(resource.rtype), int(resource.rclass))
         else:
-            raise ValueError # TODO: exception handling
+            raise ValueError  # TODO: exception handling
 
         name_id = self.get_name_id(resource.name)
         # TODO: question id cache
@@ -593,12 +602,14 @@ class Database(object):
         questionset = self.get_questionset_id(questions)
         with closing(self.db.cursor()) as cursor:
             if ns_id is not None and addr_id is not None:
-                cursor.execute('SELECT response FROM query JOIN packet AS packet_query JOIN packet AS packet_response ON query.packet=packet_query.id AND query.response=packet_response.id WHERE response IS NOT NULL AND nameserver=%s AND address=%s AND packet_query.questionset=%s AND TIMESTAMPADD(second,packet_response.effective_ttl,packet_response.cached) >= NOW() ORDER BY packet_response.cached DESC LIMIT 1',
-                               (ns_id, addr_id, questionset))
+                cursor.execute(
+                    'SELECT response FROM query JOIN packet AS packet_query JOIN packet AS packet_response ON query.packet=packet_query.id AND query.response=packet_response.id WHERE response IS NOT NULL AND nameserver=%s AND address=%s AND packet_query.questionset=%s AND TIMESTAMPADD(second,packet_response.effective_ttl,packet_response.cached) >= NOW() ORDER BY packet_response.cached DESC LIMIT 1',
+                    (ns_id, addr_id, questionset))
             else:
                 # TODO: see if there is a better way to handle the WHERE col=NULL problem
-                cursor.execute('SELECT response FROM query JOIN packet AS packet_query JOIN packet AS packet_response ON query.packet=packet_query.id AND query.response=packet_response.id WHERE response IS NOT NULL AND nameserver IS NULL AND address IS NULL AND packet_query.questionset=%s AND TIMESTAMPADD(second,packet_response.effective_ttl,packet_response.cached) >= NOW() ORDER BY packet_response.cached DESC LIMIT 1',
-                               (questionset,))
+                cursor.execute(
+                    'SELECT response FROM query JOIN packet AS packet_query JOIN packet AS packet_response ON query.packet=packet_query.id AND query.response=packet_response.id WHERE response IS NOT NULL AND nameserver IS NULL AND address IS NULL AND packet_query.questionset=%s AND TIMESTAMPADD(second,packet_response.effective_ttl,packet_response.cached) >= NOW() ORDER BY packet_response.cached DESC LIMIT 1',
+                    (questionset,))
             self.queries += 1
             r = cursor.fetchone()
             if r is None:
@@ -615,7 +626,9 @@ class Database(object):
         questions = []
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_questions(%d)' % (packet_id,))
-            cursor.execute('SELECT resource_header.id, resource_header.name,resource_header.type,resource_header.class FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id  WHERE packet_question.packet=%s ORDER BY packet_question.id ASC', (packet_id,))
+            cursor.execute(
+                'SELECT resource_header.id, resource_header.name,resource_header.type,resource_header.class FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id  WHERE packet_question.packet=%s ORDER BY packet_question.id ASC',
+                (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
             for row in rows:
@@ -633,7 +646,9 @@ class Database(object):
         records = []
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_records(%d)' % (packet_id,))
-            cursor.execute('SELECT resource_record.id, resource_header.name,resource_header.type,resource_header.class,packet_record.ttl,dns.blob.blob FROM packet_record JOIN resource_record JOIN resource_header JOIN dns.blob ON packet_record.record = resource_record.id AND resource_header.id = resource_record.header AND dns.blob.sha1=resource_record.rdata WHERE packet_record.packet = %s ORDER BY packet_record.id ASC', (packet_id,))
+            cursor.execute(
+                'SELECT resource_record.id, resource_header.name,resource_header.type,resource_header.class,packet_record.ttl,dns.blob.blob FROM packet_record JOIN resource_record JOIN resource_header JOIN dns.blob ON packet_record.record = resource_record.id AND resource_header.id = resource_record.header AND dns.blob.sha1=resource_record.rdata WHERE packet_record.packet = %s ORDER BY packet_record.id ASC',
+                (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
             for row in rows:
@@ -650,7 +665,9 @@ class Database(object):
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet(%s)' % (packet_id,))
             # TODO: `source`, `source_port`, `destination`, `destination_port`, `effective_ttl`, `questionset`, `recordset`
-            cursor.execute('SELECT `id`,`txnid`, `qr`, `opcode`, `aa`, `tc`, `rd`, `z`, `rcode`, `qdcount`, `ancount`, `nscount`, `arcount` FROM packet WHERE packet.id=%s LIMIT 1', (packet_id,))
+            cursor.execute(
+                'SELECT `id`,`txnid`, `qr`, `opcode`, `aa`, `tc`, `rd`, `z`, `rcode`, `qdcount`, `ancount`, `nscount`, `arcount` FROM packet WHERE packet.id=%s LIMIT 1',
+                (packet_id,))
             self.queries += 1
             row = cursor.fetchone()
 
@@ -666,15 +683,15 @@ class Database(object):
 
             answers = records[:ANCOUNT]
             assert len(answers) == ANCOUNT
-            nameservers = records[ANCOUNT:ANCOUNT+NSCOUNT]
+            nameservers = records[ANCOUNT:ANCOUNT + NSCOUNT]
             assert len(nameservers) == NSCOUNT
-            additional_records = records[ANCOUNT+NSCOUNT:]
+            additional_records = records[ANCOUNT + NSCOUNT:]
             assert len(additional_records) == ARCOUNT
 
             cls = Query if QR == DnsQR.query else Response
 
-            dns_packet = cls(ID=TXNID,QR=QR,OPCODE=OPCODE,AA=AA,TC=TC,RD=RD,Z=Z,RCODE=RCODE,
-                             QDCOUNT=QDCOUNT,ANCOUNT=ANCOUNT,NSCOUNT=NSCOUNT,ARCOUNT=ARCOUNT,
+            dns_packet = cls(ID=TXNID, QR=QR, OPCODE=OPCODE, AA=AA, TC=TC, RD=RD, Z=Z, RCODE=RCODE,
+                             QDCOUNT=QDCOUNT, ANCOUNT=ANCOUNT, NSCOUNT=NSCOUNT, ARCOUNT=ARCOUNT,
                              questions=questions,
                              answers=answers,
                              nameservers=nameservers,
@@ -689,18 +706,20 @@ class Database(object):
 
     def get_questionset_id(self, questions):
         self.log.debug('get_questionset_id(%s)' % questions)
-        return self._get_digest(','.join(map(str,(sorted(map(self.get_resource_header_id, questions))))).encode('ascii'))
+        return self._get_digest(
+            ','.join(map(str, (sorted(map(self.get_resource_header_id, questions))))).encode('ascii'))
 
     def get_recordset_id(self, records):
         self.log.debug('get_recordset_id(%s)')
-        return self._get_digest(','.join(map(str,(sorted(map(self.get_record_id, records))))).encode('ascii'))
+        return self._get_digest(','.join(map(str, (sorted(map(self.get_record_id, records))))).encode('ascii'))
 
     def create_packet_record(self, packet_id, record):
         assert isinstance(packet_id, int)
         record_id = self.get_record_id(record)
         record.pk = record_id
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO `packet_record` (`packet`, `record`, `ttl`) VALUES (%s, %s, %s)', (packet_id, record_id, record.ttl))
+            cursor.execute('INSERT INTO `packet_record` (`packet`, `record`, `ttl`) VALUES (%s, %s, %s)',
+                           (packet_id, record_id, record.ttl))
             self.queries += 1
 
 
@@ -709,7 +728,8 @@ class Database(object):
         question_id = self.get_resource_header_id(question)
         question.pk = question_id
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO `packet_question` (`packet`, `question`) VALUES (%s, %s)', (packet_id, question_id,))
+            cursor.execute('INSERT INTO `packet_question` (`packet`, `question`) VALUES (%s, %s)',
+                           (packet_id, question_id,))
             self.queries += 1
 
 
@@ -721,11 +741,13 @@ if __name__ == '__main__':
 
     db = Database('dns', 'dns', '123qwe', 'localhost')
 
-    resolver_startup_task = asyncio.Task(loop.create_datagram_endpoint(lambda: DnsResolver(db), local_addr=('0.0.0.0',0)))
+    resolver_startup_task = asyncio.Task(
+        loop.create_datagram_endpoint(lambda: DnsResolver(db), local_addr=('0.0.0.0', 0)))
     loop.run_until_complete(resolver_startup_task)
     (resolver_transport, resolver_protocol) = resolver_startup_task.result()
 
-    start_server_task = asyncio.Task(loop.create_datagram_endpoint(lambda: DnsServer(resolver_protocol), local_addr=('127.0.0.1',53)))
+    start_server_task = asyncio.Task(
+        loop.create_datagram_endpoint(lambda: DnsServer(resolver_protocol), local_addr=('127.0.0.1', 53)))
     loop.run_until_complete(start_server_task)
     # (server_transport, server_protocol) = start_server_task.result()
 

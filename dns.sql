@@ -1,14 +1,17 @@
-/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT = @@CHARACTER_SET_CLIENT */;
 /*!40101 SET NAMES ascii */;
-/*!40014 SET FOREIGN_KEY_CHECKS=0 */;
+/*!40014 SET FOREIGN_KEY_CHECKS = 0 */;
 
 
 -- Dumping structure for table dns.blob
 CREATE TABLE IF NOT EXISTS `blob` (
-  `sha1` binary(20) NOT NULL,
-  `blob` blob NOT NULL,
+  `sha1` BINARY(20) NOT NULL,
+  `blob` BLOB       NOT NULL,
   PRIMARY KEY (`sha1`)
-) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
+)
+  ENGINE =InnoDB
+  DEFAULT CHARSET =ascii
+  COLLATE =ascii_bin;
 
 
 -- Dumping structure for table dns.blacklist
@@ -16,96 +19,110 @@ CREATE TABLE IF NOT EXISTS `blacklist` (
   `ip` VARBINARY(16) NOT NULL,
 --  `reason` TINYINT(3) UNSIGNED NOT NULL DEFAULT 0,
   PRIMARY KEY (`ip`)
-) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
+)
+  ENGINE =InnoDB
+  DEFAULT CHARSET =ascii
+  COLLATE =ascii_bin;
 
 
 -- Dumping structure for table dns.packet
 CREATE TABLE IF NOT EXISTS `packet` (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  `source` varbinary(16) NULL,
-  `source_port` smallint(6) unsigned NOT NULL DEFAULT 0,
-  `destination` varbinary(16) NULL,
-  `destination_port` smallint(6) unsigned NOT NULL DEFAULT 53,
-  `txnid` int(10) unsigned NOT NULL,
-  `qr` bit(1),
-  `opcode` bit(4),
-  `aa` bit(1),
-  `tc` bit(1),
-  `rd` bit(1),
-  `z` bit(3),
-  `rcode` bit(4),
-  `qdcount` smallint(6) unsigned NOT NULL,
-  `ancount` smallint(6) unsigned NOT NULL,
-  `nscount` smallint(6) unsigned NOT NULL,
-  `arcount` smallint(6) unsigned NOT NULL,
-  `questionset` binary(20) NOT NULL,
-  `recordset` binary(20) NOT NULL,
-  `effective_ttl` int(10) unsigned NOT NULL DEFAULT 0, -- SELECT MIN(ttl) from packet_record WHERE packet=id
-  `cached` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `id`               BIGINT(20) UNSIGNED  NOT NULL AUTO_INCREMENT,
+  `source`           VARBINARY(16)        NULL,
+  `source_port`      SMALLINT(6) UNSIGNED NOT NULL DEFAULT 0,
+  `destination`      VARBINARY(16)        NULL,
+  `destination_port` SMALLINT(6) UNSIGNED NOT NULL DEFAULT 53,
+  `txnid`            INT(10) UNSIGNED     NOT NULL,
+  `qr`               BIT(1),
+  `opcode`           BIT(4),
+  `aa`               BIT(1),
+  `tc`               BIT(1),
+  `rd`               BIT(1),
+  `z`                BIT(3),
+  `rcode`            BIT(4),
+  `qdcount`          SMALLINT(6) UNSIGNED NOT NULL,
+  `ancount`          SMALLINT(6) UNSIGNED NOT NULL,
+  `nscount`          SMALLINT(6) UNSIGNED NOT NULL,
+  `arcount`          SMALLINT(6) UNSIGNED NOT NULL,
+  `questionset`      BINARY(20)           NOT NULL,
+  `recordset`        BINARY(20)           NOT NULL,
+  `effective_ttl`    INT(10) UNSIGNED     NOT NULL DEFAULT 0, -- SELECT MIN(ttl) from packet_record WHERE packet=id
+  `cached`           TIMESTAMP            NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `source` (`source`),
   KEY `destination` (`destination`),
   KEY `questionset` (`questionset`),
   KEY `recordset` (`recordset`)
-) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
+)
+  ENGINE =InnoDB
+  DEFAULT CHARSET =ascii
+  COLLATE =ascii_bin;
 
 
 -- Dumping structure for table dns.names
 CREATE TABLE IF NOT EXISTS `name` (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  `parent` bigint(20) unsigned DEFAULT NULL,
-  `name` varchar(64) NOT NULL,
+  `id`     BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `parent` BIGINT(20) UNSIGNED DEFAULT NULL,
+  `name`   VARCHAR(64)         NOT NULL,
   PRIMARY KEY (`id`),
   KEY `parent` (`parent`),
   KEY `name` (`name`)
-) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_general_ci;
+)
+  ENGINE =InnoDB
+  DEFAULT CHARSET =ascii
+  COLLATE =ascii_general_ci;
 
 
 -- Dumping structure for table dns.question
 CREATE TABLE IF NOT EXISTS resource_header (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  `name` bigint(20) unsigned NOT NULL,
-  `type` smallint(5) unsigned NOT NULL,
-  `class` smallint(5) unsigned NOT NULL,
+  `id`    BIGINT(20) UNSIGNED  NOT NULL AUTO_INCREMENT,
+  `name`  BIGINT(20) UNSIGNED  NOT NULL,
+  `type`  SMALLINT(5) UNSIGNED NOT NULL,
+  `class` SMALLINT(5) UNSIGNED NOT NULL,
   PRIMARY KEY (`id`),
   KEY `name` (`name`),
   CONSTRAINT `rh_name_fk` FOREIGN KEY (`name`) REFERENCES `name` (`id`)
-) ENGINE=InnoDB;
+)
+  ENGINE =InnoDB;
 
 
 --  Dumping structure for table dns.record
 CREATE TABLE IF NOT EXISTS `resource_record` (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-  `header` bigint(20) unsigned NOT NULL,
-  `rdata` binary(20) NOT NULL,
+  `id`     BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `header` BIGINT(20) UNSIGNED NOT NULL,
+  `rdata`  BINARY(20)          NOT NULL,
   PRIMARY KEY (`id`),
   KEY `resource_header` (`header`),
   KEY `rdata` (`rdata`),
   CONSTRAINT `rr_header_fk` FOREIGN KEY (`header`) REFERENCES `resource_header` (`id`),
   CONSTRAINT `rr_rdata_fk` FOREIGN KEY (`rdata`) REFERENCES `blob` (`sha1`)
-) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
+)
+  ENGINE =InnoDB
+  DEFAULT CHARSET =ascii
+  COLLATE =ascii_bin;
 
 -- Dumping structure for table dns.packet_question
 CREATE TABLE IF NOT EXISTS `packet_question` (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
-  `packet` bigint(20) unsigned NOT NULL,
-  `question` bigint(20) unsigned NOT NULL,
+  `id`       BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
+  `packet`   BIGINT(20) UNSIGNED NOT NULL,
+  `question` BIGINT(20) UNSIGNED NOT NULL,
   PRIMARY KEY (`id`),
   KEY `packet` (`packet`),
   KEY `question` (`question`),
   CONSTRAINT `packet_question_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
   CONSTRAINT `packet_question_rh_fk` FOREIGN KEY (`question`) REFERENCES `resource_header` (`id`)
-) ENGINE=InnoDB;
+)
+  ENGINE =InnoDB;
 
 
 -- Dumping structure for table dns.query
 CREATE TABLE IF NOT EXISTS `query` (
-  `packet` bigint(20) unsigned NOT NULL,
-  `parent` bigint(20) unsigned NULL,
-  `nameserver` bigint(20) unsigned NULL,
-  `address` bigint(20) unsigned NULL,
+  `packet`     BIGINT(20) UNSIGNED NOT NULL,
+  `parent`     BIGINT(20) UNSIGNED NULL,
+  `nameserver` BIGINT(20) UNSIGNED NULL,
+  `address`    BIGINT(20) UNSIGNED NULL,
 -- TODO: consider "multiple response" case, as well as TC
-  `response` bigint(20) unsigned NULL,
+  `response`   BIGINT(20) UNSIGNED NULL,
   PRIMARY KEY (`packet`),
   KEY `parent` (`parent`),
   KEY `nameserver` (`nameserver`),
@@ -116,25 +133,27 @@ CREATE TABLE IF NOT EXISTS `query` (
   CONSTRAINT `query_nameserver_fk` FOREIGN KEY (`nameserver`) REFERENCES resource_record (`id`),
   CONSTRAINT `query_address_fk` FOREIGN KEY (`address`) REFERENCES resource_record (`id`),
   CONSTRAINT `query_response_fk` FOREIGN KEY (`response`) REFERENCES `packet` (`id`)
-) ENGINE=InnoDB;
+)
+  ENGINE =InnoDB;
 
 
 -- Dumping structure for table dns.packet_record
 CREATE TABLE IF NOT EXISTS `packet_record` (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
-  `packet` bigint(20) unsigned NOT NULL,
-  `record` bigint(20) unsigned NOT NULL,
-  -- TODO: Might be nice to have a field for the over-the-wire bytes of a given name VARCHAR(255)/blob_id?
-  -- TODO: RFC2181 suggests ttl be "ignored" when considering record sets, log as part of the packet instead of the record
-  `ttl` int(10) unsigned NOT NULL,
+  `id`     BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
+  `packet` BIGINT(20) UNSIGNED NOT NULL,
+  `record` BIGINT(20) UNSIGNED NOT NULL,
+-- TODO: Might be nice to have a field for the over-the-wire bytes of a given name VARCHAR(255)/blob_id?
+-- TODO: RFC2181 suggests ttl be "ignored" when considering record sets, log as part of the packet instead of the record
+  `ttl`    INT(10) UNSIGNED    NOT NULL,
   PRIMARY KEY (`id`),
   KEY `packet` (`packet`),
   KEY `record` (`record`),
   CONSTRAINT `packet_record_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
   CONSTRAINT `packet_record_record_fk` FOREIGN KEY (`record`) REFERENCES resource_record (`id`)
-) ENGINE=InnoDB;
+)
+  ENGINE =InnoDB;
 
 
-/*!40014 SET FOREIGN_KEY_CHECKS=1 */;
-/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+/*!40014 SET FOREIGN_KEY_CHECKS = 1 */;
+/*!40101 SET CHARACTER_SET_CLIENT = @OLD_CHARACTER_SET_CLIENT */;
 
