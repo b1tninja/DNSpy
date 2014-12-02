@@ -150,76 +150,101 @@ class DnsResolver(asyncio.Protocol):
 
         return response
 
+    @staticmethod
+    def enumerate_nameserver_addresses(nameserver_records, additional_records):
+        # TODO: consider moving away from ns,addr pairs, and just using addr soley
+        for nameserver_record in nameserver_records:
+            assert isinstance(nameserver_record, DnsRecord)
+            if nameserver_record.rtype == DnsRType.NS:
+                # TODO: support domain name label compression for NS rdata
+                ns_name = DomainName.parse(nameserver_record.rdata)
+                for address_record in additional_records:
+                    assert isinstance(address_record, DnsRecord)
+                    if address_record.name == ns_name and address_record.rtype in [DnsRType.A]:
+                        yield (nameserver_record, address_record)
+
+
     @asyncio.coroutine
     def resolve(self, dns_packet):
-        assert(isinstance(dns_packet, DnsPacket))
-        assert(hasattr(dns_packet, 'pk')) # The packet must be stored in the database
+        assert isinstance(dns_packet, DnsPacket)
+        assert hasattr(dns_packet, 'pk')
 
         # TODO: consider http://tools.ietf.org/html/draft-ietf-dnsext-edns1-03
         # TODO: try/except to set proper RCODE
-        assert(dns_packet.QDCOUNT > 0)
+        assert dns_packet.QDCOUNT > 0
         if dns_packet.QDCOUNT > 1:
-            assert(all(map(lambda question: question.name == dns_packet.questions[0].name, dns_packet.questions)))
-            assert(all(map(lambda question: question.qclass == dns_packet.questions[0].qclass, dns_packet.questions)))
+            assert all(map(lambda question: question.name == dns_packet.questions[0].name, dns_packet.questions[1:]))
+            assert all(map(lambda question: question.qclass == dns_packet.questions[0].qclass, dns_packet.questions[1:]))
 
         response = self.db.lookup_response(dns_packet.questions)
         if response:
             return response
 
-
         # TODO: deduplicate at the packet level?
         self.db.create_query(dns_packet.pk)
 
-        parent_ns = self.db.lookup_response(DnsQuestion(root_label, DnsQType.NS))
-        # TODO: if not parent_ns bootstrap() ?
-        assert(isinstance(parent_ns, Response))
+        zone_cut = self.db.lookup_response(DnsQuestion(root_label, DnsQType.NS))
+        # TODO: if not zone_cut bootstrap() ?
+        assert isinstance(zone_cut, Response)
 
         # Determine SOA
         for zone in dns_packet.questions[0].name.enumerate_hierarchy():
             # TODO: opportunity here for async operation
             question = DnsQuestion(zone, DnsQType.SOA)
-            zone_soa = self.db.lookup_response(question)
+            #zone_soa = self.db.lookup_response(question)
+            #if not zone_soa:
+
+            for (nameserver,additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers, zone_cut.additional_records):
+                # TODO: Use/Check resolved AA queries from cached records, from zone_cut
+                # As fallback, use glue
+                # TODO: Nameserver(nameserver_record)?
+                ns_name = DomainName.parse(nameserver.rdata)
+                print(ns_name)
+                try:
+                    zone_soa = yield from self.query([question], nameserver, additional_record, parent_id=dns_packet.pk)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.InvalidStateError:
+                    pass
+                else:
+                    self.log.debug('resolve() %s' % zone_soa)
+                    assert isinstance(zone_soa, Response)
+                    # TODO: ANCOUNT == 1 probably shouldn't be a requirement
+                    # TODO: smarter detection of lame delegation
+                    if zone_soa.RCODE == DnsResponseCode.no_error:
+                        # TODO: and rtype == SOA etc
+                        zone_soa_dict = RData_SOA.parse(zone_soa.answers[0].rdata)
+                        if ns_name != zone_soa_dict['mname']:
+                            pass
+                            # We received an authorative SOA response, but not from the preferred NS
+
+                        # TODO: consider using zone_soa as parent_id?
+                        # TODO: enforce expires/refresh/minimum TTL values
+                        # TODO: support negative caching
+                        # next_zone_cut = yield from self.query([DnsQuestion(zone, DnsQType.NS)], nameserver, additional_record, parent_id=dns_packet.pk)
+                    zone_cut = zone_soa
+                    break
+
             if not zone_soa:
-                for nameserver in parent_ns.nameservers:
-                    assert(isinstance(nameserver, DnsRecord))
-                    assert(nameserver.rtype == DnsRType.NS)
-                    # TODO: Use/Check resolved AA queries from cached records, from parent_ns
-                    # As fallback, use glue
-                    # TODO: Nameserver(nameserver_record)?
-                    ns_name = DomainName.parse(nameserver.rdata)
-                    for additional_record in parent_ns.additional_records:
-                        assert(isinstance(additional_record, DnsRecord))
-                        # Not interested in anything other than A/AAAA
-                        if additional_record.name == ns_name and additional_record.rtype in [DnsRType.A, DnsRType.AAAA]:
-                            try:
-                                result = yield from self.query([question], nameserver, additional_record, parent_id=dns_packet.pk)
-                            except asyncio.CancelledError:
-                                pass
-                            except asyncio.InvalidStateError:
-                                pass
-                            else:
-                                self.log.debug('resolve() %s' % result)
-                                assert(isinstance(result,Response))
-                                # TODO: ANCOUNT == 1 probably shouldn't be a requirement
-                                if result.AA and result.RCODE == DnsResponseCode.no_error and result.ANCOUNT == 1:
-                                    # TODO: and rtype = SOA etc
-                                    zone_soa_dict = RData_SOA.parse(result.answers[0].rdata)
-                                    zone_soa = result
+                pass
+                # consider this the apex?
+
+        if zone_soa and zone_soa.AA:
+            for nameserver in filter(lambda record: isinstance(record, DnsRecord) and record.rtype == DnsRType.NS, zone_soa.answers):
+                for additional_record in filter(lambda record: isinstance(record, DnsRecord) and record.rtype in [DnsRType.A], zone_soa.additional_records):
+                    result = yield from self.query(dns_packet.questions, nameserver, additional_record, parent_id=dns_packet.pk)
+                    if result:
+                        return result
 
 
-                # TODO: if still not zone_soa
-
-            break # for debugging purposes
-        print(bool(zone_soa))
-        return "somestuff"
-
+    @asyncio.coroutine
     def query(self, questions, nameserver_record, address_record, parent_id=None):
         if nameserver_record:
-            assert(isinstance(nameserver_record, DnsRecord))
-            assert(hasattr(nameserver_record, 'pk'))
+            assert isinstance(nameserver_record, DnsRecord)
+            assert hasattr(nameserver_record, 'pk')
         if address_record:
-            assert(isinstance(address_record, DnsRecord))
-            assert(hasattr(address_record, 'pk'))
+            assert isinstance(address_record, DnsRecord)
+            assert hasattr(address_record, 'pk')
 
         future = asyncio.Future()
 
@@ -228,13 +253,15 @@ class DnsResolver(asyncio.Protocol):
             future.set_result(cached_record)
         else:
             ip = ipaddress.ip_address(address_record.rdata)
-
             dns_packet = Query(questions=questions, RD=False)
-            key = (ip.exploded, dns_packet.ID)
             self.db.store_packet(dns_packet, destination=(ip.exploded,53))
             self.db.create_query(dns_packet.pk, nameserver_record.pk, address_record.pk, parent_id)
-            self.queue[key] = (dns_packet, future)
-            self.transport.sendto(dns_packet.encode(), (ip.exploded,53))
+            key = (ip.exploded, dns_packet.ID)
+            if isinstance(ip, ipaddress.IPv4Address):
+                self.queue[key] = (dns_packet, future)
+                self.transport.sendto(dns_packet.encode(), (ip.exploded,53))
+            else:
+                future.cancel()
             #TODO: try to catch the exception on giaerror
             # TODO: handle condition when IPV6 fails?
             # del self.queue[key]
@@ -246,7 +273,7 @@ class DnsServer(asyncio.Protocol):
     loop = asyncio.get_event_loop()
 
     def __init__(self, resolver):
-        assert(isinstance(resolver, DnsResolver))
+        assert isinstance(resolver, DnsResolver)
         self.resolver = resolver
         self.log = logging.Logger('server')
         self.log.addHandler(console)
@@ -261,6 +288,7 @@ class DnsServer(asyncio.Protocol):
         if dns_packet.QR == DnsQR.query:
             try:
                 response = yield from self.resolver.resolve(dns_packet)
+                print(response)
             except asyncio.CancelledError:
                 self.log.debug("Task cancelled.")
             except asyncio.InvalidStateError:
@@ -283,6 +311,7 @@ class DnsServer(asyncio.Protocol):
             self.log.info('Incoming packet: %s' % dns_packet)
             task = asyncio.async(self.respond_to_packet(dns_packet, addr))
             #loop.call_later(60, task.cancel) # TODO: play around with timeout parameter
+            #loop.run_until_complete(task)
 
 
 
@@ -318,10 +347,10 @@ class Database(object):
 
 
     def store_packet(self, dns_packet, source=None, destination=None):
-        assert(len(dns_packet.questions) == dns_packet.QDCOUNT)
-        assert(len(dns_packet.answers) == dns_packet.ANCOUNT)
-        assert(len(dns_packet.nameservers) == dns_packet.NSCOUNT)
-        assert(len(dns_packet.additional_records) == dns_packet.ARCOUNT)
+        assert len(dns_packet.questions) == dns_packet.QDCOUNT
+        assert len(dns_packet.answers) == dns_packet.ANCOUNT
+        assert len(dns_packet.nameservers) == dns_packet.NSCOUNT
+        assert len(dns_packet.additional_records) == dns_packet.ARCOUNT
 
         record_set = dns_packet.answers + dns_packet.nameservers + dns_packet.additional_records
 
@@ -496,7 +525,7 @@ class Database(object):
 
 
     def get_record_id(self, record):
-        assert(isinstance(record, DnsRecord))
+        assert isinstance(record, DnsRecord)
 
         resource_header_id = self.get_resource_header_id(record)
         rdata_blob_id = self.get_blob_id(record.rdata)
@@ -540,7 +569,7 @@ class Database(object):
 
     def create_record(self, record):
         self.log.info('create_record(%s)' % record)
-        assert(isinstance(record, DnsRecord))
+        assert isinstance(record, DnsRecord)
         record_header_id = self.get_resource_header_id(record)
         rdata_blob = self.get_blob_id(record.rdata)
         with closing(self.db.cursor()) as cursor:
@@ -631,16 +660,16 @@ class Database(object):
             OPCODE = DnsOpCode(OPCODE)
             RCODE = DnsResponseCode(RCODE)
             questions = self.get_packet_questions(packet_id)
-            assert(len(questions) == QDCOUNT)
+            assert len(questions) == QDCOUNT
 
             records = self.get_packet_records(packet_id)
 
             answers = records[:ANCOUNT]
-            assert(len(answers) == ANCOUNT)
+            assert len(answers) == ANCOUNT
             nameservers = records[ANCOUNT:ANCOUNT+NSCOUNT]
-            assert(len(nameservers) == NSCOUNT)
+            assert len(nameservers) == NSCOUNT
             additional_records = records[ANCOUNT+NSCOUNT:]
-            assert(len(additional_records) == ARCOUNT)
+            assert len(additional_records) == ARCOUNT
 
             cls = Query if QR == DnsQR.query else Response
 
@@ -667,7 +696,7 @@ class Database(object):
         return self._get_digest(','.join(map(str,(sorted(map(self.get_record_id, records))))).encode('ascii'))
 
     def create_packet_record(self, packet_id, record):
-        assert(isinstance(packet_id, int))
+        assert isinstance(packet_id, int)
         record_id = self.get_record_id(record)
         record.pk = record_id
         with closing(self.db.cursor()) as cursor:
@@ -676,7 +705,7 @@ class Database(object):
 
 
     def create_packet_question(self, packet_id, question):
-        assert(isinstance(packet_id, int))
+        assert isinstance(packet_id, int)
         question_id = self.get_resource_header_id(question)
         question.pk = question_id
         with closing(self.db.cursor()) as cursor:

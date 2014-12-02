@@ -131,16 +131,16 @@ class DnsPacket(object):
         self.NSCOUNT = int(NSCOUNT)
         self.ARCOUNT = int(ARCOUNT)
 
-        assert(isinstance(questions, list))
+        assert isinstance(questions, list)
         self.questions = questions
 
-        assert(isinstance(answers, list))
+        assert isinstance(answers, list)
         self.answers = answers
 
-        assert(isinstance(nameservers, list))
+        assert isinstance(nameservers, list)
         self.nameservers = nameservers
 
-        assert(isinstance(additional_records, list))
+        assert isinstance(additional_records, list)
         self.additional_records = additional_records
 
     def __repr__(self):
@@ -165,7 +165,7 @@ class DnsPacket(object):
         RA = data[3] & 0b10000000 != 0
         # Reserved for future, zero value
         Z = (data[3] & 0b01110000) >> 4
-        #assert(Z == 0) # Newer RFCs obsolete this
+        #assert Z == 0 # Newer RFCs obsolete this
         RCODE = DnsResponseCode(data[3] & 0b1111)
         (QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT,) = struct.unpack_from('!HHHH', data, 4)
 
@@ -191,10 +191,10 @@ class DnsPacket(object):
             else:
                 raise Exception('Too many/too few records.')
         else:
-            assert(len(questions) == QDCOUNT)
-            assert(len(answers) == ANCOUNT)
-            assert(len(nameservers) == NSCOUNT)
-            assert(len(additional_records) == ARCOUNT)
+            assert len(questions) == QDCOUNT
+            assert len(answers) == ANCOUNT
+            assert len(nameservers) == NSCOUNT
+            assert len(additional_records) == ARCOUNT
             cls = (Query if QR else Response)
             return (cls(ID, QR, OPCODE, AA, TC, RD, RA, Z, RCODE, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT, questions, answers, nameservers, additional_records),offset,)
 
@@ -242,8 +242,12 @@ class DomainName(list):
         return hash(str(self).lower())
 
     def __eq__(self, other):
-        assert(isinstance(other, DomainName))
-        return hash(self)==hash(other)
+        assert isinstance(other, DomainName)
+        return hash(self) == hash(other)
+
+    def __ne__(self, other):
+        assert isinstance(other, DomainName)
+        return hash(self) != hash(other)
 
     def __str__(self):
         return '.'.join(self)
@@ -257,8 +261,8 @@ class DomainName(list):
 
     def enumerate_hierarchy(self):
         yield root_label
-        for n in range(len(self)-1,0,-1):
-            yield DomainName(self[n:])
+        for n in range(len(self)):
+            yield DomainName(self[-(n+1):])
 
     @staticmethod
     def from_string(name):
@@ -277,7 +281,7 @@ class DomainName(list):
             if data[offset] < 64:
                 #print(data[offset + 1:offset + 1 + data[offset]])
                 label = data[offset + 1:offset + 1 + data[offset]].decode('ascii')
-                assert(allowed_charset.issuperset(label))
+                assert allowed_charset.issuperset(label)
                 offset += data[offset] + 1
                 sequence.append(label)
             elif data[offset] >= 0b11000000:
