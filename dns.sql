@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS `packet` (
   `ancount`          SMALLINT(6) UNSIGNED NOT NULL,
   `nscount`          SMALLINT(6) UNSIGNED NOT NULL,
   `arcount`          SMALLINT(6) UNSIGNED NOT NULL,
+  `suffix`           BINARY(20)           NULL,
   `questionset`      BINARY(20)           NOT NULL,
   `recordset`        BINARY(20)           NOT NULL,
   `effective_ttl`    INT(10) UNSIGNED     NOT NULL DEFAULT 0, -- SELECT MIN(ttl) from packet_record WHERE packet=id
@@ -103,9 +104,10 @@ CREATE TABLE IF NOT EXISTS `resource_record` (
 
 -- Dumping structure for table dns.packet_question
 CREATE TABLE IF NOT EXISTS `packet_question` (
-  `id`       BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
-  `packet`   BIGINT(20) UNSIGNED NOT NULL,
-  `question` BIGINT(20) UNSIGNED NOT NULL,
+  `id`              BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
+  `packet`          BIGINT(20) UNSIGNED NOT NULL,
+  `question`        BIGINT(20) UNSIGNED NOT NULL,
+  `compressed_name` TINYBLOB            NULL,
   PRIMARY KEY (`id`),
   KEY `packet` (`packet`),
   KEY `question` (`question`),
@@ -139,12 +141,14 @@ CREATE TABLE IF NOT EXISTS `query` (
 
 -- Dumping structure for table dns.packet_record
 CREATE TABLE IF NOT EXISTS `packet_record` (
-  `id`     BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
-  `packet` BIGINT(20) UNSIGNED NOT NULL,
-  `record` BIGINT(20) UNSIGNED NOT NULL,
+  `id`               BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
+  `packet`           BIGINT(20) UNSIGNED NOT NULL,
+  `record`           BIGINT(20) UNSIGNED NOT NULL, -- TODO: should be 'uncompressed, and in canonical name form'
 -- TODO: Might be nice to have a field for the over-the-wire bytes of a given name VARCHAR(255)/blob_id?
--- TODO: RFC2181 suggests ttl be "ignored" when considering record sets, log as part of the packet instead of the record
-  `ttl`    INT(10) UNSIGNED    NOT NULL,
+-- RFC2181 suggests ttl be "ignored" when considering record sets, log as part of the packet instead of the record
+  `compressed_name`  TINYBLOB            NULL,
+  `compressed_rdata` BINARY(20)          NULL,
+  `ttl`              INT(10) UNSIGNED    NOT NULL,
   PRIMARY KEY (`id`),
   KEY `packet` (`packet`),
   KEY `record` (`record`),
@@ -157,3 +161,10 @@ CREATE TABLE IF NOT EXISTS `packet_record` (
 /*!40014 SET FOREIGN_KEY_CHECKS = 1 */;
 /*!40101 SET CHARACTER_SET_CLIENT = @OLD_CHARACTER_SET_CLIENT */;
 
+-- Every question can contain a compressed name
+-- Every packet_record can contain a compressed name, and compressed rdata
+
+-- Option 1, uncompress and normalize, store both forms, and use original compressed bytes for encode()
+-- Option 2, store only compressed form, give parsers ability to decompress (requires access to raw packet bytes)
+-- Option 3, hybrid of 1&2, make a RecordParser that is bound to a given set of packet bytes,
+-- Option 4, consider name compression when it could be appended to the end of the packet, after the recordset, perhaps storing the packet bytes may be required

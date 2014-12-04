@@ -23,14 +23,14 @@ try:
 except ImportError:
     signal = None
 
-from socket import gaierror, has_ipv6
+from socket import gaierror
 
 import logging
 
 from dns_packet import DnsPacket, DnsQuestion, DnsRecord, DomainName, Query, Response
 from dns_packet import RData_SOA
 # Enums
-from enums import DnsQR, DnsQType, DnsQClass, DnsRType, DnsRClass, DnsOpCode, DnsResponseCode
+from enums import DnsQR, DnsQType, DnsRType, DnsRClass, DnsOpCode, DnsResponseCode
 # Constants
 from dns_packet import root_label
 
@@ -186,63 +186,76 @@ class DnsResolver(asyncio.Protocol):
         # TODO: deduplicate at the packet level?
         self.db.create_query(dns_packet.pk)
 
-        zone_cut = self.db.lookup_response(DnsQuestion(root_label, DnsQType.NS))
         # TODO: if not zone_cut bootstrap() ?
-        assert isinstance(zone_cut, Response)
+
+        root_hints = self.db.lookup_response(DnsQuestion(root_label, DnsQType.NS))
+        next_zone_cut = root_hints
 
         # Determine SOA
-        for zone in dns_packet.questions[0].name.enumerate_hierarchy:
+        for zone in dns_packet.questions[0].name.enumerate_hierarchy():
             # TODO: opportunity here for async operation
             question = DnsQuestion(zone, DnsQType.SOA)
-            # zone_soa = self.db.lookup_response(question)
-            #if not zone_soa:
+            zone_soa = self.db.lookup_response(question)
 
-            for (nameserver, additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers,
-                                                                                       zone_cut.additional_records):
-                # TODO: Use/Check resolved AA queries from cached records, from zone_cut
-                # As fallback, use glue
-                # TODO: Nameserver(nameserver_record)?
-                ns_name = DomainName.parse(nameserver.rdata)
-                print(ns_name)
-                try:
-                    zone_soa = yield from self.query([question], nameserver, additional_record, parent_id=dns_packet.pk)
-                except asyncio.CancelledError:
+            #next_zone_cut = root_hints ???
+
+            while next_zone_cut and not zone_soa:
+                assert isinstance(next_zone_cut, Response)
+
+                zone_cut = next_zone_cut
+                next_zone_cut = None
+
+                for (nameserver, additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers,
+                                                                                           zone_cut.additional_records):
+                    # TODO: Use/Check resolved AA queries from cached records, from zone_cut
+                    # As fallback, use glue
+                    # TODO: Nameserver(nameserver_record)?
+                    ns_name = DomainName.parse(nameserver.rdata)
+                    try:
+                        response = yield from self.query([question], nameserver, additional_record,
+                                                         parent_id=dns_packet.pk)
+                        assert isinstance(response, Response)
+                    except asyncio.CancelledError:
+                        pass
+                    except asyncio.InvalidStateError:
+                        pass
+                    except AssertionError:
+                        pass
+                    else:
+                        self.log.debug('resolve() %s' % response)
+                        if response.RCODE == DnsResponseCode.no_error:
+                            # TODO: and rtype == SOA etc
+                            if response.ANCOUNT == 0:
+                                if response.NSCOUNT > 0:
+                                    # TODO: lame delegation
+                                    # TODO: if RD
+                                    next_zone_cut = response
+                            elif response.ANCOUNT == 1:
+                                # TODO: ANCOUNT == 1 probably shouldn't be a requirement
+                                next_zone_cut = zone_cut # Reuse the zone_cut that produced this authorative response
+                                zone_soa = RData_SOA.parse(response.answers[0].rdata)
+                                if ns_name != zone_soa.mname:
+                                    pass
+
+                                if response.questions[0].name == dns_packet.questions[0].name:
+                                    result = yield from self.query(dns_packet.questions, nameserver, additional_record, parent_id=dns_packet.pk)
+                                    if isinstance(result, Response):
+                                        result.ID = dns_packet.ID
+                                        return result
+                                    # We received an authorative SOA response, but not from the preferred NS
+                                    # TODO: consider using zone_soa as parent_id?
+                                    # TODO: enforce expires/refresh/minimum TTL values
+                                    # TODO: support negative caching (if response.AA)
+
+                            else:
+                                pass
+
+                        # zone_cut = response
+                        break # TODO: parallel requests, this line skips the rest of the ns,addr pairs
+
+                if not response:
                     pass
-                except asyncio.InvalidStateError:
-                    pass
-                else:
-                    self.log.debug('resolve() %s' % zone_soa)
-                    assert isinstance(zone_soa, Response)
-                    # TODO: ANCOUNT == 1 probably shouldn't be a requirement
-                    # TODO: smarter detection of lame delegation
-                    if zone_soa.RCODE == DnsResponseCode.no_error:
-                        # TODO: and rtype == SOA etc
-                        zone_soa_dict = RData_SOA.parse(zone_soa.answers[0].rdata)
-                        if ns_name != zone_soa_dict['mname']:
-                            pass
-                            # We received an authorative SOA response, but not from the preferred NS
 
-                            # TODO: consider using zone_soa as parent_id?
-                            # TODO: enforce expires/refresh/minimum TTL values
-                            # TODO: support negative caching
-                            # next_zone_cut = yield from self.query([DnsQuestion(zone, DnsQType.NS)], nameserver, additional_record, parent_id=dns_packet.pk)
-                    zone_cut = zone_soa
-                    break
-
-            if not zone_soa:
-                pass
-                # consider this the apex?
-
-        if zone_soa and zone_soa.AA:
-            for nameserver in filter(lambda record: isinstance(record, DnsRecord) and record.rtype == DnsRType.NS,
-                                     zone_soa.answers):
-                for additional_record in filter(
-                        lambda record: isinstance(record, DnsRecord) and record.rtype in [DnsRType.A],
-                        zone_soa.additional_records):
-                    result = yield from self.query(dns_packet.questions, nameserver, additional_record,
-                                                   parent_id=dns_packet.pk)
-                    if result:
-                        return result
 
 
     @asyncio.coroutine
@@ -297,17 +310,19 @@ class DnsServer(asyncio.Protocol):
         if dns_packet.QR == DnsQR.query:
             try:
                 response = yield from self.resolver.resolve(dns_packet)
-                print(response)
             except asyncio.CancelledError:
                 self.log.debug("Task cancelled.")
             except asyncio.InvalidStateError:
                 self.log.debug("Got result, but future was already cancelled.")
             else:
-                # TODO: RFC2181 FORBIDS mixed TTL values in a record set.
-                # response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, questions=dns_packet.questions, answers=answers, nameservers=nameservers, additional_records=additional_records)
-                # TODO: consider making a responses table that refrences a packet to a destination addr,port
-                self.resolver.db.store_packet(response, destination=addr)
-                self.transport.sendto(response.encode(), addr)
+                if response:
+                    print(response)
+                    # TODO: RFC2181 FORBIDS mixed TTL values in a record set.
+                    # response = Response(dns_packet.ID, DnsQR.response, DnsOpCode.query, False, False, True, False, 0, DnsResponseCode.no_error, questions=dns_packet.questions, answers=answers, nameservers=nameservers, additional_records=additional_records)
+                    # TODO: consider making a responses table that refrences a packet to a destination addr,port
+                    #self.resolver.db.store_packet(response, destination=addr)
+                    self.transport.sendto(response.encode(), addr)
+                    pass
 
 
     def datagram_received(self, data, addr):
@@ -320,7 +335,7 @@ class DnsServer(asyncio.Protocol):
             self.log.info('Incoming packet: %s' % dns_packet)
             task = asyncio.async(self.respond_to_packet(dns_packet, addr))
             # loop.call_later(60, task.cancel) # TODO: play around with timeout parameter
-            #loop.run_until_complete(task)
+            # loop.run_until_complete(task)
 
 
 class Database(object):
@@ -393,10 +408,11 @@ class Database(object):
                            '`ancount`,'
                            '`nscount`,'
                            '`arcount`,'
+                           '`suffix`,'
                            '`effective_ttl`,'
                            '`questionset`,'
                            '`recordset`'
-                           ') VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                           ') VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
                            (source,
                             source_port,
                             destination,
@@ -413,6 +429,7 @@ class Database(object):
                             dns_packet.ANCOUNT,
                             dns_packet.NSCOUNT,
                             dns_packet.ARCOUNT,
+                            dns_packet.suffix if dns_packet.suffix else None,  # don't include b''
                             effective_ttl,
                             self.get_questionset_id(dns_packet.questions),
                             # TODO: reread RFC2181, unsure if ameservers+additional_records are part of the "record set"
@@ -448,7 +465,7 @@ class Database(object):
                 if name_id is None:
                     return DomainName(sequence)
 
-    def create_name(self, label, parent, casemap=str.lower):
+    def create_name(self, label, parent, casemap=str.upper):
         if not label and parent is None:
             label = '.'
         else:
@@ -479,7 +496,7 @@ class Database(object):
                            (resource.name, resource_type, resource_class, cursor.lastrowid))
             return cursor.lastrowid
 
-    def get_name_id(self, name, casemap=str.lower):
+    def get_name_id(self, name, casemap=str.upper):
         key = casemap(str(name))
         if key in self._cached_names:
             return self._cached_names[key]
@@ -627,13 +644,15 @@ class Database(object):
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_questions(%d)' % (packet_id,))
             cursor.execute(
-                'SELECT resource_header.id, resource_header.name,resource_header.type,resource_header.class FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id  WHERE packet_question.packet=%s ORDER BY packet_question.id ASC',
+                'SELECT resource_header.id, resource_header.name,resource_header.type,resource_header.class, compressed_name FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id WHERE packet_question.packet=%s ORDER BY packet_question.id ASC',
                 (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
             for row in rows:
-                (pk, name_id, qtype, qclass) = row
+                (pk, name_id, qtype, qclass, compressed_name) = row
                 name = self.get_name(name_id)
+                if compressed_name:
+                    self.name.compressed_name = compressed_name
                 question = DnsQuestion(name, qtype, qclass)
                 question.pk = pk
                 questions.append(question)
@@ -647,13 +666,15 @@ class Database(object):
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_records(%d)' % (packet_id,))
             cursor.execute(
-                'SELECT resource_record.id, resource_header.name,resource_header.type,resource_header.class,packet_record.ttl,dns.blob.blob FROM packet_record JOIN resource_record JOIN resource_header JOIN dns.blob ON packet_record.record = resource_record.id AND resource_header.id = resource_record.header AND dns.blob.sha1=resource_record.rdata WHERE packet_record.packet = %s ORDER BY packet_record.id ASC',
+                'SELECT resource_record.id, resource_header.name,resource_header.type,resource_header.class,packet_record.ttl,dns.blob.blob, compressed_name FROM packet_record JOIN resource_record JOIN resource_header JOIN dns.blob ON packet_record.record = resource_record.id AND resource_header.id = resource_record.header AND dns.blob.sha1=resource_record.rdata WHERE packet_record.packet = %s ORDER BY packet_record.id ASC',
                 (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
             for row in rows:
-                (pk, name_id, rtype, rclass, ttl, rdata) = row
+                (pk, name_id, rtype, rclass, ttl, rdata, compressed_name) = row
                 name = self.get_name(name_id)
+                if compressed_name:
+                    name.compressed_name = compressed_name
                 record = DnsRecord(name, rtype, rclass, ttl, rdata=rdata)
                 record.pk = pk
                 records.append(record)
@@ -717,19 +738,38 @@ class Database(object):
         assert isinstance(packet_id, int)
         record_id = self.get_record_id(record)
         record.pk = record_id
+
+        if hasattr(record.name, 'compressed_name') and record.name.encode() != record.name.compressed_name:
+            compressed_name = record.name.compressed_name
+        else:
+            compressed_name = None
+
+        if hasattr(record, 'compressed_rdata'):
+            compressed_rdata = self.get_blob_id(record.compressed_rdata)
+        else:
+            compressed_rdata = None
+
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO `packet_record` (`packet`, `record`, `ttl`) VALUES (%s, %s, %s)',
-                           (packet_id, record_id, record.ttl))
+            cursor.execute(
+                'INSERT INTO `packet_record` (`packet`, `record`, `ttl`, `compressed_name`, `compressed_rdata`) VALUES (%s, %s, %s, %s, %s)',
+                (packet_id, record_id, record.ttl, compressed_name, compressed_rdata))
             self.queries += 1
 
 
     def create_packet_question(self, packet_id, question):
         assert isinstance(packet_id, int)
         question_id = self.get_resource_header_id(question)
+
+        if hasattr(question.name, 'compressed_name') and question.name.encode() != question.name.compressed_name:
+            compressed_name = question.name.compressed_name
+        else:
+            compressed_name = None
+
         question.pk = question_id
         with closing(self.db.cursor()) as cursor:
-            cursor.execute('INSERT INTO `packet_question` (`packet`, `question`) VALUES (%s, %s)',
-                           (packet_id, question_id,))
+            cursor.execute(
+                'INSERT INTO `packet_question` (`packet`, `question`, `compressed_name`) VALUES (%s, %s, %s)',
+                (packet_id, question_id, compressed_name,))
             self.queries += 1
 
 

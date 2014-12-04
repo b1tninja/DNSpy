@@ -37,23 +37,55 @@ class DnsQuestion(object):
 
 
 class RData(object):
-    pass
+    @classmethod
+    def get_handler(cls, rtype):
+        handlers = {DnsRType.SOA: RData_SOA,
+                    DnsRType.NS: RData_SingleName,
+                    DnsRType.CNAME: RData_SingleName,
+                    DnsRType.PTR: RData_SingleName}
+
+        if rtype in handlers:
+            return handlers[rtype]
+        else:
+            return cls
 
 
 class RData_SOA(RData):
-    @staticmethod
-    def parse(rdata):
+    def __init__(self, serial, refresh, retry, expire, mname, rname):
+        self.serial = serial
+        self.refresh = refresh
+        self.retry = retry
+        self.expire = expire
+        self.mname = mname
+        self.rname = rname
+
+    @classmethod
+    def parse(cls, rdata, offset=0):
         # TODO: consider some wizardry with locals()
-        offset = 0
         (mname, offset) = DomainName.parse_from(rdata, offset)
         (rname, offset) = DomainName.parse_from(rdata, offset)
         (serial, refresh, retry, expire) = struct.unpack_from('!IIII', rdata, offset)
-        return {'mname': mname,
-                'rname': rname,
-                'serial': serial,
-                'refresh': refresh,
-                'retry': retry,
-                'expire': expire}
+        return cls(serial, refresh, retry, expire, mname, rname)
+
+    def encode(self):
+        return self.mname.encode() + self.rname.encode() + struct.pack('!IIII',
+                                                                       self.serial,
+                                                                       self.refresh,
+                                                                       self.retry,
+                                                                       self.expire)
+
+
+class RData_SingleName(RData):
+    @classmethod
+    def parse(cls, rdata, offset=0):
+        (name, offset) = DomainName.parse_from(rdata, offset)
+        return cls(name)
+
+    def __init__(self, name):
+        self.name = name
+
+    def encode(self):
+        return self.name.encode()
 
 
 class DnsRecord(object):
@@ -74,16 +106,13 @@ class DnsRecord(object):
             self.rclass = int(rclass)
 
         self.ttl = int(ttl)
-        self.rdlength = len(rdata)
+        self.rdlength = len(rdata) # TODO: drop this?
         self.rdata = rdata
 
     @classmethod
     def parse(cls, data, offset):
         (name, offset) = DomainName.parse_from(data, offset)
         (rtype, rclass, ttl, rdlength) = struct.unpack_from('!HHIH', data, offset)
-        offset += 10
-        rdata = data[offset:offset + rdlength]
-        offset += rdlength
 
         try:
             rtype = DnsRType(rtype)
@@ -94,7 +123,23 @@ class DnsRecord(object):
         except ValueError:
             rclass = int(rclass)
 
-        return cls(name, rtype, rclass, ttl, rdata), offset,
+        offset += 10
+
+        compressed_rdata = data[offset:offset+rdlength]
+        assert len(compressed_rdata) == rdlength
+
+        # Message compression is allowed for the DomainNames in these record types
+        # Store normalized data in rdata, and offer compressed_rdata as needed, to reconstruct original packet
+
+        record = cls(name, rtype, rclass, ttl, compressed_rdata)
+        if rtype in [DnsRType.NS, DnsRType.SOA, DnsRType.CNAME, DnsRType.PTR]:
+            uncompressed_rdata = RData.get_handler(rtype).parse(data, offset).encode()
+            if uncompressed_rdata != compressed_rdata:
+                record = cls(name, rtype, rclass, ttl, uncompressed_rdata)
+                record.compressed_rdata = compressed_rdata
+
+        offset += rdlength
+        return record, offset,
 
     def __repr__(self):
         return "<Record:%s,%s,%s,%d,%d,%s>" % (
@@ -107,7 +152,7 @@ class DnsRecord(object):
 class DnsPacket(object):
     def __init__(self, ID=random.getrandbits(16), QR=DnsQR.query, OPCODE=DnsOpCode.query, AA=False, TC=False, RD=True,
                  RA=True, Z=0, RCODE=DnsResponseCode.no_error, QDCOUNT=None, ANCOUNT=None, NSCOUNT=None, ARCOUNT=None,
-                 questions=[], answers=[], nameservers=[], additional_records=[]):
+                 questions=[], answers=[], nameservers=[], additional_records=[], suffix=bytes()):
         if QDCOUNT is None:
             QDCOUNT = len(questions)
         if ANCOUNT is None:
@@ -149,6 +194,9 @@ class DnsPacket(object):
         assert isinstance(additional_records, list)
         self.additional_records = additional_records
 
+        assert suffix is None or isinstance(suffix, bytes)
+        self.suffix = suffix
+
     def __repr__(self):
         return "<DnsPacket:%s, questions:%s, answers:%s, nameservers:%s, additional_records: %s>" % (
             hex(self.ID), self.questions, self.answers, self.nameservers, self.additional_records)
@@ -159,7 +207,7 @@ class DnsPacket(object):
         # Transaction ID 16
         (ID,) = struct.unpack_from('!H', data)
         # Query/Response 1
-        QR = (data[2] & 0b10000000) >> 7
+        QR = DnsQR((data[2] & 0b10000000) >> 7)
         # OpCode 4
         OPCODE = DnsOpCode((data[2] & 0b01111000) >> 3)
         # Authoratative Answer 1
@@ -202,10 +250,10 @@ class DnsPacket(object):
             assert len(answers) == ANCOUNT
             assert len(nameservers) == NSCOUNT
             assert len(additional_records) == ARCOUNT
-            cls = (Query if QR else Response)
+            cls = (Query if QR == DnsQR.query else Response)
             return (cls(ID, QR, OPCODE, AA, TC, RD, RA, Z, RCODE,
                         QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT,
-                        questions, answers, nameservers, additional_records),
+                        questions, answers, nameservers, additional_records, suffix=data[offset:]),
                     offset,)
 
     def encode(self):
@@ -222,7 +270,7 @@ class DnsPacket(object):
                            self.ANCOUNT,
                            self.NSCOUNT,
                            self.ARCOUNT,
-                           )
+        )
 
         for record in self.questions:
             data += record.encode()
@@ -250,7 +298,7 @@ class Response(DnsPacket):
 class DomainName(list):
     # TODO: support preservation of the over-the-wire encoding (the raw bytes)
     def __hash__(self):
-        return hash(str(self).lower())
+        return hash(str(self).upper())
 
     def __eq__(self, other):
         assert isinstance(other, DomainName)
@@ -266,9 +314,9 @@ class DomainName(list):
     def __init__(self, labels):
         if labels == []:
             # TODO: auto upgrade [] into the root_label? may be better to force compliance elsewhere
-            list.__init__(self, [''])
+            super(DomainName, self).__init__([''])
         else:
-            list.__init__(self, labels)
+            super(DomainName, self).__init__(labels)
 
     def enumerate_hierarchy(self):
         yield root_label
@@ -286,8 +334,10 @@ class DomainName(list):
 
     @staticmethod
     def parse_from(data, offset=0):
+        starting_offset = offset
         allowed_charset = set(string.ascii_letters + string.digits + '-')
         sequence = []
+
         while (data[offset]):
             if data[offset] < 64:
                 label = data[offset + 1:offset + 1 + data[offset]].decode('ascii')
@@ -301,7 +351,6 @@ class DomainName(list):
                 # #TODO: shouldn't allow pointing to 'same label offset' either?
                 assert data[ptr] < 64  # Don't allow pointers to pointers
                 (label, n,) = DomainName.parse_from(data, ptr)  # RECURSE
-                # (label, n,) = DomainName.parse_from(data, data[offset])  # RECURSE
                 sequence.extend(label)
                 break
             else:
@@ -313,10 +362,11 @@ class DomainName(list):
         else:
             offset += 1  # consume the null terminator
 
-        if sequence == []:
-            return (DomainName.from_string('.'), offset,)
-        else:
-            return (DomainName(sequence), offset,)
+        # TODO: make a proper DomainNameParser/constructor to handle this
+        domain_name = DomainName(sequence)
+        domain_name.compressed_name = data[starting_offset:offset]
+
+        return domain_name, offset,
 
     def encode(self):
         # TODO: label name compression, with context of current packet_buffer?
