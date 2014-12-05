@@ -160,11 +160,3 @@ CREATE TABLE IF NOT EXISTS `packet_record` (
 
 /*!40014 SET FOREIGN_KEY_CHECKS = 1 */;
 /*!40101 SET CHARACTER_SET_CLIENT = @OLD_CHARACTER_SET_CLIENT */;
-
--- Every question can contain a compressed name
--- Every packet_record can contain a compressed name, and compressed rdata
-
--- Option 1, uncompress and normalize, store both forms, and use original compressed bytes for encode()
--- Option 2, store only compressed form, give parsers ability to decompress (requires access to raw packet bytes)
--- Option 3, hybrid of 1&2, make a RecordParser that is bound to a given set of packet bytes,
--- Option 4, consider name compression when it could be appended to the end of the packet, after the recordset, perhaps storing the packet bytes may be required
