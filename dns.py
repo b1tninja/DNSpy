@@ -644,7 +644,7 @@ class Database(object):
         with closing(self.db.cursor()) as cursor:
             self.log.debug('get_packet_questions(%d)' % (packet_id,))
             cursor.execute(
-                'SELECT resource_header.id, resource_header.name,resource_header.type,resource_header.class, compressed_name FROM packet_question JOIN resource_header ON packet_question.question = resource_header.id WHERE packet_question.packet=%s ORDER BY packet_question.id ASC',
+                'SELECT resource_header.id, resource_header.name,resource_header.type,resource_header.class, compressed_name FROM packet_question JOIN resource_header ON packet_question.resource_header = resource_header.id WHERE packet_question.packet=%s ORDER BY packet_question.id ASC',
                 (packet_id,))
             self.queries += 1
             rows = cursor.fetchall()
@@ -758,18 +758,18 @@ class Database(object):
 
     def create_packet_question(self, packet_id, question):
         assert isinstance(packet_id, int)
-        question_id = self.get_resource_header_id(question)
+        resource_header_id = self.get_resource_header_id(question)
 
         if hasattr(question.name, 'compressed_name') and question.name.encode() != question.name.compressed_name:
             compressed_name = question.name.compressed_name
         else:
             compressed_name = None
 
-        question.pk = question_id
+        question.pk = resource_header_id
         with closing(self.db.cursor()) as cursor:
             cursor.execute(
-                'INSERT INTO `packet_question` (`packet`, `question`, `compressed_name`) VALUES (%s, %s, %s)',
-                (packet_id, question_id, compressed_name,))
+                'INSERT INTO `packet_question` (`packet`, `resource_header`, `compressed_name`) VALUES (%s, %s, %s)',
+                (packet_id, resource_header_id, compressed_name,))
             self.queries += 1
 
 

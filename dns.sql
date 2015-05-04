@@ -106,13 +106,13 @@ CREATE TABLE IF NOT EXISTS `resource_record` (
 CREATE TABLE IF NOT EXISTS `packet_question` (
   `id`              BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, -- shouldn't/can't depend on INSERT default SORT BY order...
   `packet`          BIGINT(20) UNSIGNED NOT NULL,
-  `question`        BIGINT(20) UNSIGNED NOT NULL,
+  `resource_header`        BIGINT(20) UNSIGNED NOT NULL,
   `compressed_name` TINYBLOB            NULL,
   PRIMARY KEY (`id`),
   KEY `packet` (`packet`),
-  KEY `question` (`question`),
+  KEY `resource_header` (`resource_header`),
   CONSTRAINT `packet_question_packet_fk` FOREIGN KEY (`packet`) REFERENCES `packet` (`id`),
-  CONSTRAINT `packet_question_rh_fk` FOREIGN KEY (`question`) REFERENCES `resource_header` (`id`)
+  CONSTRAINT `packet_question_rh_fk` FOREIGN KEY (`resource_header`) REFERENCES `resource_header` (`id`)
 )
   ENGINE =InnoDB;
 
