@@ -1,7 +1,7 @@
-from __future__ import unicode_literals
-
 #!/usr/bin/env python3
 # setcap cap_net_bind_service=+ep /usr/bin/python3.4
+
+from __future__ import unicode_literals
 
 __author__ = 'b1tninja'
 
@@ -15,6 +15,8 @@ import mysql.connector
 
 import hashlib
 import ipaddress
+
+import random
 
 import asyncio
 
@@ -154,6 +156,11 @@ class DnsResolver(asyncio.Protocol):
 
     @staticmethod
     def enumerate_nameserver_addresses(nameserver_records, additional_records):
+        nameserver_records = list(nameserver_records)
+        additional_records = list(additional_records)
+        random.shuffle(nameserver_records)
+        random.shuffle(additional_records)
+
         # TODO: consider moving away from ns,addr pairs, and just using addr soley
         for nameserver_record in nameserver_records:
             assert isinstance(nameserver_record, DnsRecord)
@@ -205,15 +212,13 @@ class DnsResolver(asyncio.Protocol):
                 zone_cut = next_zone_cut
                 next_zone_cut = None
 
-                for (nameserver, additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers,
-                                                                                           zone_cut.additional_records):
+                for (nameserver, additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers,zone_cut.additional_records):
                     # TODO: Use/Check resolved AA queries from cached records, from zone_cut
                     # As fallback, use glue
                     # TODO: Nameserver(nameserver_record)?
                     ns_name = DomainName.parse(nameserver.rdata)
                     try:
-                        response = yield from self.query([question], nameserver, additional_record,
-                                                         parent_id=dns_packet.pk)
+                        response = yield from self.query([question], nameserver, additional_record,parent_id=dns_packet.pk)
                         assert isinstance(response, Response)
                     except asyncio.CancelledError:
                         pass
@@ -229,8 +234,20 @@ class DnsResolver(asyncio.Protocol):
                                 if response.NSCOUNT > 0:
                                     # TODO: lame delegation
                                     # TODO: if RD
+                                    # TODO: when we ask com for example.com our zone=example.com, when zone_cut is a.iana-servers.net, should attempt to resolve the address of the NS first, then rely on glue... this will require another recursion
+                                    # for _ns in response.nameservers:
+                                    #     #TODO: ask for A or AAAA based on the ipv4/6 of socket
+                                    #     #TODO: check for a cached record, if one is not found, attempt to resolve it, if that fails, use glue
+                                    #     #cached_response = yield from self.resolve(Query(questions=[DnsQuestion(DomainName.parse(_ns.rdata), DnsQType.A)]))
+                                    #     # if cached_response:
+                                    #     #     next_zone_cut = cached_response
+                                    #     #     break # We found a cached address for the ns, break out so we can use this as next zone cut
+                                    #         # TODO: this whole thing is a mess, and needs rewritting... the break here will prevent continuing in the event that the address we have cached is non responsive... a stack type mechanism would be much more suitable, then recursion depth could be controlled in a sane fashion
+                                    # else:
+                                    # Use the glue
                                     next_zone_cut = response
-                            elif response.ANCOUNT == 1:
+                                    break
+                            elif response.ANCOUNT >= 1:
                                 # TODO: ANCOUNT == 1 probably shouldn't be a requirement
                                 next_zone_cut = zone_cut # Reuse the zone_cut that produced this authorative response
                                 zone_soa = RData_SOA.parse(response.answers[0].rdata)
@@ -525,15 +542,15 @@ class Database(object):
             return node
 
 
-    def create_query(self, packet_id, ns_id=None, addr_id=None, parent=None, response_id=None):
+    def create_query(self, packet_id, ns_id=None, addr_id=None, parent_id=None, response_id=None):
         with closing(self.db.cursor()) as cursor:
             cursor.execute(
                 'INSERT INTO query (`packet`,`nameserver`,`address`,`parent`,`response`) VALUES (%s,%s,%s,%s,%s)',
-                (packet_id, ns_id, addr_id, parent, response_id))
+                (packet_id, ns_id, addr_id, parent_id, response_id))
             self.queries += 1
             self.db.commit()
             self.log.debug('create_query(%s,%s,%s,%s,%s) created with id: %d' %
-                           (packet_id, parent, ns_id, addr_id, response_id, cursor.lastrowid))
+                           (packet_id, parent_id, ns_id, addr_id, response_id, cursor.lastrowid))
             return cursor.lastrowid
 
 
