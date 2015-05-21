@@ -3,6 +3,8 @@ import random
 import string
 import struct
 
+import ipaddress
+
 from DNSpy.enums import DnsQType, DnsRClass, DnsQClass, DnsRType, DnsQR, DnsOpCode, DnsResponseCode
 
 
@@ -49,7 +51,10 @@ class RData(object):
         handlers = {DnsRType.SOA: RData_SOA,
                     DnsRType.NS: RData_SingleName,
                     DnsRType.CNAME: RData_SingleName,
-                    DnsRType.PTR: RData_SingleName}
+                    DnsRType.PTR: RData_SingleName,
+                    DnsRType.A: RData_A,
+                    DnsRType.AAAA: RData_AAAA,
+                    }
 
         if rtype in handlers:
             return handlers[rtype]
@@ -102,6 +107,27 @@ class RData_SingleName(RData):
     def __repr__(self):
         return repr(self.name)
 
+class RData_A(RData):
+    def __init__(self, ip):
+        assert isinstance(ip, ipaddress.IPv4Address)
+        self.ip = ip
+
+    @classmethod
+    def parse(cls, rdata, offset=0):
+        ip = ipaddress.ip_address(rdata)
+        return cls(ip)
+
+    def encode(self):
+        return self.ip.packed
+
+    def __repr__(self):
+        return self.ip.exploded
+
+class RData_AAAA(RData_A):
+    def __init__(self, ip):
+        assert isinstance(ip, ipaddress.IPv6Address)
+        self.ip = ip
+        #TODO: super
 
 class DnsRecord(object):
     def __init__(self, name, rtype=DnsRType.A, rclass=DnsRClass.IN, ttl=0, rdata=b""):
