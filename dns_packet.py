@@ -3,7 +3,7 @@ import random
 import string
 import struct
 
-from enums import DnsQType, DnsRClass, DnsQClass, DnsRType, DnsQR, DnsOpCode, DnsResponseCode
+from DNSpy.enums import DnsQType, DnsRClass, DnsQClass, DnsRType, DnsQR, DnsOpCode, DnsResponseCode
 
 
 class DnsQuestion(object):
@@ -37,6 +37,13 @@ class DnsQuestion(object):
 
 
 class RData(object):
+    def __init__(self, blob):
+        self.blob = blob
+
+    @classmethod
+    def parse(cls, blob):
+        return cls(blob)
+
     @classmethod
     def get_handler(cls, rtype):
         handlers = {DnsRType.SOA: RData_SOA,
@@ -48,6 +55,9 @@ class RData(object):
             return handlers[rtype]
         else:
             return cls
+
+    def __repr__(self):
+        return binascii.b2a_hex(self.blob).decode('ascii')
 
 
 class RData_SOA(RData):
@@ -73,6 +83,8 @@ class RData_SOA(RData):
                                                                        self.refresh,
                                                                        self.retry,
                                                                        self.expire)
+    def __repr__(self):
+        return "%d %d %d %d %s %s" % (self.serial, self.refresh, self.retry, self.expire, self.mname, self.rname)
 
 
 class RData_SingleName(RData):
@@ -86,6 +98,9 @@ class RData_SingleName(RData):
 
     def encode(self):
         return self.name.encode()
+
+    def __repr__(self):
+        return repr(self.name)
 
 
 class DnsRecord(object):
@@ -136,14 +151,14 @@ class DnsRecord(object):
             uncompressed_rdata = RData.get_handler(rtype).parse(data, offset).encode()
             if uncompressed_rdata != compressed_rdata:
                 record = cls(name, rtype, rclass, ttl, uncompressed_rdata)
-                record.compressed_rdata = compressed_rdata
+                record.compressed_rdata = compressed_rdata #TODO: don't add member variables to classes like this
 
         offset += rdlength
         return record, offset,
 
     def __repr__(self):
         return "<Record:%s,%s,%s,%d,%d,%s>" % (
-            self.name, self.rtype, self.rclass, self.ttl, self.rdlength, binascii.b2a_hex(self.rdata))
+            self.name, self.rtype, self.rclass, self.ttl, self.rdlength, repr(self.rdata))
 
     def encode(self):
         return self.name.encode() + struct.pack('!HHIH', self.rtype, self.rclass, self.ttl, self.rdlength) + self.rdata
@@ -310,6 +325,9 @@ class DomainName(list):
 
     def __str__(self):
         return '.'.join(self)
+
+    def __repr__(self):
+        return str(self)
 
     def __init__(self, labels):
         if labels == []:
