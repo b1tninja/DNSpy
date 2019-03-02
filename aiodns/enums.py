@@ -1,7 +1,5 @@
 from enum import IntEnum
 
-__author__ = 'unpro'
-
 
 class DnsResponseCode(IntEnum):
     no_error = 0
