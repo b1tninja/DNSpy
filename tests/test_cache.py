@@ -2,12 +2,12 @@ import ipaddress
 
 import pytest
 
-from aiodns._sql import SqliteDnsCache
 from aiodns.cache import (
     DnsCache,
     MemoryDnsCache,
     NegativeEntry,
     PositiveEntry,
+    SqliteDnsCache,
 )
 from aiodns.enums import DnsRClass, DnsResponseCode, DnsRType
 from aiodns.names import DomainName

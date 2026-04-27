@@ -1,11 +1,11 @@
-"""DNS cache (RFC 1034 §7.4 / RFC 2308) abstract base + in-memory backing.
+"""DNS cache (RFC 1034 §7.4 / RFC 2308) package: abstract base + backings.
 
 Per-RRset caching keyed on ``(qname, qtype, qclass)``. Entries carry their
 own absolute expiry deadline in the cache's ``time_fn`` units (defaults
-to wall-clock seconds). Concrete backings live alongside this module:
+to wall-clock seconds). Concrete backings:
 
 * :class:`MemoryDnsCache` — process-local dict with optional LRU bound.
-* :class:`aiodns._sql.SqliteDnsCache` — SQLite, ephemeral or on-disk.
+* :class:`SqliteDnsCache` — SQLite, ephemeral or on-disk (see :mod:`aiodns.cache.sqlite`).
 
 The :class:`aiodns.resolver.RecursiveResolver` consults the cache at the
 top of each :func:`aiodns.resolver.resolve_steps` iteration before sending
@@ -18,8 +18,8 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 
-from .enums import DnsResponseCode
-from .names import DomainName
+from ..enums import DnsResponseCode
+from ..names import DomainName
 
 
 def _key(name, qtype, qclass):
@@ -165,3 +165,15 @@ class MemoryDnsCache(DnsCache):
         for k in keys:
             del self._entries[k]
         return len(keys)
+
+
+from .sqlite import SqliteDnsCache  # noqa: E402
+
+__all__ = [
+    "CacheEntry",
+    "DnsCache",
+    "MemoryDnsCache",
+    "NegativeEntry",
+    "PositiveEntry",
+    "SqliteDnsCache",
+]

@@ -678,7 +678,7 @@ class RecursiveResolver(Resolver):
 
                 yield record
 
-    def __init__(self, db=None, root_hints_path="named.root", dns_suffix=None, cache=None):
+    def __init__(self, root_hints_path="named.root", dns_suffix=None, cache=None):
         self.queue = {}
         self.queue_v6 = {}
         self.transport_v6 = None
