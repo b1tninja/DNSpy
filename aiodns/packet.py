@@ -100,7 +100,7 @@ class DnsRecord(object):
         if rdlength is None:
             rdlength = len(bytes(rdata))
         self.rdlength = rdlength
-        self.rdata = rdata
+        self.rdata : RData = rdata
 
     @classmethod
     def parse(cls, data, offset):
@@ -173,7 +173,7 @@ class DnsPacket(object):
             AA=False,
             TC=False,
             RD=True,
-            RA=True,
+            RA=False,
             Z=0,
             RCODE=DnsResponseCode.no_error,
             QDCOUNT=None,

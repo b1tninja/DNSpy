@@ -6,6 +6,11 @@ An **asyncio-based DNS library and example server** from the DNSpy project: pack
 - **Style:** Ruff (lint + format), pytest for tests
 - **Status:** experimental; the recursive resolver path is still rough, but the core parsing and the demo server are useful for learning and local experimentation
 
+## References
+
+- [RFC 1034](https://www.ietf.org/rfc/rfc1034.txt) — Domain names: concepts and facilities  
+- [RFC 1035](https://www.ietf.org/rfc/rfc1035.txt) — Domain names: implementation and specification
+
 ## What’s in the box
 
 | Area | Notes |
@@ -46,6 +51,22 @@ python -m aiodns
 On success you should see a log line about startup; the process then **runs until you press Ctrl+C**.
 
 Root hints for the recursive resolver are read from `named.root` in the current working directory if present, otherwise the code may attempt to **fetch** [Internic’s `named.root`](https://www.internic.net/domain/named.root) (see `aiodns/resolver.py` and your `.gitignore` for `named.root`).
+
+## Tracing
+
+`RecursiveResolver` records every iterative-resolution step into a `Trace`
+(see [`aiodns/trace.py`](aiodns/trace.py)). The trace is exposed both on the
+resolver (`resolver.last_trace`) and on the response object
+(`response.trace`). Render any trace as a Mermaid `sequenceDiagram` with
+`Trace.to_mermaid()`.
+
+When you run `python -m aiodns` and the demo lookup completes, the most
+recent trace is written to `last_resolution.md` in the current working
+directory — open it in any Mermaid-aware viewer to see the zone-cut walk
+and any glueless sub-resolutions.
+
+For the RFC 1034 mapping that drives the resolver code, see
+[`resolution.MD`](resolution.MD).
 
 ## Develop
 

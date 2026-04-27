@@ -70,21 +70,11 @@ class RData_SOA(RData):
         )
 
 
-class RData_SingleName:
-    def __init__(self, name):
-        assert isinstance(name, DomainName)
-        self.name = name
-
+class RData_SingleName(DomainName):
     @classmethod
     def parse_from(cls, rdata, offset=0, length=None):
         (name, offset) = DomainName.parse_from(rdata, offset)
-        return cls(name)
-
-    def __str__(self):
-        return str(self.name)
-
-    def __repr__(self):
-        return repr(self.name)
+        return cls(name.name, name.buffer, name.offset)
 
 
 class RData_A(RData):

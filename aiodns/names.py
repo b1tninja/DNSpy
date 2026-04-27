@@ -40,9 +40,11 @@ class DomainName:
         """
         DNS Label encoder/decoder
 
-        :param name: A traditional domain.name string
+        :param name: A traditional ``domain.name`` string. A trailing ``.`` is
+            the *root terminator* and marks the name as absolute (FQDN); a
+            name without it is *relative* and may be promoted to absolute by
+            appending a DNS suffix — see :meth:`qualify`.
         :param buffer: The packet or buffer that the label originated, for referencing the original encoding
-        :param offset: The offset into buffer that the label was read
         :param offset: The offset into buffer that the label was read
         """
         try:
@@ -52,6 +54,51 @@ class DomainName:
         self.name = name
         self.buffer = buffer
         self.offset = offset
+
+    @property
+    def is_absolute(self):
+        """Whether this name carries the root terminator (a trailing ``.``).
+
+        On the wire, every name is absolute (terminated by the zero-length root
+        label). In presentation form, a trailing ``.`` explicitly anchors the
+        name at the root and prevents any DNS suffix from being assumed; a
+        name without it is relative and a suffix may be applied via
+        :meth:`qualify`. The bare root (``"."`` or ``""``) is absolute.
+        """
+        s = self.name or ""
+        return s == "" or s.endswith(".")
+
+    @property
+    def terminated(self):
+        """Alias of :attr:`is_absolute`, reading as "has a root terminator"."""
+        return self.is_absolute
+
+    def qualify(self, dns_suffix=None):
+        """Return an absolute :class:`DomainName`, applying a DNS suffix if needed.
+
+        If this name is already absolute, ``self`` is returned unchanged — the
+        trailing root terminator on the wire prevents any suffix from being
+        assumed. Otherwise the result is composed of this name's labels, then
+        ``dns_suffix`` if one is supplied, then the root terminator. With no
+        ``dns_suffix``, the relative name is simply anchored at the root.
+
+        The decision of *which* suffix to assume for a relative name is the
+        resolver's responsibility (see :attr:`aiodns.resolver.Resolver.dns_suffix`);
+        :class:`DomainName` itself is suffix-agnostic.
+        """
+        if self.is_absolute:
+            return self
+        base = (self.name or "").rstrip(".")
+        sfx = str(dns_suffix).strip().rstrip(".") if dns_suffix is not None else ""
+        if base and sfx:
+            qualified = base + "." + sfx + "."
+        elif base:
+            qualified = base + "."
+        elif sfx:
+            qualified = sfx + "."
+        else:
+            qualified = "."
+        return self.__class__(qualified)
 
     def hierarchy(self):
         labels = self.name.split(".")
@@ -97,7 +144,11 @@ class DomainName:
 
         else:
             offset += 1
-            return cls(".".join(labels), buffer, offset), final or offset
+            # Wire form is always absolute (terminated by the zero-length root
+            # label); reflect that in the presentation form so :attr:`is_absolute`
+            # and equality see it as such.
+            presentation = ".".join(labels) + "." if labels else "."
+            return cls(presentation, buffer, offset), final or offset
 
     # @classmethod
     # def parse(cls, stream):
@@ -135,9 +186,18 @@ class DomainName:
     #         return cls('.'.join(labels), stream, offset=start)
     #
     def __bytes__(self):
-        # https://tools.ietf.org/html/rfc3490
-        parts = self.name.encode("ascii").split(b".")
-        assert b"" not in parts[:-1]
+        # TODO support https://tools.ietf.org/html/rfc3490
+        # RFC 1035 §3.1: each label is a length-prefixed byte string and the
+        # name is terminated by the zero-length root label. The trailing ``.``
+        # in presentation form is the root terminator and is not itself a
+        # label — strip it before splitting so we don't emit a phantom
+        # zero-length label *before* the actual terminator (which would
+        # double-null the wire form and shift QTYPE/QCLASS by one byte).
+        name = (self.name or "").rstrip(".")
+        if not name:
+            return bytes([0])
+        parts = name.encode("ascii").split(b".")
+        assert b"" not in parts
         return b"".join(
             [
                 (
@@ -147,7 +207,6 @@ class DomainName:
                 )
                 + label
                 for label in parts
-                if label
             ]
         ) + bytes([0])
 
@@ -157,17 +216,28 @@ class DomainName:
     def __repr__(self):
         return repr(self.name)
 
-    def __ne__(self, other):
-        return self.name.upper() != other.name.upper()
+    def _labels(self) -> tuple[str, ...]:
+        """Case-folded label tuple for the DNS name; trailing root terminator is not significant.
 
-    def __eq__(self, other):
-        try:
-            return self.name.upper() == other.name.upper()
-        except Exception:
-            pass
+        On the wire every name is fully qualified (RFC 1035 §3.1), so equality
+        is wire-form based: ``com`` and ``com.`` denote the same name and
+        produce the same tuple. The trailing ``.`` is meaningful only as the
+        root terminator that tells a *resolver* not to assume a DNS suffix
+        (see :meth:`qualify` and :attr:`aiodns.resolver.Resolver.dns_suffix`).
+        ASCII case is also ignored. The root (``"."`` and empty) is ``()``.
+        """
+        s = (self.name or "").strip().rstrip(".")
+        return tuple(p.upper() for p in s.split(".") if p) if s else ()
 
-    def __hash__(self):
-        return hash(self.name.upper())
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            other = DomainName(other)
+        if not isinstance(other, DomainName):
+            return NotImplemented
+        return self._labels() == other._labels()
+
+    def __hash__(self) -> int:
+        return hash(self._labels())
 
     @classmethod
     def root_label(cls):
