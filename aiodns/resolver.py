@@ -10,6 +10,7 @@ import urllib.request
 from socket import gaierror
 
 from . import IP_MTU_DISCOVER, IP_PMTUDISC_DO, console
+from .cache import MemoryDnsCache, NegativeEntry, PositiveEntry
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from .names import DomainName
 from .packet import DnsPacket, DnsPacketParseError, DnsQuestion, DnsRecord, Query, Response
@@ -465,15 +466,31 @@ def classify(response, sname, slist, entry):
     yield Demote(entry, "empty response")
 
 
-def resolve_steps(sname, slist):
+def resolve_steps(sname, slist, cache=None):
     """Drive resolution as a generator of effect/trace events.
 
     The generator is fully synchronous; it never touches sockets. The async
     driver `RecursiveResolver._drive` fulfills `SendQuery` / `NeedAddress`
     yields and feeds results back via `gen.send(...)`.
+
+    If ``cache`` is provided (a :class:`aiodns.cache.DnsCache`), every hop
+    first consults it (RFC 1034 §5.3.3 step 1) and short-circuits with
+    ``Answer``/``Done`` or ``Nxdomain``/``Nodata``/``Done`` on a hit. After
+    a real authoritative response classifies as a terminal event, the
+    result is written back to the cache.
     """
     for _ in range(MAX_HOPS):
-        # TODO: §5.3.3 step 1 — consult cache here before hitting the network.
+        if cache is not None:
+            hit = cache.get(sname.qname, sname.qtype, sname.qclass)
+            if hit is not None:
+                if isinstance(hit, PositiveEntry):
+                    yield Answer(hit.records)
+                elif hit.rcode == DnsResponseCode.name_error:
+                    yield Nxdomain()
+                else:
+                    yield Nodata(hit.soa)
+                yield Done(_synthesize_response(sname, hit))
+                return
         entry = slist.best()
         if entry is None:
             yield Fail("no servers")
@@ -489,6 +506,12 @@ def resolve_steps(sname, slist):
         response = yield SendQuery(entry, sname.questions)
         terminal = False
         for step in classify(response, sname, slist, entry):
+            # Write to cache *before* yielding the terminal event so callers
+            # (including tests) can observe a populated cache the moment the
+            # Answer/Nxdomain/Nodata is visible — the generator pauses at
+            # ``yield step`` and may never be resumed past Done.
+            if cache is not None and isinstance(step, (Answer, Nodata, Nxdomain)):
+                _write_cache(cache, sname, step, response)
             yield step
             if isinstance(step, Done):
                 terminal = True
@@ -498,6 +521,111 @@ def resolve_steps(sname, slist):
         if terminal:
             return
     yield Fail("max hops")
+
+
+def _synthesize_response(sname, hit):
+    """Build a synthetic :class:`Response` from a cache hit.
+
+    The resolver's outer code expects a :class:`Response` from a successful
+    resolution (it stamps the original packet's ``ID`` onto it); we manufacture
+    one whose AN/NS sections reflect the cached entry.
+    """
+    questions = list(sname.questions)
+    if isinstance(hit, PositiveEntry):
+        return Response(
+            QR=DnsQR.response,
+            AA=hit.authoritative,
+            RCODE=DnsResponseCode.no_error,
+            questions=questions,
+            answers=list(hit.records),
+        )
+    rcode = (
+        hit.rcode if isinstance(hit.rcode, DnsResponseCode)
+        else DnsResponseCode(int(hit.rcode))
+    )
+    nameservers = [hit.soa] if hit.soa is not None else []
+    return Response(
+        QR=DnsQR.response,
+        AA=False,
+        RCODE=rcode,
+        questions=questions,
+        nameservers=nameservers,
+    )
+
+
+def _negative_ttl_seconds(soa_record):
+    """RFC 2308 §5: cap negative-cache TTL at ``min(SOA.MINIMUM, SOA.TTL)``.
+
+    The current :class:`~aiodns.rdata.RData_SOA` parser does not surface
+    ``MINIMUM`` (a pre-existing gap), so when it is unavailable we fall
+    back to ``SOA.TTL``. Returns ``0`` when no SOA is present, which the
+    caller treats as "do not cache this negative response".
+    """
+    if soa_record is None:
+        return 0
+    ttl = int(getattr(soa_record, "ttl", 0) or 0)
+    minimum = getattr(getattr(soa_record, "rdata", None), "minimum", None)
+    if minimum is not None:
+        return max(0, min(int(minimum), ttl))
+    return max(0, ttl)
+
+
+def _write_cache(cache, sname, terminal_event, response):
+    """Populate ``cache`` from a terminal classify event.
+
+    ``terminal_event`` is the most recent of (Answer, Nodata, Nxdomain)
+    yielded for this response; ``response`` is the corresponding wire
+    packet (used for the AA flag and to dig the SOA out of the authority
+    section on NXDOMAIN).
+    """
+    now = cache.time_fn()
+    if isinstance(terminal_event, Answer):
+        records = list(terminal_event.records)
+        if not records:
+            return
+        ttl = min(int(getattr(r, "ttl", 0) or 0) for r in records)
+        if ttl <= 0:
+            return
+        cache.put(PositiveEntry(
+            sname.qname,
+            sname.qtype,
+            sname.qclass,
+            records,
+            now + ttl,
+            authoritative=bool(getattr(response, "AA", False)),
+        ))
+        return
+    if isinstance(terminal_event, Nodata):
+        ttl = _negative_ttl_seconds(terminal_event.soa)
+        if ttl <= 0:
+            return
+        cache.put(NegativeEntry(
+            sname.qname,
+            sname.qtype,
+            sname.qclass,
+            DnsResponseCode.no_error,
+            terminal_event.soa,
+            now + ttl,
+        ))
+        return
+    if isinstance(terminal_event, Nxdomain):
+        soa = None
+        if response is not None:
+            soa = next(
+                (r for r in response.nameservers if r.rtype == DnsRType.SOA),
+                None,
+            )
+        ttl = _negative_ttl_seconds(soa)
+        if ttl <= 0:
+            return
+        cache.put(NegativeEntry(
+            sname.qname,
+            sname.qtype,
+            sname.qclass,
+            DnsResponseCode.name_error,
+            soa,
+            now + ttl,
+        ))
 
 
 class RecursiveResolver(Resolver):
@@ -550,7 +678,7 @@ class RecursiveResolver(Resolver):
 
                 yield record
 
-    def __init__(self, db=None, root_hints_path="named.root", dns_suffix=None):
+    def __init__(self, db=None, root_hints_path="named.root", dns_suffix=None, cache=None):
         self.queue = {}
         self.queue_v6 = {}
         self.transport_v6 = None
@@ -560,6 +688,7 @@ class RecursiveResolver(Resolver):
         self.root_hints = self.bootstrap(root_hints_path)
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None
+        self.cache = cache if cache is not None else MemoryDnsCache()
         if dns_suffix is not None:
             self.dns_suffix = dns_suffix
 
@@ -739,7 +868,7 @@ class RecursiveResolver(Resolver):
                 child_sname = Sname(step.ns_name, DnsQType.A, DnsRClass.IN)
                 child_slist = self.sbelt.copy_for(child_sname)
                 child_trace = trace.child(child_sname)
-                sub_gen = resolve_steps(child_sname, child_slist)
+                sub_gen = resolve_steps(child_sname, child_slist, self.cache)
                 sub_response = await self._drive(sub_gen, child_trace, depth + 1)
                 addrs = []
                 if isinstance(sub_response, Response):
@@ -772,7 +901,7 @@ class RecursiveResolver(Resolver):
         sname = Sname(qname, question.qtype, question.qclass)
         self.last_trace = Trace(sname)
         slist = self.sbelt.copy_for(sname)
-        gen = resolve_steps(sname, slist)
+        gen = resolve_steps(sname, slist, self.cache)
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):
             response.ID = dns_packet.ID

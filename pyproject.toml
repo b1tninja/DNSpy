@@ -4,7 +4,9 @@ version = "0.0.0"
 description = "asyncio DNS library (modernized from dnspy aiodns)"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "idna>=3.7",
+]
 
 [project.optional-dependencies]
 dev = [
