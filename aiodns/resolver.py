@@ -1,5 +1,4 @@
 import asyncio
-
 import ipaddress
 import logging
 import os
@@ -9,10 +8,10 @@ import socket
 import urllib.request
 from socket import gaierror
 
-from . import IP_PMTUDISC_DO, IP_MTU_DISCOVER, IP_MTU, console
-from .enums import DnsRClass, DnsRType, DnsQType, DnsQR, DnsResponseCode
+from . import IP_MTU_DISCOVER, IP_PMTUDISC_DO, console
+from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from .names import DomainName
-from .packet import DnsRecord, DnsPacket, DnsQuestion, Query, Response
+from .packet import DnsPacket, DnsPacketParseError, DnsQuestion, DnsRecord, Query, Response
 from .rdata import RData_SOA
 
 
@@ -23,7 +22,7 @@ class Resolver(asyncio.Protocol):
         if address_record:
             assert isinstance(address_record, DnsRecord)
 
-        future = asyncio.Future()
+        future = asyncio.get_running_loop().create_future()
 
         # cached_record = self.db.lookup_response(questions, nameserver_record.pk, address_record.pk)
         # if cached_record:
@@ -58,34 +57,33 @@ class Resolver(asyncio.Protocol):
             assert isinstance(nameserver_record, DnsRecord)
             if nameserver_record.rtype == DnsRType.NS:
                 # TODO: support domain name label compression for NS rdata
-                ns_name = nameserver_record.name
                 for address_record in additional_records:
                     assert isinstance(address_record, DnsRecord)
-                    if address_record.name == nameserver_record.rdata and address_record.rtype in [DnsRType.A,
-                                                                                                   DnsRType.AAAA]:
+                    if address_record.name == nameserver_record.rdata and address_record.rtype in [
+                        DnsRType.A,
+                        DnsRType.AAAA,
+                    ]:
                         yield (nameserver_record, address_record)
 
 
 class Forwarder(asyncio.Protocol):
     def __init__(self, nameservers=None):
         if nameservers is None:
-            nameservers = ['8.8.8.8', '8.8.4.4', '4.2.2.2', '1.1.1.1']
+            nameservers = ["8.8.8.8", "8.8.4.4", "4.2.2.2", "1.1.1.1"]
 
 
 class RecursiveResolver(Resolver):
-    loop = asyncio.get_event_loop()
-
     def error_received(self, exception):
         if isinstance(exception, gaierror):
             pass
         self.log.critical(exception)
 
     def record_reader(self, zone_file):
-        with open(zone_file, 'r') as root_hints_file:
+        with open(zone_file, "r") as root_hints_file:
             for i, line in enumerate(root_hints_file):
-                if not line or line[0] == ';':
+                if not line or line[0] == ";":
                     continue
-                tokens = re.split(r'\s+', line.rstrip())
+                tokens = re.split(r"\s+", line.rstrip())
                 if len(tokens) == 5:
                     (name, ttl, rclass, rtype, rdata) = tokens
                     rclass = DnsRClass[rclass]
@@ -100,7 +98,7 @@ class RecursiveResolver(Resolver):
                     rtype = DnsRType[rtype]
                     ttl = int(ttl)
                 except ValueError:
-                    self.log.critical('Malformed glue records.')
+                    self.log.critical("Malformed glue records.")
                     continue
 
                 name = DomainName(name)
@@ -109,35 +107,47 @@ class RecursiveResolver(Resolver):
                 if rtype == DnsRType.NS:
                     record = DnsRecord(name, rtype, rclass, ttl, rdata=DomainName(rdata))
                 elif rtype == DnsRType.A:
-                    record = DnsRecord(name, rtype, rclass, ttl, rdata=ipaddress.IPv4Address(rdata).packed)
+                    record = DnsRecord(
+                        name, rtype, rclass, ttl, rdata=ipaddress.IPv4Address(rdata).packed
+                    )
                 elif rtype == DnsRType.AAAA:
-                    record = DnsRecord(name, rtype, rclass, ttl, rdata=ipaddress.IPv6Address(rdata).packed)
+                    record = DnsRecord(
+                        name, rtype, rclass, ttl, rdata=ipaddress.IPv6Address(rdata).packed
+                    )
                 else:
-                    logging.warning("Skipping %s record for %s from zone: %s", rtype, name, zone_file)
+                    logging.warning(
+                        "Skipping %s record for %s from zone: %s", rtype, name, zone_file
+                    )
                     continue
 
                 yield record
 
-    def __init__(self, db=None, root_hints_path='named.root'):
+    def __init__(self, db=None, root_hints_path="named.root"):
         self.queue = {}
         # self.db = db
-        self.log = logging.Logger('resolver')
+        self.log = logging.Logger("resolver")
         self.log.addHandler(console)
         self.root_hints = self.bootstrap(root_hints_path)
 
     def connection_made(self, transport):
         self.transport = transport
-        sock = transport.get_extra_info('socket')
+        sock = transport.get_extra_info("socket")
         # self.MTU = sock.getsockopt(socket.IPPROTO_IP, IP_MTU)
         sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
 
     def datagram_received(self, data, addr):
         try:
             (dns_packet, offset) = DnsPacket.parse(data)
-        except AssertionError as e:
-            self.log.warning('Unable to parse packet: %s. %s', data, e)
+        except DnsPacketParseError as e:
+            self.log.warning(
+                "parse failed in resolver: err=%s offset=%s len=%d hex=%s",
+                e,
+                e.offset,
+                len(e.data),
+                e.wire_hex(),
+            )
         else:
-            self.log.info('resolver_datagram_recieved(%s, %s)' % (dns_packet, addr))
+            self.log.info("resolver_datagram_recieved(%s, %s)" % (dns_packet, addr))
             # self.db.store_packet(dns_packet, source=addr)
             (host, port) = addr
             key = (str(host), dns_packet.ID)
@@ -157,16 +167,17 @@ class RecursiveResolver(Resolver):
         # if response is None:
         try:
             if not os.path.isfile(root_hints_path):
-                urllib.request.urlretrieve('http://www.internic.net/domain/named.root', root_hints_path)
-                self.log.info('Attempting to retrieve root hints from internic.')
+                urllib.request.urlretrieve(
+                    "http://www.internic.net/domain/named.root", root_hints_path
+                )
+                self.log.info("Attempting to retrieve root hints from internic.")
             else:
-                self.log.debug('Found root hints, %s' % os.path.basename(root_hints_path))
+                self.log.debug("Found root hints, %s" % os.path.basename(root_hints_path))
 
         except IOError:
-            self.log.critical('Unable to retrieve root hints.')
+            self.log.critical("Unable to retrieve root hints.")
 
         else:
-
             nameservers = []
             additional_records = []
             for record in self.record_reader(root_hints_path):
@@ -176,10 +187,16 @@ class RecursiveResolver(Resolver):
                     additional_records.append(record)
 
             query = Query(QR=DnsQR.query, RD=False, questions=questions)
-            response = Response(QR=DnsQR.response, ID=query.ID, AA=True, RD=False, RA=False,
-                                questions=questions,
-                                nameservers=nameservers,
-                                additional_records=additional_records)
+            response = Response(
+                QR=DnsQR.response,
+                ID=query.ID,
+                AA=True,
+                RD=False,
+                RA=False,
+                questions=questions,
+                nameservers=nameservers,
+                additional_records=additional_records,
+            )
 
             # self.db.store_packet(query)
             # self.db.store_packet(response)
@@ -196,9 +213,18 @@ class RecursiveResolver(Resolver):
         # TODO: try/except to set proper RCODE
         assert dns_packet.QDCOUNT > 0
         if dns_packet.QDCOUNT > 1:
-            assert all(map(lambda question: question.name == dns_packet.questions[0].name, dns_packet.questions[1:]))
             assert all(
-                map(lambda question: question.qclass == dns_packet.questions[0].qclass, dns_packet.questions[1:]))
+                map(
+                    lambda question: question.name == dns_packet.questions[0].name,
+                    dns_packet.questions[1:],
+                )
+            )
+            assert all(
+                map(
+                    lambda question: question.qclass == dns_packet.questions[0].qclass,
+                    dns_packet.questions[1:],
+                )
+            )
 
         # response = self.db.lookup_response(dns_packet.questions)
         # if response:
@@ -233,14 +259,17 @@ class RecursiveResolver(Resolver):
                     next_zone_cut = None
 
                     # for nameserver in [Nameserver(ns) for ns in zone_cut.nameservers]:
-                    for (nameserver, additional_record) in self.enumerate_nameserver_addresses(zone_cut.nameservers,
-                                                                                               zone_cut.additional_records):
+                    for nameserver, additional_record in self.enumerate_nameserver_addresses(
+                        zone_cut.nameservers, zone_cut.additional_records
+                    ):
                         # TODO: Use/Check resolved AA queries from cached records, from zone_cut
                         # As fallback, use glue
                         # TODO: Nameserver(nameserver_record)?
                         ns_name = nameserver.rdata
                         try:
-                            response = await self.query([question], nameserver, additional_record, RD=False)
+                            response = await self.query(
+                                [question], nameserver, additional_record, RD=False
+                            )
                             assert isinstance(response, Response)
                         except asyncio.CancelledError:
                             pass
@@ -249,7 +278,7 @@ class RecursiveResolver(Resolver):
                         except AssertionError:
                             pass
                         else:
-                            self.log.debug('resolve() %s' % response)
+                            self.log.debug("resolve() %s" % response)
                             if response.RCODE == DnsResponseCode.no_error:
                                 # TODO: and rtype == SOA etc
                                 if response.ANCOUNT == 0:
@@ -280,10 +309,10 @@ class RecursiveResolver(Resolver):
                                         pass
 
                                     for response_question in response.questions:
-
                                         if response_question.name == question.name:
-                                            result = await self.query(dns_packet.questions, nameserver,
-                                                                      additional_record)
+                                            result = await self.query(
+                                                dns_packet.questions, nameserver, additional_record
+                                            )
                                             if isinstance(result, Response):
                                                 result.ID = dns_packet.ID
                                                 return result

@@ -1,6 +1,3 @@
-import datetime
-
-
 class DnsNameserver:
     pass
 
@@ -33,7 +30,8 @@ class DnsCache:
         self.zones[zone].update(records, authorative)
 
     def cache_root_hints(self, root_hints):
-        self.cache_zone(DnsRootLabel, root_hints, authorative=True)
+        # Root label / hints are stored under the DNS root zone.
+        self.cache_zone(".", root_hints, authorative=True)
 
     def cache_response(self, nameserver, response):
         pass

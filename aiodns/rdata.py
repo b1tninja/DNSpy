@@ -25,7 +25,7 @@ class RData:
         if isinstance(self.blob, str):
             return self.blob
         elif isinstance(self.blob, bytes):
-            return self.blob.decode('ascii')
+            return self.blob.decode("ascii")
         else:
             return str(self.blob)
 
@@ -49,18 +49,25 @@ class RData_SOA(RData):
         # TODO: consider some wizardry with locals()
         (mname, offset) = DomainName.parse_from(buffer, offset)
         (rname, offset) = DomainName.parse_from(buffer, offset)
-        (serial, refresh, retry, expire) = struct.unpack_from('!IIII', rdata, offset)
+        (serial, refresh, retry, expire) = struct.unpack_from("!IIII", buffer, offset)
         return cls(serial, refresh, retry, expire, mname, rname)
 
     def encode(self):
-        return self.mname.encode() + self.rname.encode() + struct.pack('!IIII',
-                                                                       self.serial,
-                                                                       self.refresh,
-                                                                       self.retry,
-                                                                       self.expire)
+        return (
+            self.mname.encode()
+            + self.rname.encode()
+            + struct.pack("!IIII", self.serial, self.refresh, self.retry, self.expire)
+        )
 
     def __repr__(self):
-        return "%d %d %d %d %s %s" % (self.serial, self.refresh, self.retry, self.expire, self.mname, self.rname)
+        return "%d %d %d %d %s %s" % (
+            self.serial,
+            self.refresh,
+            self.retry,
+            self.expire,
+            self.mname,
+            self.rname,
+        )
 
 
 class RData_SingleName:

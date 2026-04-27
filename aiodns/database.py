@@ -1,11 +1,11 @@
 import logging
 
-from .dns import console
+from . import console
 
 
 class Database(object):
-    def __init__(self, database='dns', user=None, password=None, host='localhost', port=3306):
-        self.log = logging.Logger('db')
+    def __init__(self, database="dns", user=None, password=None, host="localhost", port=3306):
+        self.log = logging.Logger("db")
         self.log.addHandler(console)
         self._cached_names = {}
         self._cached_questions = {}

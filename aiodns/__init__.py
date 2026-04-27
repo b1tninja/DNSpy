@@ -1,4 +1,4 @@
-__author__ = 'b1tninja'
+__author__ = "b1tninja"
 
 import logging
 
@@ -8,4 +8,11 @@ IP_PMTUDISC_DO = 2
 
 console = logging.StreamHandler()
 console.setLevel(logging.DEBUG)
-console.setFormatter(logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s'))
+console.setFormatter(logging.Formatter("%(name)-12s: %(levelname)-8s %(message)s"))
+
+__all__ = [
+    "IP_MTU",
+    "IP_MTU_DISCOVER",
+    "IP_PMTUDISC_DO",
+    "console",
+]

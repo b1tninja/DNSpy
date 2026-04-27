@@ -3,38 +3,38 @@ import string
 
 class DomainName:
     """
-        <domain> ::= <subdomain> | " "
+    <domain> ::= <subdomain> | " "
 
-        <subdomain> ::= <label> | <subdomain> "." <label>
+    <subdomain> ::= <label> | <subdomain> "." <label>
 
-        <label> ::= <letter> [ [ <ldh-str> ] <let-dig> ]
+    <label> ::= <letter> [ [ <ldh-str> ] <let-dig> ]
 
-        <ldh-str> ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+    <ldh-str> ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
 
-        <let-dig-hyp> ::= <let-dig> | "-"
+    <let-dig-hyp> ::= <let-dig> | "-"
 
-        <let-dig> ::= <letter> | <digit>
+    <let-dig> ::= <letter> | <digit>
 
-        <letter> ::= any one of the 52 alphabetic characters A through Z in
-        upper case and a through z in lower case
+    <letter> ::= any one of the 52 alphabetic characters A through Z in
+    upper case and a through z in lower case
 
-        <digit> ::= any one of the ten digits 0 through 9
+    <digit> ::= any one of the ten digits 0 through 9
 
-        Note that while upper and lower case letters are allowed in domain
-        names, no significance is attached to the case.  That is, two names with
-        the same spelling but different case are to be treated as if identical.
+    Note that while upper and lower case letters are allowed in domain
+    names, no significance is attached to the case.  That is, two names with
+    the same spelling but different case are to be treated as if identical.
 
-        The labels must follow the rules for ARPANET host names.  They must
-        start with a letter, end with a letter or digit, and have as interior
-        characters only letters, digits, and hyphen.  There are also some
-        restrictions on the length.  Labels must be 63 characters or less.
+    The labels must follow the rules for ARPANET host names.  They must
+    start with a letter, end with a letter or digit, and have as interior
+    characters only letters, digits, and hyphen.  There are also some
+    restrictions on the length.  Labels must be 63 characters or less.
 
     """
 
-    let = set(string.ascii_letters.encode('ascii'))
-    digit = set(string.digits.encode('ascii'))
-    let_dig = set((string.ascii_letters + string.digits).encode('ascii'))
-    let_dig_hyp = set((string.ascii_letters + string.digits + '-').encode('ascii'))
+    let = set(string.ascii_letters.encode("ascii"))
+    digit = set(string.digits.encode("ascii"))
+    let_dig = set((string.ascii_letters + string.digits).encode("ascii"))
+    let_dig_hyp = set((string.ascii_letters + string.digits + "-").encode("ascii"))
 
     def __init__(self, name, buffer=None, offset=None):
         """
@@ -47,15 +47,17 @@ class DomainName:
         """
         try:
             assert isinstance(name, str)
-        except:
+        except Exception:
             pass
         self.name = name
         self.buffer = buffer
         self.offset = offset
 
     def hierarchy(self):
-        labels = self.name.split('.')
-        return [self.root_label()] + [self.__class__('.'.join(labels[-i:])) for i in range(1, len(labels) + 1)]
+        labels = self.name.split(".")
+        return [self.root_label()] + [
+            self.__class__(".".join(labels[-i:])) for i in range(1, len(labels) + 1)
+        ]
 
     @classmethod
     def parse_from(cls, buffer, offset=0):
@@ -65,13 +67,13 @@ class DomainName:
 
         final = None
 
-        while (buffer[offset]):
+        while buffer[offset]:
             assert offset not in previousOffsets
             previousOffsets.append(offset)
             if buffer[offset] & 0b11000000:
                 if final is None:
                     final = offset + 2
-                offset = int.from_bytes(buffer[offset:][:2], 'big') & 0b0011111111111111
+                offset = int.from_bytes(buffer[offset:][:2], "big") & 0b0011111111111111
                 assert 0 <= offset <= len(buffer)
                 assert buffer[offset] < 64
                 continue
@@ -79,23 +81,23 @@ class DomainName:
             length = buffer[offset]
             offset += 1
             assert length < 64
-            assert offset + length < len(buffer)
+            assert offset + length <= len(buffer)
 
             label = buffer[offset:][:length]
             offset += length
 
-            assert label[0] in cls.let  # Must begin with a letter
+            # On wire, labels may start with a digit (e.g. in-addr.arpa / ip6.arpa reverse trees).
+            assert label[0] in cls.let_dig  # letter or digit
             assert label[-1] in cls.let_dig  # Must end with letter or digit
             assert cls.let_dig_hyp.issuperset(label[1:][:-1])  # Inner portion can be letter digit hyphen
-
             nameLength += length
             assert nameLength < 256
 
-            labels.append(label.decode('ascii'))
+            labels.append(label.decode("ascii"))
 
         else:
             offset += 1
-            return cls('.'.join(labels), buffer, offset), final or offset
+            return cls(".".join(labels), buffer, offset), final or offset
 
     # @classmethod
     # def parse(cls, stream):
@@ -134,11 +136,20 @@ class DomainName:
     #
     def __bytes__(self):
         # https://tools.ietf.org/html/rfc3490
-        parts = self.name.encode('ascii').split(b'.')
-        assert b'' not in parts[:-1]
-        return b''.join([(int.to_bytes(len(label), 1, 'big') if len(label) < 64
-                          else int.to_bytes(0b1100000000000000 | len(label), 2, 'little')) + label
-                         for label in parts if label]) + bytes([0])
+        parts = self.name.encode("ascii").split(b".")
+        assert b"" not in parts[:-1]
+        return b"".join(
+            [
+                (
+                    int.to_bytes(len(label), 1, "big")
+                    if len(label) < 64
+                    else int.to_bytes(0b1100000000000000 | len(label), 2, "little")
+                )
+                + label
+                for label in parts
+                if label
+            ]
+        ) + bytes([0])
 
     def __str__(self):
         return str(self.name)
@@ -152,12 +163,12 @@ class DomainName:
     def __eq__(self, other):
         try:
             return self.name.upper() == other.name.upper()
-        except:
+        except Exception:
             pass
 
     def __hash__(self):
-        return self.name.upper()
+        return hash(self.name.upper())
 
     @classmethod
     def root_label(cls):
-        return cls('.')
+        return cls(".")
