@@ -14,6 +14,7 @@ should be attributable to the one octet this test moved, not to test-order dust.
 
 import base64
 import datetime
+from functools import cache
 
 import pytest
 
@@ -106,21 +107,29 @@ def _sign(
     return RData_RRSIG(signature=signature, **fields)
 
 
-_ROOT = _make_key()
-_TEST = _make_key()
-_ZONE = _make_key()
-_ROOT_KEY = _dnskey(_ROOT)
-_TEST_KEY = _dnskey(_TEST)
-_ZONE_KEY = _dnskey(_ZONE)
+@cache
+def _pk(which: str):
+    """The tree's signing keys, made on first use, never at import.
+
+    CI runs the suite without ``namespy[crypto]`` installed -- that is the whole point
+    of the skip guards -- and a module-level ``generate_private_key`` would crash
+    collection on the missing import before any guard could say "skip".
+    """
+    return _make_key()
+
+
+@cache
+def _pub(which: str) -> RData_DNSKEY:
+    return _dnskey(_pk(which))
 
 
 def _anchor() -> TrustAnchor:
     return TrustAnchor(
         zone=".",
-        key_tag=_ROOT_KEY.key_tag,
+        key_tag=_pub("root").key_tag,
         algorithm=8,
         digest_type=2,
-        digest=ds_digest(".", bytes(_ROOT_KEY), 2),
+        digest=ds_digest(".", bytes(_pub("root")), 2),
         key_id="Kfixture.root",
         valid_from=datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC),
     )
@@ -184,30 +193,30 @@ def build_store(
         store.add(records, zone=zone)
 
     # the root: its own keys, and the DS introducing test.
-    serve(".", ".", int(DnsRType.DNSKEY), [_ROOT_KEY], _ROOT)
+    serve(".", ".", int(DnsRType.DNSKEY), [_pub("root")], _pk("root"))
     serve(
         ".",
         "test.",
         int(DnsRType.DS),
-        [RData_DS.for_dnskey("test.", _TEST_KEY)],
-        _ROOT,
+        [RData_DS.for_dnskey("test.", _pub("test"))],
+        _pk("root"),
         algorithm=ds_alg,
     )
     # test.: its keys, and the DS introducing zone.test.
-    serve("test.", "test.", int(DnsRType.DNSKEY), [_TEST_KEY], _TEST)
+    serve("test.", "test.", int(DnsRType.DNSKEY), [_pub("test")], _pk("test"))
     serve(
         "test.",
         "zone.test.",
         int(DnsRType.DS),
-        [RData_DS.for_dnskey("zone.test.", _ZONE_KEY)],
-        _TEST,
+        [RData_DS.for_dnskey("zone.test.", _pub("zone"))],
+        _pk("test"),
         algorithm=ds_alg,
     )
     # zone.test.: keys and data.
-    serve("zone.test.", "zone.test.", int(DnsRType.DNSKEY), [_ZONE_KEY], _ZONE)
+    serve("zone.test.", "zone.test.", int(DnsRType.DNSKEY), [_pub("zone")], _pk("zone"))
     wildcard_a = RData_A(b"\xc0\x00\x02\x02")
     if with_wildcard:
-        serve("zone.test.", "*.zone.test.", int(DnsRType.A), [wildcard_a], _ZONE)
+        serve("zone.test.", "*.zone.test.", int(DnsRType.A), [wildcard_a], _pk("zone"))
         # the expanded answer: the wildcard's bits under the queried name, signed as
         # the wildcard's bytes -- the RRSIG's Labels remembers which name was signed.
         store.add(
@@ -216,7 +225,7 @@ def build_store(
                 R(
                     "any.zone.test.",
                     int(DnsRType.RRSIG),
-                    _sign(_ZONE, "zone.test.", "*.zone.test.", int(DnsRType.A), [wildcard_a]),
+                    _sign(_pk("zone"), "zone.test.", "*.zone.test.", int(DnsRType.A), [wildcard_a]),
                 ),
             ],
             zone="zone.test.",
@@ -246,7 +255,7 @@ def build_store(
                 f"{label}.zone.test.",
                 int(DnsRType.NSEC3),
                 [RData_NSEC3(1, 0, 0, salt, digests[nxt], owners[owner])],
-                _ZONE,
+                _pk("zone"),
             )
     else:
         apex_types = [
@@ -262,14 +271,14 @@ def build_store(
                 "*.zone.test.",
                 int(DnsRType.NSEC),
                 [_nsec("sub.zone.test.", [int(DnsRType.A)])],
-                _ZONE,
+                _pk("zone"),
             )
             serve(
                 "zone.test.",
                 "zone.test.",
                 int(DnsRType.NSEC),
                 [_nsec("*.zone.test.", apex_types)],
-                _ZONE,
+                _pk("zone"),
             )
         else:
             serve(
@@ -277,14 +286,14 @@ def build_store(
                 "zone.test.",
                 int(DnsRType.NSEC),
                 [_nsec("sub.zone.test.", apex_types)],
-                _ZONE,
+                _pk("zone"),
             )
         serve(
             "zone.test.",
             "sub.zone.test.",
             int(DnsRType.NSEC),
             [_nsec("www.zone.test.", [int(DnsRType.NS)])],
-            _ZONE,
+            _pk("zone"),
         )
         www_types = [int(DnsRType.A)]
         if contradict:
@@ -294,7 +303,7 @@ def build_store(
             "www.zone.test.",
             int(DnsRType.NSEC),
             [_nsec("y.zone.test.", www_types)],
-            _ZONE,
+            _pk("zone"),
             algorithm=www_sig_alg,
         )
         serve(
@@ -302,14 +311,14 @@ def build_store(
             "y.zone.test.",
             int(DnsRType.NSEC),
             [_nsec("zone.test.", [int(DnsRType.TXT)])],
-            _ZONE,
+            _pk("zone"),
         )
     serve(
         "zone.test.",
         "www.zone.test.",
         int(DnsRType.A),
         [RData_A(b"\xc0\x00\x02\x01")],
-        _ZONE,
+        _pk("zone"),
         algorithm=a_sig_alg,
     )
     return store
@@ -329,7 +338,7 @@ def test_the_deep_zone_chains_from_the_root_anchor():
     validator = build_validator()
     apex = validator.authenticate_zone("zone.test.")
     assert apex.status is SecurityStatus.SECURE
-    assert apex.matched_key_tag == _ZONE_KEY.key_tag
+    assert apex.matched_key_tag == _pub("zone").key_tag
     assert len(apex.keys) == 1
     assert validator.authenticate_zone("test.").status is SecurityStatus.SECURE
 
@@ -407,7 +416,7 @@ def test_a_directly_anchored_island_survives_a_broken_parent():
     this test walks through.
     """
     _needs_backend()
-    ds = RData_DS.for_dnskey("test.", _TEST_KEY)
+    ds = RData_DS.for_dnskey("test.", _pub("test"))
     test_anchor = TrustAnchor(
         zone="test.",
         key_tag=ds.key_tag,
@@ -435,20 +444,21 @@ def test_a_key_shaped_anchor_needs_no_digest_at_all():
     _needs_backend()
     key_anchor = TrustAnchor(
         zone=".",
-        key_tag=_ROOT_KEY.key_tag,
+        key_tag=_pub("root").key_tag,
         algorithm=8,
         digest_type=99,
         digest=b"\x00" * 20,
-        public_key=_ROOT_KEY.public_key,
+        public_key=_pub("root").public_key,
         flags=257,
     )
     validator = Validator(anchors=[key_anchor], store=build_store(), now=NOW)
     verdict = validator.authenticate_zone(".")
     assert verdict.status is SecurityStatus.SECURE
-    assert verdict.matched_key_tag == _ROOT_KEY.key_tag
+    assert verdict.matched_key_tag == _pub("root").key_tag
 
 
 def test_without_a_backend_the_tree_is_indeterminate_top_to_bottom(monkeypatch):
+    _needs_backend()  # the tree it monkeypatches away from still has to be signed
     monkeypatch.setattr(crypto, "_BACKEND", None)
     monkeypatch.setattr(crypto, "_PROBED", True)
     validator = build_validator()
@@ -483,7 +493,7 @@ def test_an_answer_validates_under_the_chain():
     _needs_backend()
     verdict = build_validator().validate_rrset("www.zone.test.", int(DnsRType.A))
     assert verdict.secure
-    assert verdict.matched_key_tag == _ZONE_KEY.key_tag
+    assert verdict.matched_key_tag == _pub("zone").key_tag
     assert str(verdict.zone) == "zone.test."
 
 
@@ -585,7 +595,7 @@ def test_a_proved_nxdomain_is_secure():
         zone="zone.test.",
     )
     assert verdict.secure
-    assert verdict.matched_key_tag == _ZONE_KEY.key_tag
+    assert verdict.matched_key_tag == _pub("zone").key_tag
 
 
 def test_a_proved_no_data_answer_is_secure():
