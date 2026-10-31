@@ -69,6 +69,7 @@ from .bundle import (
     query_option_for,
 )
 from .cache import FailureCache, MemoryDnsCache, NegativeEntry, PositiveEntry
+from .dnssec import DNSSEC_SECURITY_TYPES
 from .edns import (
     MQTYPE_QUERY_OPTION_CODE,
     extended_error_presentation,
@@ -92,7 +93,7 @@ from .packet import (
 )
 from .rdata import RData_A, RData_AAAA, type_name_of
 from .trace import Trace
-from .validate import SecurityStatus, Validator
+from .validate import SecurityStatus, ValidationVerdict, Validator
 
 LOGGER = logging.getLogger(__name__)
 
@@ -284,7 +285,7 @@ class Resolver(asyncio.Protocol):
     glue_policy = GluePolicy.STRICT
     nxdomain_cut = NxdomainPolicy.ALWAYS
 
-    #: Trust anchors the walk judges negative answers under; see
+    #: Trust anchors the walk judges answers under, positive and negative; see
     #: :meth:`RecursiveResolver.__init__`. Empty is the unvalidating default,
     #: and the only one a bare ``Resolver()`` can honestly have.
     trust_anchors = ()
@@ -1653,6 +1654,102 @@ def classify(
 _MAX_SEC_FETCHES = 8
 
 
+def _judge_answer(validator, response, zone, qtype: int) -> ValidationVerdict:
+    """One verdict for a positive answer: every RRset the response asserts.
+
+    RFC 4035 §3.2.3 makes AD mean "all RRsets in the Answer and Authority
+    sections are authentic", so judging only the queried RRset could never
+    license the claim -- a response carrying a CNAME beside its target asserts
+    two things, a bundle answering A and AAAA from one walk asserts two, and an
+    SOA riding in the authority section is a third the rule names. Each distinct
+    (owner, type) pair those sections carry is judged by
+    :meth:`~namespy.validate.Validator.validate_rrset`, whose signer-driven
+    chain needs no help from *zone* except for the unsigned case -- which is
+    exactly the case where *zone* decides whether unsigned means Insecure or
+    Bogus. The DNSSEC types stay unjudged in passing, because there RRSIG is the
+    evidence and NSEC the denial's material; a client that queried one directly
+    makes it the answer, and then it is judged like any RRset.
+
+    The composite follows the sections' own logic, not a majority: one forged
+    RRset makes the response Bogus (RFC 4033 §5 -- a response is one thing, and
+    an attacker who can sign anything in it can pick), otherwise one
+    Indeterminate part keeps the whole undetermined and its hint becomes the
+    loop's next question, otherwise one Insecure part is the ceiling -- an
+    unsigned answer below a proved-unsigned parent is authentic data in an
+    unauthenticated dress -- and only an all-secure set is SECURE. Via Opt-Out
+    anywhere, and §9.2¶1 withholds the bit even from an all-secure set: the
+    wildcard answer's closer-match proof is a closest-encloser proof like any
+    other, and its next closer may hide an unsigned delegation.
+    """
+    judged: list[ValidationVerdict] = []
+    seen: set = set()
+    sections = [*response.answers, *response.nameservers]
+    for record in sections:
+        rtype = int(record.rtype)
+        if rtype == OPT_RTYPE:
+            continue  # never an RRset (RFC 6891 §6.2.1), and its owner is the root by convention
+        if rtype in DNSSEC_SECURITY_TYPES and rtype != qtype:
+            continue
+        key = (DomainName(record.name).canonical_text, rtype)
+        if key in seen:
+            continue
+        seen.add(key)
+        judged.append(validator.validate_rrset(key[0], rtype, zone=zone))
+    if not judged:
+        # Nothing left to judge (a response of nothing but OPT): nothing to vouch for.
+        return ValidationVerdict(
+            SecurityStatus.INDETERMINATE,
+            "the answer carried no RRset this resolver could judge",
+            zone=zone,
+        )
+    worst = judged[0]
+    for verdict in judged[1:]:
+        worst = _combine_verdicts(worst, verdict)
+    if len(judged) > 1:
+        worst = ValidationVerdict(
+            worst.status,
+            f"all {len(judged)} RRsets judged: {worst.reason}",
+            zone=worst.zone if worst.zone is not None else zone,
+            matched_key_tag=worst.matched_key_tag,
+            fetch_hint=worst.fetch_hint,
+            via_opt_out=any(v.via_opt_out for v in judged),
+        )
+    else:
+        worst = ValidationVerdict(
+            worst.status,
+            worst.reason,
+            zone=worst.zone if worst.zone is not None else zone,
+            matched_key_tag=worst.matched_key_tag,
+            fetch_hint=worst.fetch_hint,
+            via_opt_out=worst.via_opt_out,
+        )
+    return worst
+
+
+def _combine_verdicts(left: ValidationVerdict, right: ValidationVerdict) -> ValidationVerdict:
+    """The section-wide rank: bogus poisons, indeterminate defers, insecure caps.
+
+    SECURE survives only by meeting SECURE. The reason carried is the one that
+    explains the surviving status -- the bogus verdict's, failing that an
+    indeterminate one's (its hint rides along: one question at a time, and the
+    re-run reconsiders every RRset anyway) -- so a trace line reads as a
+    sentence about the response, not a tally.
+    """
+    rank = {
+        SecurityStatus.SECURE: 0,
+        SecurityStatus.INSECURE: 1,
+        SecurityStatus.INDETERMINATE: 2,
+        SecurityStatus.BOGUS: 3,
+    }
+    winner = left if rank[left.status] >= rank[right.status] else right
+    if winner.status is SecurityStatus.INDETERMINATE:
+        for verdict in (left, right):
+            if verdict.status is SecurityStatus.INDETERMINATE and verdict.fetch_hint is not None:
+                winner = verdict
+                break
+    return winner
+
+
 def resolve_steps(
     sname,
     slist,
@@ -1687,14 +1784,17 @@ def resolve_steps(
     not a client's DO bit: the walk has no client. What a particular client may see is decided once,
     on the way out, by :class:`namespy.server.DnsServer` -- see RFC 4035 §3.2.1.
 
-    ``anchors`` switches on validation of the negatives this walk receives: the
+    ``anchors`` switches on validation of the answers this walk receives: the
     records every response carries are bucketed into one ``DnssecStore`` per walk
     (a referral's DS rides along for free -- RFC 4035 §3.1.4 obliges signed
-    delegations to carry it), and a terminal denial is judged under the anchors by
-    ``namespy.validate``. Whatever the chain lacks is asked for, one query at a
+    delegations to carry it), and a terminal answer -- denial or positive -- is
+    judged under the anchors by ``namespy.validate``, the positive as a
+    composite over every RRset RFC 4035 §3.2.3 makes the response stand or fall
+    on together. Whatever the chain lacks is asked for, one query at a
     time, of the zone that holds it -- §5.2¶6's "MUST query the name servers for
     the parent zone for the DS RRset" is this loop's name -- and the verdict both
-    precedes the terminal event (a ``DnssecVerdict``) and travels into the cached
+    precedes the terminal event (a ``DnssecVerdict``), raises the response's AD
+    bit if it is fully verified, and travels into the cached
     entry's ``validated`` flag, which is what :attr:`NxdomainPolicy.VALIDATED`
     reads at the cut. Empty anchors, the default, keeps the walk exactly as it
     was: gathering, judging, and stamping nothing. ``now`` pins the signature
@@ -1832,13 +1932,17 @@ def resolve_steps(
         if server is not None:
             sec_servers.setdefault(str(DomainName(zone)), server)
 
-    def _fetch_chain(qname, qtype, rcode, zone):
-        """Judge *zone*'s denial of this name, fetching chain data as hints demand.
+    def _fetch_chain(judge):
+        """Run *judge*, fetching chain records as its hints demand, until decided or spent.
 
         A generator because the fetching is the walk's own :class:`SendQuery`
         effect: the verdict loop asks the driver, in the middle of this lookup,
         for the DS or DNSKEY that RFC 4035 §5.2¶6 says a resolver MUST go and ask
-        for. Each hint is offered once per (name, type, zone) -- the
+        for. *judge* is any callable returning a :class:`~namespy.validate.
+        ValidationVerdict` -- a denial, or the composite over a positive
+        answer's RRsets -- and it re-runs whole after every fetch, because the
+        one record that was missing may unlock the verdict anywhere in the
+        response. Each hint is offered once per (name, type, zone) -- the
         :class:`~namespy.validate.Validator`'s side of the bargain -- and
         ``_MAX_SEC_FETCHES`` bounds the pathological zone besides. A hint whose
         zone the walk never reached is terminal: DNS offers no way to ask
@@ -1847,7 +1951,7 @@ def resolve_steps(
         """
         fetches = 0
         while True:
-            verdict = sec_validator.validate_denial(qname, qtype, rcode=rcode, zone=zone)
+            verdict = judge()
             hint = verdict.fetch_hint
             if hint is None or fetches >= _MAX_SEC_FETCHES:
                 return verdict
@@ -2087,51 +2191,78 @@ def resolve_steps(
             # Answer/Nxdomain/Nodata is visible — the generator pauses at
             # ``yield step`` and may never be resumed past Done.
             sec_verdict = None
-            denying_zone = None
+            sec_zone = None
             if (
                 sec_validator is not None
                 and response is not None
-                and isinstance(step, (Nodata, Nxdomain))
+                and isinstance(step, (Answer, Nodata, Nxdomain))
             ):
-                # The verdict is computed here, at the moment the denial and every
-                # record that can judge it are both in hand -- not later at the cut,
-                # when the keys may have aged out of cache and the walk would be
-                # re-judging a memory with fresh questions about data it can no
-                # longer see. RFC 4035 §4.5's atomic-entry guidance caches a
-                # response as one unit for one TTL; the verdict rides along as the
-                # entry's own history of that check.
-                denial_rcode = (
-                    DnsResponseCode.NAME_ERROR
-                    if isinstance(step, Nxdomain)
-                    else DnsResponseCode.NO_ERROR
-                )
-                soa = getattr(step, "soa", None) or next(
-                    (r for r in response.nameservers if int(r.rtype) == int(DnsRType.SOA)),
-                    None,
-                )
-                # The SOA the answer carries is the denying zone's own apex (RFC 8020
-                # Appendix A: "The accompanying SOA record indicates the apex of the
-                # zone"), which beats trusting the Slist's idea of the current zone
-                # when a server has answered for a name it does not control.
-                denying_zone = soa.name if soa is not None else entry.zone
-                sec_verdict = yield from _fetch_chain(
-                    sname.qname, int(sname.qtype), denial_rcode, denying_zone
-                )
+                # The verdict is computed here, at the moment the response and
+                # every record that can judge it are both in hand -- not later at
+                # the cut or the cache read, when the keys may have aged out of
+                # cache and the walk would be re-judging a memory with fresh
+                # questions about data it can no longer see. RFC 4035 §4.5's
+                # atomic-entry guidance caches a response as one unit for one
+                # TTL; the verdict rides along as the entry's own history of
+                # that check. Positive answers joined the same machinery when AD
+                # needed them: §3.2.3 makes the bit speak for every RRset in the
+                # answer, so the judgment is the composite over them all.
+                if isinstance(step, Answer):
+                    # The zone an authoritative answer speaks for. validate_rrset
+                    # consults it only for the unsigned case -- a signed RRset's
+                    # own Signer's Name drives the chain -- and the unsigned case
+                    # is exactly where "which zone is answering" decides Insecure
+                    # from Bogus. entry.zone is what the walk believes; classify
+                    # has already refused to treat a non-authoritative packet
+                    # this way, so an answer reaching here came from the zone it
+                    # claims.
+                    sec_zone = entry.zone if entry is not None else None
+                    # The defaults bind what the one-and-only call of this thunk
+                    # needs; nothing here outlives the iteration, but a closure
+                    # over loop-reassigned names would be a bug waiting for a
+                    # `break` to be added, and B023 is right to call it.
+                    sec_verdict = yield from _fetch_chain(
+                        lambda sec_zone=sec_zone, response=response, qtype=int(sname.qtype): (
+                            _judge_answer(sec_validator, response, sec_zone, qtype)
+                        )
+                    )
+                else:
+                    denial_rcode = (
+                        DnsResponseCode.NAME_ERROR
+                        if isinstance(step, Nxdomain)
+                        else DnsResponseCode.NO_ERROR
+                    )
+                    soa = getattr(step, "soa", None) or next(
+                        (r for r in response.nameservers if int(r.rtype) == int(DnsRType.SOA)),
+                        None,
+                    )
+                    # The SOA the answer carries is the denying zone's own apex (RFC 8020
+                    # Appendix A: "The accompanying SOA record indicates the apex of the
+                    # zone"), which beats trusting the Slist's idea of the current zone
+                    # when a server has answered for a name it does not control.
+                    sec_zone = soa.name if soa is not None else entry.zone
+                    sec_verdict = yield from _fetch_chain(
+                        lambda sec_zone=sec_zone, denial_rcode=denial_rcode: (
+                            sec_validator.validate_denial(
+                                sname.qname, int(sname.qtype), rcode=denial_rcode, zone=sec_zone
+                            )
+                        )
+                    )
                 if sec_verdict.status is SecurityStatus.BOGUS and not client_cd:
                     # The walk is this client's validator (RFC 4035 §3.2.2¶3
                     # inverted: CD is clear, so the authentication duty is
-                    # ours), and a denial that failed it is not an answer. It
-                    # is also not cacheable: RFC 4035 §4.7's BAD-data cache is
-                    # the optional one, and storing forged evidence would let
-                    # the RFC 8020 cut -- which ALLOWS serving an ancestor's
-                    # denial for every name beneath it -- launder one poisoned
-                    # packet into a subtree-wide lie. What §9520 §3.4 does make
+                    # ours), and a response that failed validation is not an
+                    # answer. It is also not cacheable: RFC 4035 §4.7's
+                    # BAD-data cache is the optional one, and storing forged
+                    # evidence would let the RFC 8020 cut -- which ALLOWS
+                    # serving an ancestor's denial for every name beneath it --
+                    # launder one poisoned packet into a subtree-wide lie, and
+                    # let the next reader of a poisoned positive RRset serve it
+                    # as the name's own answer. What §9520 §3.4 does make
                     # mandatory is caching the *failure*, which the note below
                     # files with §3.2's backoff -- 4.7¶4's amplification guard,
                     # met by the machinery 9520 was written to standardise.
-                    yield DnssecVerdict(
-                        str(denying_zone), sec_verdict.status.value, sec_verdict.reason
-                    )
+                    yield DnssecVerdict(str(sec_zone), sec_verdict.status.value, sec_verdict.reason)
                     _remember_dnssec(sec_verdict.reason)
                     refused = Response(
                         QR=DnsQR.RESPONSE,
@@ -2164,7 +2295,7 @@ def resolve_steps(
                     sname,
                     step,
                     response,
-                    validated=bool(sec_verdict is not None and sec_verdict.secure),
+                    validated=bool(sec_verdict is not None and sec_verdict.ad_worthy),
                 )
             if (
                 failures is not None
@@ -2210,7 +2341,7 @@ def resolve_steps(
                     response.AD = True
                 # Before the event it judged: the verdict is why the NXDOMAIN below
                 # may cut, and a reader should meet the reason before the fact.
-                yield DnssecVerdict(str(denying_zone), sec_verdict.status.value, sec_verdict.reason)
+                yield DnssecVerdict(str(sec_zone), sec_verdict.status.value, sec_verdict.reason)
             yield step
             if isinstance(step, (Done, Fail)):
                 # Fail is terminal for the same reason Done is: classify emits it
@@ -2404,6 +2535,7 @@ def _synthesize_response(sname, hit, dnssec_ok: bool = False, validated: bool = 
         return Response(
             QR=DnsQR.RESPONSE,
             AA=hit.authoritative,
+            AD=validated,
             RCODE=DnsResponseCode.NO_ERROR,
             questions=questions,
             answers=list(hit.records),
@@ -2452,9 +2584,11 @@ def _write_cache(cache, sname, terminal_event, response, validated=False):
     ``terminal_event`` is the most recent of (Answer, Nodata, Nxdomain)
     yielded for this response; ``response`` is the corresponding wire
     packet (used for the AA flag and to dig the SOA out of the authority
-    section on NXDOMAIN). ``validated`` is the walk's SECURE verdict on this
-    denial under its trust anchors -- ``False`` whenever nothing was checked,
-    which is the only state a non-validating resolver may assert.
+    section on NXDOMAIN). ``validated`` is the walk's verdict on this response
+    under its trust anchors -- fully verified, AD-worthy and (for a denial)
+    cut-worthy -- and ``False`` whenever nothing was checked or what was
+    checked came up short, which is the only state a non-validating resolver
+    may assert.
 
     A truncated response is never stored. RFC 1123 section 6.1.3.2 states it as
     a prohibition -- "Truncated responses MUST NOT be saved (cached) and later
@@ -2488,6 +2622,7 @@ def _write_cache(cache, sname, terminal_event, response, validated=False):
                 records,
                 now + ttl,
                 authoritative=bool(getattr(response, "AA", False)),
+                validated=validated,
             )
         )
         return
@@ -2731,12 +2866,15 @@ class RecursiveResolver(Resolver):
             cache has a subtree-wide claim at all. :class:`NxdomainPolicy` says
             what each stance costs. Also accepted as the equivalent string.
         :param trust_anchors: :class:`~namespy.anchors.TrustAnchor` objects to
-            validate negative answers against -- the trust point RFC 4035 §4.4
-            calls "configured" and §4.3 makes the origin of every Secure verdict.
-            With any present, every NXDOMAIN/NODATA this walk receives is judged by
-            :mod:`namespy.validate` (chain composed from the walk's own responses,
-            §5.2¶6 gaps fetched), the verdict is traced as a ``DnssecVerdict``, and
-            a SECURE denial is stamped ``validated`` into its cache entry. Empty,
+            validate answers against -- the trust point RFC 4035 §4.4 calls
+            "configured" and §4.3 makes the origin of every Secure verdict.
+            With any present, every terminal answer this walk receives, positive
+            and negative, is judged by :mod:`namespy.validate` (chain composed
+            from the walk's own responses, §5.2¶6 gaps fetched; a positive
+            answer is judged as a whole, every RRset §3.2.3 names), a fully
+            verified one carries the header's AD bit, and the verdict is traced
+            as a ``DnssecVerdict`` and stamped ``validated`` into the answer's
+            cache entry. Empty,
             the default, validates nothing -- and :attr:`NxdomainPolicy.VALIDATED`
             refuses construction without it. Setting anchors turns on ``dnssec_ok``:
             a security-aware resolver MUST ask for the records it means to validate

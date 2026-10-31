@@ -1159,6 +1159,77 @@ answer's closer proof comes along with it); (2) the DS-strip question and the
 `serve --dnssec` DO question remain open; (3) key-tag signalling (RFC 8145's
 actual subject) now has a home: the helper queries know which zones they ask.
 
+### Follow-up: the positive half — the answer, judged whole (RFC 4035 §3.2.3, §5.3.1, §5.3.4; RFC 4033 §5; RFC 9520 §3.4; RFC 5155 §9.2)
+
+**Requested**: the first item of the previous "Next" — AD existed but could
+only speak for denials; a validator whose NXDOMAINs are verified and whose A
+records are not has answered half the question §3.2.3 asks.
+
+**Delivered**: terminal answers run the same judge-fetch-stamp loop the denials
+earned, with `_fetch_chain` generalized from a denial-specific function to a
+judge-thunk runner (re-runs whole after every fetch: the one missing record may
+unlock the verdict anywhere in the response). The judgment is a **composite**:
+`_judge_answer` enumerates every distinct (owner, type) RRset the Answer and
+Authority sections carry — §3.2.3's "all RRsets" is the claim AD makes, and
+judging only the queried type could never license it — skipping DNSSEC types
+(RRSIG is evidence, NSEC the denial's material) unless the client queried one
+directly. Rank: Bogus poisons the whole response, Indeterminate defers it and
+lends its hint to the loop, Insecure caps it, SECURE needs them all. The
+verdict then behaves exactly as the negatives' did: refused with SERVFAIL + EDE
+6 + the failure note when CD is clear, delivered raw and uncached when CD is
+set, AD on the response and `validated` in the entry when fully verified, and
+the cache-hit path asserts from the stamp for a validator and stays silent for
+an anchorless reader.
+
+**The conviction the half-crank could not see**: a zone the chain proves secure
+answering **without** its RRSIG is now Bogus — RFC 4033 §5's missing-signature
+rule, reached through `validate_rrset`'s unsigned path (zone stated, chain
+secure). Before this increment the walk judged signatures only when they were
+present, which is precisely the property the strip-a-signature attacker
+selects: the downgraded answer would have been served as merely
+unauthenticated, forever, with the resolver's own cache confirming it. The
+stripping test (`test_an_answer_stripped_of_its_signature_is_bogus_not_unsigned`)
+is the increment's reason to exist.
+
+**The stamp's meaning narrowed, on purpose**: `validated` now means *fully
+verified* — `ad_worthy`, not `secure`. The stamp answers two questions (may a
+cache read assert AD; may a denial cut) and RFC 5155 §9.2¶1's Opt-Out refusal
+reaches both, so an Opt-Out-rested denial no longer stamps at all: the check
+that could not finish at write time is not allowed to be guessed finished at
+read time, and the conservative reading costs only a re-walk. `PositiveEntry`
+joined the same (already-migrated) SQLite column; `validate_rrset` surfaces
+`WildcardAnswerProof.via_opt_out` — the third flag nsec.py exported and nobody
+read (`via_opt_out` at 9.2, `DenialProof`'s, this one's) — so a wildcard
+answer behind an Opt-Out next closer is secure, served, and unasserted.
+
+**Findings along the way**: (1) `classify` needed no change at all — its
+`Answer` fires terminal only when the alias chain lands on the real type, so a
+response carrying CNAME+target arrives whole to the judge and both RRsets are
+enumerated; an in-flight CNAME-only response yields no `Answer` and is judged
+when its successor terminates. (2) ruff's B023 caught a real hygiene gap in
+the answer thunk: `response` is a loop name; the denial thunk had grown its
+defaults for `sec_zone`/`denial_rcode` but the answer one closed over
+`response` and `sname.qtype` — bound explicitly, since "consumed this
+iteration" is a property of the call site, not of the closure. (3) the
+composite's reason string ("all 2 RRsets judged: …") is a test surface: the
+event must say the response was judged as one thing, because that is the claim.
+
+**Verified**: 1357 passed (+13 net: 9 positive-answer wiring tests — secure/AD/
+stamp, cache-hit AD both readers, forged refused, stripped refused (the strip
+attack), CD collect-everything-claim-nothing, silent-keys indeterminate,
+proved-unsigned child insecure, no-anchors untouched; 1 two-RRset composite
+with a poisoned SOA signature; 1 validator wildcard Opt-Out; 2 SQLite positive
+round-trips), `ruff check`/`format` clean, `mypy namespy` exits 0, `-O` run
+clean.
+
+**Next, in order**: (1) the DS-strip question and the `serve --dnssec` DO
+question remain open; (2) key-tag signalling (RFC 8145: `edns-key-tag` on the
+helper DNSKEY queries, §4.2.2.1's two-list forwarding) now has an obvious
+home; (3) aggressive NSEC caching (RFC 9908 — the denials now carry verdicts,
+which is the precondition 9908 §5's caveats assume); (4) wildcard *synthesis*
+from cache (roadmap §4's ⬜ row) can reuse the per-lookup store question
+finally settled here.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

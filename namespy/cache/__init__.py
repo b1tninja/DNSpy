@@ -117,17 +117,28 @@ class CacheEntry:
 
 
 class PositiveEntry(CacheEntry):
-    """Cached positive RRset (RFC 1034 §7.4)."""
+    """Cached positive RRset (RFC 1034 §7.4).
 
-    def __init__(self, name, qtype, qclass, records, expires_at, authoritative=False):
+    ``validated`` carries the same meaning as on :class:`NegativeEntry`: the
+    walk judged this answer under its trust anchors at write time and found
+    every RRset it asserts fully verified -- secure, and with nothing left
+    cryptographically unchecked (no Opt-Out span). It is the entry's own
+    history of that check, and the only basis on which a later cache answer
+    may raise the AD bit (RFC 4035 §3.2.3).
+    """
+
+    def __init__(
+        self, name, qtype, qclass, records, expires_at, authoritative=False, validated=False
+    ):
         super().__init__(name, qtype, qclass, expires_at)
         self.records = list(records)
         self.authoritative = bool(authoritative)
+        self.validated = bool(validated)
 
     def __repr__(self):
         return (
             f"<PositiveEntry {self.name}/{self.qtype} "
-            f"n={len(self.records)} aa={self.authoritative}>"
+            f"n={len(self.records)} aa={self.authoritative} validated={self.validated}>"
         )
 
 
@@ -150,8 +161,12 @@ class NegativeEntry(CacheEntry):
     a resolver that did not ask for DNSSEC data without them too -- and an empty value only costs the
     echo, never the denial itself.
 
-    ``validated`` records that *this resolver checked those proofs when the denial arrived* and the
-    chain under its configured anchors came back SECURE (RFC 4035 §4.3¶2). It is deliberately a
+    ``validated`` records that *this resolver checked those proofs when the denial arrived*
+    and the chain under its configured anchors came back SECURE with nothing left
+    cryptographically unchecked -- secure, and not resting on an NSEC3 Opt-Out span
+    (RFC 4035 §4.3¶2, RFC 5155 §9.2¶1's MUST NOT as applied to the stamp: a denial whose
+    next closer may hide an insecure delegation has proved the answer but not every
+    alternative, so it earns neither the AD claim nor the cut). It is deliberately a
     remembered verdict rather than a live re-check: RFC 4035 §4.5 builds caching on responses kept
     "as a single atomic entry" and discarded together when they expire, and re-verifying at
     cut time would couple the cut to whether a DNSKEY happens to still be cached -- a TTL

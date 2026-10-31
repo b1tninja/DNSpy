@@ -162,8 +162,10 @@ class SqliteDnsCache(DnsCache):
         """Add ``validated`` to a database written before the RFC 8020 §2¶3 verdict flag.
 
         Rows from that era read as unvalidated, which is the only honest default: the verdict
-        is a record of a check *this* build performed, and an old row proves only that nobody
-        checked. A database written after this column joined :data:`_SCHEMA` but before some
+        is a record of a check *this* build performed -- of a denial, which is what the flag
+        judged first, or of an answer, which joined it on the same column -- and an old row
+        proves only that nobody checked. A database written after this column joined
+        :data:`_SCHEMA` but before some
         future one needs no special handling either -- the ALTER sees the column present.
         """
         self._migrate_column(
@@ -231,6 +233,7 @@ class SqliteDnsCache(DnsCache):
                 _unpack_records(payload),
                 expires_at,
                 bool(authoritative),
+                validated=bool(validated),
             )
         return NegativeEntry(
             name,
@@ -286,7 +289,7 @@ class SqliteDnsCache(DnsCache):
             # how an answer and its signatures stay together. The column exists so the row shape is
             # uniform, not because an answer has proofs to carry.
             proofs = b""
-            validated = 0
+            validated = 1 if getattr(entry, "validated", False) else 0
         elif isinstance(entry, NegativeEntry):
             rcode_int = int(entry.rcode)
             kind = _KIND_NXDOMAIN if rcode_int == int(DnsResponseCode.NAME_ERROR) else _KIND_NODATA

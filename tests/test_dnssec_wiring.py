@@ -2,10 +2,13 @@
 
 The validator of :mod:`namespy.validate` judges the records it is handed; these tests
 drive the *handing*: a scripted descent from the root through two signed referrals
-into a signed zone's NXDOMAIN, the chain-fetch loop the walk runs when the chain is
+into a signed zone's NXDOMAIN or its signed answer, the chain-fetch loop the walk runs
+when the chain is
 incomplete (RFC 4035 §5.2¶6: "A security-aware resolver MUST query the name servers
-for the parent zone for the DS RRset"), the verdict stamped into the cached denial,
-and :attr:`NxdomainPolicy.VALIDATED` finally consuming it (RFC 8020 §2¶3).
+for the parent zone for the DS RRset"), the verdict stamped into the cached
+answer -- denial or positive --, :attr:`NxdomainPolicy.VALIDATED` finally consuming
+it (RFC 8020 §2¶3), and the header's AD/CD pair lit or withheld according to all of
+it (RFC 4035 §3.2.2-§3.2.3).
 
 The keys, signatures, and trust anchor are the fixture tree of
 :mod:`tests.test_dnssec_validate` -- imported rather than duplicated, following the
@@ -23,7 +26,14 @@ from namespy.crypto import crypto_available
 from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from namespy.names import DomainName
 from namespy.packet import DnsQuestion, DnsRecord, Response
-from namespy.rdata import RData_A, RData_DS, RData_NS, RData_RRSIG, RData_SOA
+from namespy.rdata import (
+    RData_A,
+    RData_AAAA,
+    RData_DS,
+    RData_NS,
+    RData_RRSIG,
+    RData_SOA,
+)
 from namespy.resolver import (
     DnssecVerdict,
     Done,
@@ -731,3 +741,270 @@ def test_the_trace_marks_chain_queries_and_renders_the_verdict():
     diagram = trace.to_mermaid()
     assert "(dnssec)" in diagram  # the helper queries are marked as chain fetches
     assert "dnssec secure: zone.test." in diagram
+
+
+# ------------------------------------------------------------------- positive answers
+#
+# RFC 4035 §3.2.3 makes AD speak for "all RRsets in the Answer and Authority
+# sections", so the positive half of the walk needs the same judge-fetch-stamp
+# loop the denials earned -- composite over the whole response, and with the
+# same refusals: a forged or stripped answer is refused where CD is clear,
+# delivered unasserted where it is not, and never cached unvalidated.
+
+_HOST6 = ipaddress.IPv6Address("2001:db8::53")
+
+
+def _aaaa_rrset(name, *, flip=False, signed=True):
+    rdata = RData_AAAA(_HOST6)
+    if signed:
+        return _signed("zone.test.", name, DnsRType.AAAA, [rdata], "zone", flip=flip)
+    return [_rec(name, DnsRType.AAAA, rdata)]
+
+
+def positive(qname, records):
+    return _resp(qname, DnsQType.AAAA, aa=True, answers=list(records))
+
+
+def _positive_script(name="www.zone.test.", *, flip=False, signed=True, keys=True):
+    """Root -> test. -> zone.test. -> a signed (or stripped/forged) AAAA answer."""
+    script = [
+        root_referral(name),
+        tld_referral(name),
+        positive(name, _aaaa_rrset(name, flip=flip, signed=signed)),
+    ]
+    if keys:
+        script += [
+            key_answer(".", root_keys()),
+            key_answer("test.", tld_keys()),
+            key_answer("zone.test.", zone_keys()),
+        ]
+    return script
+
+
+def test_a_signed_answer_is_judged_traced_and_bears_ad():
+    cache = MemoryDnsCache(time_fn=Clock())
+    events = _walk(cache, "www.zone.test.", responses=_positive_script(), anchors=(_anchor(),))
+    verdict = _verdict(events)
+    assert verdict is not None
+    assert verdict.status == "secure", verdict.reason
+    assert str(verdict.zone) == "zone.test."
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.NO_ERROR
+    assert response.AD is True  # RFC 4035 §3.2.3: every RRset it stands on, judged
+    entry = cache.get("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert entry.validated is True
+    assert len(_helpers(events)) == 3
+
+
+def test_a_signed_answer_served_from_cache_answers_with_ad():
+    cache = MemoryDnsCache(time_fn=Clock())
+    _walk(cache, "www.zone.test.", responses=_positive_script(), anchors=(_anchor(),))
+    events = _walk(cache, "www.zone.test.", responses=[], anchors=(_anchor(),))
+    assert not _queries(events)
+    assert _done(events).AD is True
+    assert _verdict(events) is None  # the stamp speaks; nothing is re-judged
+
+
+def test_the_same_entry_asserts_nothing_to_a_resolver_without_anchors():
+    """§3.1.6¶3 keeps its promise on positives exactly as on denials and cuts."""
+    cache = MemoryDnsCache(time_fn=Clock())
+    _walk(cache, "www.zone.test.", responses=_positive_script(), anchors=(_anchor(),))
+    events = _walk(cache, "www.zone.test.", responses=[])
+    assert not _queries(events)
+    assert _done(events).AD is False
+
+
+def test_a_forged_answer_signature_is_refused_and_caches_nothing():
+    cache = MemoryDnsCache(time_fn=Clock())
+    failures = FailureCache()
+    events = _walk(
+        cache,
+        "www.zone.test.",
+        responses=_positive_script(flip=True),
+        anchors=(_anchor(),),
+        failures=failures,
+    )
+    verdict = _verdict(events)
+    assert verdict.status == "bogus"
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.SERVER_FAILURE
+    assert response.dnssec_bogus is True
+    assert not response.answers  # the forged data is not served to a validation client
+    assert cache.get("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN)) is None
+    note = failures.lookup_query("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert note is not None
+    assert note.dnssec is True
+
+
+def test_an_answer_stripped_of_its_signature_is_bogus_not_unsigned():
+    """The strip-a-signature attack, met head on: a secure zone answering without
+    its RRSIG is RFC 4033 §5's missing-signature bogus, not an unsigned answer --
+    and a walk that judged only present RRSIGs would serve the stripped data as
+    merely unauthenticated. The chain fetches settle who the zone is; the zone's
+    own keys convict the bare RRset.
+    """
+    cache = MemoryDnsCache(time_fn=Clock())
+    events = _walk(
+        cache,
+        "www.zone.test.",
+        responses=_positive_script(signed=False),
+        anchors=(_anchor(),),
+    )
+    verdict = _verdict(events)
+    assert verdict.status == "bogus", verdict.reason
+    assert "unsigned" in verdict.reason
+    assert _done(events).RCODE == DnsResponseCode.SERVER_FAILURE
+    assert cache.get("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN)) is None
+
+
+def test_a_cd_query_collects_the_forged_answer_claims_nothing_caches_nothing():
+    cache = MemoryDnsCache(time_fn=Clock())
+    failures = FailureCache()
+    _walk(
+        cache,
+        "www.zone.test.",
+        responses=_positive_script(flip=True),
+        anchors=(_anchor(),),
+        failures=failures,
+    )
+    events = _walk(
+        cache,
+        "www.zone.test.",
+        responses=_positive_script(flip=True),
+        anchors=(_anchor(),),
+        failures=failures,
+        client_cd=True,
+    )
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.NO_ERROR  # §3.2.2¶3: pass it through
+    assert len(response.answers) == 2  # the RRset and its bad signature, raw
+    assert response.AD is False
+    assert cache.get("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN)) is None
+    note = failures.lookup_query("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert note.strikes == 1
+
+
+def test_a_zone_that_stays_silent_on_its_keys_leaves_the_answer_unasserted():
+    """§4.3¶5 on a positive: could not obtain, could not tell, could not claim."""
+    cache = MemoryDnsCache(time_fn=Clock())
+    events = _walk(
+        cache,
+        "www.zone.test.",
+        responses=_positive_script(keys=False),  # the three fetches get nothing
+        anchors=(_anchor(),),
+    )
+    verdict = _verdict(events)
+    assert verdict.status == "indeterminate"
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.NO_ERROR  # indeterminate still answers
+    assert response.AD is False
+    entry = cache.get("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert entry.validated is False
+
+
+def test_an_answer_below_a_proved_unsigned_delegation_is_insecure():
+    """Insecure is a verdict, not a shrug -- and it takes the chain to reach.
+
+    The walk descends through zone.test.'s proof that sub.zone.test. carries no DS
+    (§5.2¶9), receives an unsigned answer from the child, and can call it Insecure
+    only because the parent's NSEC verified under authenticated keys. The answer
+    stands, served, stamped nothing, asserting nothing.
+    """
+    cache = MemoryDnsCache(time_fn=Clock())
+    name = "host.sub.zone.test."
+    script = [
+        root_referral(name),
+        tld_referral(name),
+        zone_referral_sub(name),
+        positive(name, [_rec(name, DnsRType.AAAA, RData_AAAA(_HOST6))]),
+        key_answer(".", root_keys()),
+        key_answer("test.", tld_keys()),
+        key_answer("zone.test.", zone_keys()),
+    ]
+    events = _walk(cache, name, responses=script, anchors=(_anchor(),))
+    verdict = _verdict(events)
+    assert verdict.status == "insecure", verdict.reason
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.NO_ERROR
+    assert response.AD is False
+    entry = cache.get(name, int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert entry.validated is False
+
+
+def test_no_anchors_judges_no_answer_stamps_nothing():
+    """The unvalidating default is untouched by the positive half, RRSIGs and all."""
+    cache = MemoryDnsCache(time_fn=Clock())
+    events = _walk(cache, "www.zone.test.", responses=_positive_script())
+    assert _verdict(events) is None
+    assert not _helpers(events)
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.NO_ERROR
+    assert response.AD is False
+    entry = cache.get("www.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert entry.validated is False
+
+
+def _soa_rrset(*, flip=False):
+    return _signed(
+        "zone.test.",
+        "zone.test.",
+        DnsRType.SOA,
+        [
+            RData_SOA(
+                DomainName("ns1.zone.test."),
+                DomainName("hostmaster.zone.test."),
+                1,
+                7200,
+                3600,
+                1209600,
+                300,
+            )
+        ],
+        "zone",
+        flip=flip,
+    )
+
+
+def test_every_rrset_in_the_answer_judges_and_a_forged_one_poisons_them_all():
+    """RFC 4035 §3.2.3 counts the Authority section, and one poisoned RRset is one
+    forged response.
+
+    The signed SOA riding along turns the verdict into a composite over two
+    RRsets; flipping its signature -- leaving the queried AAAA perfectly valid --
+    still refuses the whole response. An attacker who can forge one RRset in a
+    response can pick the one nobody thought to re-check, and "all RRsets" is
+    the rule's whole defence against exactly that.
+    """
+    name = "www.zone.test."
+
+    def script(flip_soa):
+        return [
+            root_referral(name),
+            tld_referral(name),
+            _resp(
+                name,
+                DnsQType.AAAA,
+                aa=True,
+                answers=_aaaa_rrset(name),
+                nameservers=_soa_rrset(flip=flip_soa),
+            ),
+            key_answer(".", root_keys()),
+            key_answer("test.", tld_keys()),
+            key_answer("zone.test.", zone_keys()),
+        ]
+
+    cache = MemoryDnsCache(time_fn=Clock())
+    events = _walk(cache, name, responses=script(False), anchors=(_anchor(),))
+    verdict = _verdict(events)
+    assert verdict.status == "secure", verdict.reason
+    assert "2 RRsets" in verdict.reason
+    assert _done(events).AD is True
+    assert cache.get(name, int(DnsQType.AAAA), int(DnsRClass.IN)).validated is True
+
+    cache = MemoryDnsCache(time_fn=Clock())
+    events = _walk(cache, name, responses=script(True), anchors=(_anchor(),))
+    assert _verdict(events).status == "bogus"
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.SERVER_FAILURE
+    assert response.dnssec_bogus is True
+    assert cache.get(name, int(DnsQType.AAAA), int(DnsRClass.IN)) is None

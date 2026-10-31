@@ -1036,7 +1036,7 @@ def test_invalidate_reopens_conclusions_but_not_requests():
 # insecure delegation": a part of the answer went cryptographically unchecked.
 
 
-def _next_closer_owner(qname: str) -> str:
+def _next_closer_owner(qname: str, *, wildcard: bool = False) -> str:
     """Which NSEC3 of the fixture's chain covers the hash of *qname* itself.
 
     Recomputes the fixture's own digest ordering rather than trusting a fixed
@@ -1045,6 +1045,8 @@ def _next_closer_owner(qname: str) -> str:
     spans running (owner, next] and the last wrapping to the first.
     """
     owners = ["zone.test.", "sub.zone.test.", "www.zone.test.", "y.zone.test."]
+    if wildcard:
+        owners.append("*.zone.test.")
     digests = {o: nsec3_hash(o, iterations=0, salt=b"") for o in owners}
     target = nsec3_hash(qname, iterations=0, salt=b"")
     order = sorted(owners, key=lambda o: digests[o])
@@ -1099,3 +1101,24 @@ def test_a_signed_next_closer_earns_the_ad_bit_it_denied_opt_out():
         zone="zone.test.",
     )
     assert nsec_verdict.ad_worthy
+
+
+def test_a_wildcard_answer_behind_an_opt_out_span_earns_no_ad():
+    """§9.2 is about closest-encloser proofs, and a wildcard answer carries one.
+
+    The closer-match denial of RFC 4035 §5.3.4¶1 IS a closest-encloser proof;
+    when Opt-Out covers its next closer, the answered name might instead have
+    been (or hidden) an insecure delegation whose data nobody signed. The
+    wildcard answer stands -- but the walk may not vouch for it.
+    """
+    _needs_backend()
+    covering = _next_closer_owner("any.zone.test.", wildcard=True)
+    validator = _nsec3_validator(with_wildcard=True, opt_out=(covering,))
+    verdict = validator.validate_rrset("any.zone.test.", int(DnsRType.A))
+    assert verdict.secure
+    assert "wildcard-expanded" in verdict.reason
+    assert verdict.via_opt_out
+    assert not verdict.ad_worthy
+    plain = _nsec3_validator(with_wildcard=True).validate_rrset("any.zone.test.", int(DnsRType.A))
+    assert plain.secure
+    assert plain.ad_worthy

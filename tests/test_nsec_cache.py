@@ -18,7 +18,7 @@ import sqlite3
 
 import pytest
 
-from namespy.cache import MemoryDnsCache, NegativeEntry
+from namespy.cache import MemoryDnsCache, NegativeEntry, PositiveEntry
 from namespy.cache.sqlite import SqliteDnsCache, _name_text
 from namespy.dnssec import encode_base32hex, nsec3_hash
 from namespy.enums import DnsRClass, DnsResponseCode, DnsRType
@@ -316,6 +316,46 @@ def test_the_sqlite_round_trip_preserves_the_verdict(sqlite_cache):
 def test_unvalidated_is_the_default_across_the_sqlite_trip(sqlite_cache):
     sqlite_cache.put(_denial())
     assert sqlite_cache.nxdomain_at("missing.example.com.", int(DnsRClass.IN)).validated is False
+
+
+def test_a_stamped_answer_survives_the_sqlite_trip_too(sqlite_cache):
+    """The positive half of the stamp: the flag means "this build verified this",
+    across processes and reboots exactly as it does for a denial -- and the read
+    that feeds a cache answer's AD bit rebuilds it from the same column.
+    """
+    sqlite_cache.put(
+        PositiveEntry(
+            "www.example.com.",
+            A,
+            int(DnsRClass.IN),
+            [_record("www.example.com.", A, b"\x93\x18\xd8\x22")],
+            NOW + 300,
+            authoritative=True,
+            validated=True,
+        )
+    )
+    hit = sqlite_cache.get("www.example.com.", A, int(DnsRClass.IN))
+    assert hit.validated is True
+    assert hit.authoritative is True
+    assert len(hit.records) == 1
+
+
+def test_an_ordinary_answer_round_trips_unvalidated(sqlite_cache):
+    """Old rows, unverified rows, rows from a non-validating resolver: all False.
+
+    The column predates positive stamps, and the migration's default is the truth
+    about every one of them -- nobody checked, so nothing may be asserted.
+    """
+    sqlite_cache.put(
+        PositiveEntry(
+            "www.example.com.",
+            A,
+            int(DnsRClass.IN),
+            [_record("www.example.com.", A, b"\x01\x02\x03\x04")],
+            NOW + 300,
+        )
+    )
+    assert sqlite_cache.get("www.example.com.", A, int(DnsRClass.IN)).validated is False
 
 
 def test_a_database_from_before_the_verdict_flag_reads_unvalidated(tmp_path):

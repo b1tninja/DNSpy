@@ -780,9 +780,12 @@ class Validator:
                 f"(RFC 4035 §5.3.4¶1)",
                 zone=DomainName(signer),
             )
+        via_opt_out = False
         try:
             if entries3:
-                nsec3_proves_wildcard_answer(qname, wildcard, usable_nsec3(entries3), signer)
+                via_opt_out = nsec3_proves_wildcard_answer(
+                    qname, wildcard, usable_nsec3(entries3), signer
+                ).via_opt_out
             else:
                 nsec_proves_wildcard_answer(qname, wildcard, entries1)
         except IncompleteProofError as exc:
@@ -806,6 +809,10 @@ class Validator:
             f"denial from {signer} is present and signed (RFC 4035 §5.3.4, §5.4¶4)",
             zone=DomainName(signer),
             matched_key_tag=zv.matched_key_tag,
+            via_opt_out=via_opt_out,  # RFC 5155 §9.2¶1 reaches wildcard answers too:
+            # the closer-match proof is a closest-encloser proof, and when Opt-Out
+            # covers its next closer the name might exist as an unsigned delegation
+            # -- the wildcard answer stands, the AD claim does not.
         )
 
     def validate_denial(self, qname, qtype: int, *, rcode, zone) -> ValidationVerdict:
