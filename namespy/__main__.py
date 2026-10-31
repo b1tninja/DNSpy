@@ -3,7 +3,6 @@
 
 import argparse
 import asyncio
-import dataclasses
 import logging
 import sys
 import time
@@ -600,9 +599,10 @@ def build_parser():
         "way every DNS answer is retried -- a timeout or a truncated answer is "
         "asked again over TCP (RFC 1035 section 4.2.2, RFC 7766); tcp asks over "
         "TCP first and asks to keep the connection idle when the server will "
-        "(RFC 7828); dot is DNS over TLS (RFC 7858, default port 853) with the "
-        "server authenticated against its #<name>. Only meaningful with "
-        "--forward.",
+        "(RFC 7828); dot is DNS over TLS (RFC 7858, default port 853) and doh "
+        "is DNS over HTTPS (RFC 8484, default port 443, template path from the "
+        "#<name>/<path> suffix), both authenticating the server against its "
+        "#<name>. Only meaningful with --forward.",
     )
     p.add_argument(
         "--mqtype",
@@ -986,12 +986,7 @@ async def cli_stub(args) -> int:
     loop = asyncio.get_running_loop()
     qname = DomainName(args.name)
     try:
-        parsed = [Upstream.parse(text) for text in args.forward]
-        upstreams = (
-            [dataclasses.replace(u, transport=args.stub_transport) for u in parsed]
-            if args.stub_transport
-            else parsed
-        )
+        upstreams = [Upstream.parse(text, transport=args.stub_transport) for text in args.forward]
     except ValueError as exc:
         raise SystemExit(f"namespy: --forward: {exc}") from None
     if args.mqtype:

@@ -315,7 +315,7 @@ async def test_a_name_mismatch_fails_closed_and_is_remembered(dot):
     resolver = stub([upstream(name="evil.test")])
     try:
         assert await resolver.forward(question()) is None
-        assert resolver._dot_dead  # the memory the paragraph asks for
+        assert resolver._stream_dead  # the memory the paragraph asks for
         attempts = server.connections  # a failed handshake may never be accepted
         assert await resolver.forward(question()) is None
         assert server.connections == attempts  # remembered dead: not even a SYN

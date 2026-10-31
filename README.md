@@ -242,8 +242,11 @@ them change the security properties of anything built on top.
   the queried name only, so there is nothing else for a referral to smuggle.
 - **Not a name server.** No zone storage, no serving of a zone, no AXFR/IXFR. The
   bundled `DnsServer` answers from the resolver for loopback testing.
-- **UDP, with TCP only for truncation.** No DNS over TLS (RFC 7858), HTTPS
-  (RFC 8484) or QUIC (RFC 9250), and no mDNS/DNS-SD (RFC 6762, RFC 6763).
+- **The recursive walk speaks Do53.** Queries to authority servers go over
+  UDP, with TCP only for truncation; DNS over QUIC (RFC 9250) and
+  mDNS/DNS-SD (RFC 6762, RFC 6763) are not spoken anywhere. The stub's
+  forwarded leg offers more: UDP, TCP, TLS (RFC 7858) and HTTPS
+  (RFC 8484, HTTP/2 via the optional `doh` extra) — see `--stub-transport`.
 
 Of these, the DNSSEC and EDNS entries are the ones worth re-reading before
 you depend on this for anything that needs authenticity. The full

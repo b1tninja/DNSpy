@@ -47,10 +47,10 @@ jobs:
       # checker stops being read.
       - run: mypy namespy
 
-  # The optional backend, exercised where it exists. The Test matrix deliberately runs
-  # without it -- that is the configuration most people install, and the no-backend path is
-  # what must stay clean -- so without this job the [crypto] extra would ship untested and
-  # the integration points its verification code will rest on would be assumptions.
+  # The optional backends, exercised where they exist. The Test matrix deliberately runs
+  # without them -- that is the configuration most people install, and the no-backend path is
+  # what must stay clean -- so without this job the [crypto] and [doh] extras would ship
+  # untested and the integration points their transports rest on would be assumptions.
   crypto_extra:
     name: Crypto extra
     runs-on: ubuntu-latest
@@ -60,12 +60,14 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      # Resolving the extra is itself the check: it fails if the floor cannot be satisfied
+      # Resolving the extras is itself the check: it fails if a floor cannot be satisfied
       # by a wheel on a supported platform, which is the failure mode an optional
       # dependency has that no unit test can see.
-      - run: python -m pip install --upgrade pip && pip install -e ".[dev,crypto]"
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev,crypto,doh]"
       - run: python -c "import cryptography, namespy.crypto as c; b=c.require_backend('probe'); print(b.name, b.version)"
       - run: python -m pytest -q tests/test_crypto_backend.py
+      - run: python -c "import h2, namespy.doh as d; assert d.H2_AVAILABLE; print('h2', h2.__version__)"
+      - run: python -m pytest -q tests/test_stub_doh.py
 
   test:
     name: Test py${{ matrix.python-version }} on ${{ matrix.os }}

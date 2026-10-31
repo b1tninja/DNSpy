@@ -57,6 +57,15 @@ dev = [
 # conflicts the moment something else in the environment needs a newer line. The
 # newest release is what CI exercises, which is where a breakage would be noticed.
 crypto = ["cryptography>=50.0.2"]
+# DNS over HTTPS' HTTP/2 half. Named for the transport, because that is the
+# whole of what it buys: the TLS underneath comes from stdlib ``ssl``, the
+# DNS message codecs are already here, and the HTTP/1.1 fallback this client
+# speaks when ALPN lands there needs nothing at all -- so the extra is
+# genuinely optional, an acceleration rather than a requirement. h2 is
+# pure-Python (no wheel-linked native advisory class, unlike the entry
+# above), which is why its floor is ordinary: 4.1 introduced the
+# ``remote_settings`` shape this client reads.
+doh = ["h2>=4.1"]
 
 [project.urls]
 Homepage = "https://github.com/b1tninja/namespy"

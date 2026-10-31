@@ -1714,11 +1714,69 @@ option parse table). `ruff`/`format`/`mypy` clean. Roadmap: the 7858 row to
 done; a new 7828/9210 row opened at 🟡 (stub transports done, walk TCP
 reuse and server-side keepalive remain).
 
-**Next, in order**: (1) **DoH** (RFC 8484) -- `application/dns-message`
-over HTTP/2; the honest decision is stdlib-versus-extra, made when writing
-it; (2) the 7828 row's remaining halves; (3) the earlier list as it fits --
-6841, 9824, 10001, 8509/9535, 9364/9904/9905/9906, IDNA, 9471, 8145 §5;
-9539 §4 reuses these transports on the authority leg, later.
+### Follow-up: DNS over HTTPS for the stub, in whichever HTTP the server negotiates (RFC 8484)
+
+Increment C of the stub track. `--stub-transport doh` (or
+`Upstream(transport="doh")`) forwards over HTTPS, and the honest
+HTTP/2-versus-stdlib question from increment B's next-list is now answered:
+an optional extra (`h2`, the pure-Python one, in the new `[doh]` extra) for
+the HTTP/2 half, and a stdlib HTTP/1.1 client for the fallback §5.2¶2
+allows -- so the extra accelerates the transport and is never required by
+it.
+
+Shipped: `namespy/doh.py` -- `_DohSession` owns the shared shape (the
+`exchange` that parses the body and refuses anything but a 200
+`application/dns-message` answering the questions asked, §4.2.1; the lock
+the serial transports need), and two subclasses own the HTTP:
+`_Http2Session` multiplexes one query per stream over a single held
+connection (§4.2¶3's multi-streaming -- the reason the h2 half exists),
+with the flow-control bookkeeping that makes a DNSSEC-sized answer
+deliverable: SETTINGS widens the per-stream window to 1 MiB, the
+connection window gets an explicit WINDOW_UPDATE (RFC 7540 §6.9.2 --
+SETTINGS alone is per-stream only, and a waiting reader would deadlock at
+65535 bytes), DATA is acknowledged as it buffers, and responses and
+requests are chunked to the peer's `max_frame_size`. `Http1Session` speaks
+one-request-at-a-time keep-alive, conservatively idled at 30 s by a timer
+(§5.2's http/1.1 has no keepalive option of its own, and RFC 7828's does
+not travel on HTTP), serialised by the base's lock. The GET form fills
+§4.1's `{?dns}` template with base64url-no-padding (§4.1.1¶5's own encoded
+message is a golden test); POST carries the §4 wire bytes with the §4.1.1
+content-type. Every query leaves with ID 0 (§4.1¶8, HTTP correlates) --
+`_ask_stream` zeroes it for DoH sessions only, and `questions_echo` is the
+matching guard: the HTTP pair is what matches a reply to a question, so
+the questions themselves must.
+
+Stub-side, the dot machinery generalised rather than duplicated:
+`_ask_dot` became `_ask_stream`, `_dot_dead` became `_stream_dead`,
+`_stream_connect` dispatches dot-or-doh, and the session loop has one new
+branch -- a multiplexed session (h2) skips the serial lock, every other
+session still takes it. `Upstream` gains `path` (`#<name>/<path>`, the
+§3¶1 configured template; the default `/dns-query`) and doh's default port
+443 (§2.1); `Upstream.parse` now takes the declared transport, because
+`dataclasses.replace` after parse re-ran `__post_init__` with the port the
+*udp* default had already pinned -- `--stub-transport dot` had been
+quietly forwarding to 53 (a bug the dot increment shipped and this one
+closes, with a test naming it). Authentication is unchanged in kind: §8.1¶1
+says the server MUST be authenticated, so doh enters through
+`_tls_context`'s BCP195 door with `doh_alpn` adding §5.2's `h2, http/1.1`
+offer, and a doh upstream with no `#<name>` is a startup sentence.
+
+**Verified**: 1488 passed, 1 skipped (+17: `tests/test_stub_doh.py` -- real
+TLS servers on loopback, ALPN-decided: POST/headers/ID-0 observed server-side,
+sequential reuse and three-way concurrent multiplexing on one connection
+(connections == 1), a 90 KB answer proving the window bookkeeping, the
+http/1.1 round-trip + reuse + idle-timer, GET with the RFC's base64url
+golden vector, 400/foreign-media/foreign-question all refused to None, the
+dead-upstream memory, path/port parsing). `ruff`/`format`/`mypy` clean.
+CI: the extras job now installs and exercises `[crypto,doh]` together.
+Roadmap: the 8484 row to done.
+
+**Next, in order**: (1) the 7828 row's remaining halves -- reuse for the
+*walk's* own TCP fallbacks, the server-side of keepalive; (2) the earlier
+list as it fits -- 6841, 9824, 10001, 8509/9535, 9364/9904/9905/9906, IDNA,
+9471, 8145 §5; 9539 §4 reuses these three transports on the authority leg,
+later. DoQ (9250) stays deferred: no stdlib QUIC, and an extra sized like
+`aioquic` is a bigger conversation than `h2` was.
 
 ## Previous round: MQTYPE (RFC 10029)
 
