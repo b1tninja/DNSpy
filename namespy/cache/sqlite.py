@@ -145,8 +145,8 @@ class SqliteDnsCache(DnsCache):
     caller's ``expires_at`` values must be expressed in the same units.
     """
 
-    def __init__(self, path=":memory:", time_fn=None):
-        super().__init__(time_fn=time_fn)
+    def __init__(self, path=":memory:", time_fn=None, stale_ttl: float = 0.0):
+        super().__init__(time_fn=time_fn, stale_ttl=stale_ttl)
         self._conn = sqlite3.connect(path)
         self._conn.executescript(_SCHEMA)
         self._add_proofs_column()
@@ -233,9 +233,53 @@ class SqliteDnsCache(DnsCache):
             return None
         (kind, rcode, expires_at, authoritative, payload, proofs, validated) = row
         if expires_at <= now:
+            if not self._retain_expired(expires_at, now):
+                self._conn.execute(
+                    "DELETE FROM rrset_cache WHERE name=? AND qtype=? AND qclass=?",
+                    (key_name, qt, qc),
+                )
+                self._conn.commit()
+            return None
+        if kind == _KIND_POSITIVE:
+            return PositiveEntry(
+                name,
+                qtype,
+                qclass,
+                _unpack_records(payload),
+                expires_at,
+                bool(authoritative),
+                validated=bool(validated),
+            )
+        return NegativeEntry(
+            name,
+            qtype,
+            qclass,
+            rcode,
+            _decode_soa(payload),
+            expires_at,
+            _unpack_proofs(proofs),
+            validated=bool(validated),
+        )
+
+    def stale(self, name, qtype, qclass):
+        if self.stale_ttl <= 0:
+            return None
+        row = self._conn.execute(
+            "SELECT kind, rcode, expires_at, authoritative, payload, proofs, validated "
+            "FROM rrset_cache WHERE name=? AND qtype=? AND qclass=? LIMIT 1",
+            (_name_text(name), int(qtype), int(qclass)),
+        ).fetchone()
+        if row is None:
+            return None
+        (kind, rcode, expires_at, authoritative, payload, proofs, validated) = row
+        now = self.time_fn()
+        if expires_at > now:
+            return None  # live data is `get`'s to serve, never this door's
+        if not self._retain_expired(expires_at, now):
+            # past the window: retired, and this read retires the row.
             self._conn.execute(
                 "DELETE FROM rrset_cache WHERE name=? AND qtype=? AND qclass=?",
-                (key_name, qt, qc),
+                (_name_text(name), int(qtype), int(qclass)),
             )
             self._conn.commit()
             return None
@@ -381,10 +425,12 @@ class SqliteDnsCache(DnsCache):
         return int(n)
 
     def prune(self):
-        now = self.time_fn()
+        # a row is reclaimable once even a failed refresh could no longer
+        # serve it: the stale window counts as useful life (RFC 8767 §5¶11).
+        cutoff = self.time_fn() - max(0.0, self.stale_ttl)
         cur = self._conn.execute(
             "DELETE FROM rrset_cache WHERE expires_at <= ?",
-            (now,),
+            (cutoff,),
         )
         self._conn.commit()
         return cur.rowcount or 0

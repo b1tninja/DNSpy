@@ -223,14 +223,43 @@ class DnsCache(ABC):
     Concrete subclasses choose their storage and serialization. They are
     expected to evict expired entries on read; :meth:`prune` is an explicit
     sweep callers may invoke to reclaim space.
+
+    ``stale_ttl`` (RFC 8767 §5¶11's maximum-stale timer) is the one knob that
+    changes the eviction rule: left at 0, an expired entry is discarded on
+    read exactly as before; set above 0, an expired entry is *retained* for
+    that many seconds past its expiry so :meth:`stale` can hand it to a
+    resolver whose refresh has failed. Retention only -- :meth:`get` still
+    refuses expired data, because serving stale is a decision the resolver
+    makes on failure (§7¶1: "stale data is used only when refreshing has
+    failed"), never something the cache does behind its back.
     """
 
-    def __init__(self, time_fn=None):
+    def __init__(self, time_fn=None, stale_ttl: float = 0.0):
         self.time_fn = time_fn or time.time
+        #: seconds an expired entry survives a read for serve-stale; 0 discards on sight
+        self.stale_ttl = float(stale_ttl or 0.0)
+
+    def _retain_expired(self, expires_at: float, now: float) -> bool:
+        """Whether an entry that expired at *expires_at* is still kept for a stale serve."""
+        return self.stale_ttl > 0 and now < expires_at + self.stale_ttl
 
     @abstractmethod
     def get(self, name, qtype, qclass):
         """Return a non-expired :class:`CacheEntry` or ``None``."""
+
+    def stale(self, name, qtype, qclass):  # noqa: ARG002 - the fallback ignores all three
+        """An expired-but-retained :class:`CacheEntry` for serve-stale, or ``None``.
+
+        The base returns nothing, the same documented fallback as
+        :meth:`nxdomain_at` and :meth:`denial_candidates`: serve-stale is a
+        resiliency feature layered on the cache, and a backend that does not
+        retain expired data simply leaves the resolver to answer SERVFAIL as
+        it did before the feature existed. A subclass that supports it returns
+        an entry only when the entry is expired *and* younger than
+        ``stale_ttl`` past expiry -- never a fresh one (that is :meth:`get`'s
+        job) and never a fully retired one.
+        """
+        return None  # noqa: RET501 - explicit: "no stale door here" is the contract
 
     @abstractmethod
     def put(self, entry):
@@ -299,8 +328,8 @@ class MemoryDnsCache(DnsCache):
     "use" is :meth:`get` or :meth:`put`).
     """
 
-    def __init__(self, max_entries=None, time_fn=None):
-        super().__init__(time_fn=time_fn)
+    def __init__(self, max_entries=None, time_fn=None, stale_ttl: float = 0.0):
+        super().__init__(time_fn=time_fn, stale_ttl=stale_ttl)
         self._entries: OrderedDict = OrderedDict()
         #: ``(labels, qclass)`` -> key of the newest cached NXDOMAIN at that name.
         #:
@@ -333,9 +362,29 @@ class MemoryDnsCache(DnsCache):
         if entry is None:
             return None
         if entry.expired(self.time_fn()):
-            self._forget(key)
+            # Expired is a miss either way; the only question is whether the
+            # row survives the read. It does while a serve-stale window wants
+            # it (the RFC 8767 maximum-stale timer on the base class); it does
+            # not when nothing will ever ask it again.
+            if not self._retain_expired(entry.expires_at, self.time_fn()):
+                self._forget(key)
             return None
         self._entries.move_to_end(key)
+        return entry
+
+    def stale(self, name, qtype, qclass):
+        key = _key(name, qtype, qclass)
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        now = self.time_fn()
+        if not entry.expired(now):
+            return None  # live data is `get`'s to serve, never this door's
+        if not self._retain_expired(entry.expires_at, now):
+            self._forget(key)  # past the window: retired, and this read retires it
+            return None
+        # Deliberately no ``move_to_end``: RFC 8767 §6¶3 asks that stale rows
+        # lose eviction contests to live ones, and recency is the contest.
         return entry
 
     def nxdomain_at(self, name, qclass):
@@ -343,11 +392,17 @@ class MemoryDnsCache(DnsCache):
         if key is None:
             return None
         entry = self._entries.get(key)
-        if entry is None or not _is_nxdomain(entry) or entry.expired(self.time_fn()):
-            # Every removal path clears the index, so reaching here means a
-            # pointer outlived its entry. The price is a walk -- never an answer
-            # manufactured from a denial that has stopped existing.
+        if entry is None or not _is_nxdomain(entry):
+            # The pointer outlived or misidentified its entry; the price is a
+            # walk -- never an answer manufactured from a denial that has
+            # stopped existing.
             self._forget(key)
+            return None
+        if entry.expired(self.time_fn()):
+            # A retained row keeps its pointer and may still answer as
+            # *stale* on a failed refresh; a retired one clears the index.
+            if not self._retain_expired(entry.expires_at, self.time_fn()):
+                self._forget(key)
             return None
         self._entries.move_to_end(key)
         return entry
@@ -376,7 +431,8 @@ class MemoryDnsCache(DnsCache):
             if not isinstance(entry, NegativeEntry) or not entry.proofs:
                 continue
             if entry.expired(self.time_fn()):
-                self._forget(key)
+                if not self._retain_expired(entry.expires_at, self.time_fn()):
+                    self._forget(key)
                 continue
             if key[2] != wanted or entry.soa is None:
                 continue
@@ -408,8 +464,15 @@ class MemoryDnsCache(DnsCache):
         return len(self._entries)
 
     def prune(self):
+        # "Past its useful life" means past the stale window too: the entries
+        # this sweep reclaims are the ones even a failed refresh could no
+        # longer serve (RFC 8767 §5¶11's timer, spent).
         now = self.time_fn()
-        keys = [k for k, e in self._entries.items() if e.expired(now)]
+        keys = [
+            k
+            for k, e in self._entries.items()
+            if e.expired(now) and not self._retain_expired(e.expires_at, now)
+        ]
         for k in keys:
             self._forget(k)
         return len(keys)

@@ -167,6 +167,14 @@ EDE_NO_REACHABLE_AUTHORITY = 22
 #: the wrong fault ("nobody answered" when somebody answered unforgably).
 EDE_DNSSEC_BOGUS = 6
 
+#: RFC 8914 section 4.2: "The response contains data that is stale, i.e. the
+#: data's TTL has expired." RFC 8767 §9 rejected a dedicated EDNS option for
+#: exactly this signal and RFC 8914 later provided the general one, so a
+#: serve-stale answer says what it is in the field built for it -- the client
+#: that reads extended errors learns the record is expired; the one that does
+#: not still gets the >0 short TTL that makes it retry rather than settle.
+EDE_STALE_ANSWER = 2
+
 #: The Extended DNS Errors this server reports about *itself*.
 #:
 #: Only its own failures are listed, and that is the deliberate half of RFC 8914
@@ -358,6 +366,16 @@ class DnsServer(asyncio.Protocol):
                     extended_dns_error_option(
                         EDE_DNSSEC_BOGUS, b"namespy: DNSSEC validation failed"
                     ),
+                )
+            elif not extended_errors and getattr(response, "stale_answer", False):
+                # RFC 8767 served this from an expired record because the refresh
+                # failed; RFC 8914 §4.2's Stale Answer says so in the one field
+                # the earlier document's rejected EDNS option never needed -- and
+                # unlike Bogus this is a *successful* answer, an NOERROR or
+                # NXDOMAIN the client may well act on, which is precisely why it
+                # deserves to know the data is past its TTL.
+                extended_errors = (
+                    extended_dns_error_option(EDE_STALE_ANSWER, b"namespy: served stale"),
                 )
             self._apply_edns(request, response, extended_errors, mqtype_answered)
         wire = bytes(response)

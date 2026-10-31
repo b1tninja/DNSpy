@@ -1550,6 +1550,63 @@ address families; (6) 8509/9535 anchor maintenance; (7) 9364/9904/9905/9906
 algorithm set; (8) 5891/3492 IDNA (P2 — the largest); (9) 9471 §3 referral
 TC; (10) 8145 §5 #kt (optional); the P4 rows await a decline decision.
 
+### Follow-up: serve-stale — expired data answers when the authorities don't (RFC 8767; EDE 2 per RFC 8914 §4.2)
+
+The roadmap row said "roadmap P3" and nothing else; the EDE greps came back
+empty of a feature (only the printer knew the code names), so this was
+genuinely unbuilt, and it is now the third resiliency layer beside the
+failure cache and the stamps.
+
+Shipped, in the two layers §5 splits: the cache gains the maximum-stale
+timer (`stale_ttl` on the base, both backends) -- an expired row inside the
+window survives reads (`get` still says miss -- §7¶1 keeps the decision with
+the resolver, never the storage) and `stale()` hands out exactly the
+expired-but-in-window entry, retiring what the window has spent; the walk
+consults that door at its two can't-refresh seams -- out-of-servers
+exhaustion, and the RFC 9520 remembered-failure block (whose §5¶7 sentence
+is the feature's own: inside the recheck window "the cache may be
+immediately consulted for stale data"). The answer is assembled fresh:
+§4¶4's MUST rewrites every record's TTL to greater-than-zero at the
+recommended 30 (§6¶6's rate-limit reading -- and the records are REBUILT,
+never edited, the entry keeps its originals), AD never rides (the stamp
+says *verified then*; §3.2.3's claim is present tense), and
+`response.stale_answer` becomes EDE 2 the way `dnssec_bogus` becomes EDE 6.
+
+Decisions the texts left open, taken with their numbers: data-level failures
+(alias loops, hop budgets) and validation refusals do NOT serve stale --
+§6¶9's MAY extends to unreachable authorities, not to a name whose fresh
+data just proved bad; CD clients DO (a cache read is not the inference
+Appendix A exempts, and §9¶2's "for all clients" stands); all-Refused does
+not preempt serving (§6¶11's open question -- treat it like every other
+failure to refresh); retention equals usability (one knob, §5¶11's own
+sentence); default off with `--serve-stale [SECONDS]` (bare = 86400, the
+low end of the recommended 1-3 days).
+
+Found en route, separate commit: the fuzz property replayed a genuine
+counterexample -- an RRSIG whose signature field is empty raised the
+constructor's bare `ValueError` through `parse_from`, escaping the parser's
+one exception class; `DnsRecord.parse` now converts codec `ValueError`s to
+`DnsPacketParseError` at the boundary (DNSKEY/DS/NSEC3's constructor
+invariants cross the same door and are covered by the same conversion),
+with the counterexample pinned as a regression test.
+
+**Verified**: 1439 passed, 1 skipped (+19 net: `tests/test_serve_stale.py`
+17 -- retention/refusal/retirement per backend, both walk seams, knob-off
+honest failure, past-window gone, CD served, never AD even stamped, TTL
+bounds, originals untouched, trace line, resolver-opens-cache-window;
+test_dnssec_serving.py EDE-2 test +1; test_fuzz_wire.py regression +1). One init-ordering bug
+caught by mypy (the cache-window block referenced `self.cache` before its
+assignment -- moved after, pinned by the window test through
+`RecursiveResolver(serve_stale=...)`). `ruff`/`format`/`mypy` clean.
+Roadmap: the 8767 row to done.
+
+**Next, in order**: (1) 7828/9210 TCP connection reuse with the
+`edns-tcp-keepalive` idle timeout; (2) 6841 0x20 QNAME-case entropy;
+(3) 9824 compact NSEC3 digest RR types; (4) 10001 §4.2 address families;
+(5) 8509/9535 anchor maintenance; (6) 9364/9904/9905/9906 algorithm set;
+(7) 5891/3492 IDNA (P2 -- the largest); (8) 9471 §3 referral TC; (9) 8145 §5
+#kt (optional); the P4 rows await a decline decision.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

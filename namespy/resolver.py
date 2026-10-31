@@ -1078,6 +1078,26 @@ class WildcardSynthesis:
 
 
 @dataclass(frozen=True)
+class ServeStale:
+    """An expired entry answered because the refresh failed (RFC 8767).
+
+    The one answer this resolver gives from data it cannot currently call
+    authentic: the record's TTL ran out, every server that could refresh it
+    failed, and §4's amended TTL definition allows the use anyway -- "if the
+    data is unable to be authoritatively refreshed when the TTL expires, the
+    record MAY be used as though it is unexpired." *age* is how long the data
+    has been expired, because that is the number an operator weighing
+    resiliency against staleness asks for. The event always carries the
+    reason two sections care about: never AD (the claim is present tense and
+    this data's verdict is past), and RFC 8914 §4.2's Stale Answer EDE on the
+    wire to clients that read extended errors.
+    """
+
+    name: str
+    age: int
+
+
+@dataclass(frozen=True)
 class DnssecVerdict:
     """The validation layer's answer about a denial this lookup just received.
 
@@ -1843,6 +1863,7 @@ def resolve_steps(
     client_cd: bool = False,
     client_key_tags: tuple = (),
     aggressive_nsec: bool = False,
+    serve_stale: float = 0.0,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1939,6 +1960,17 @@ def resolve_steps(
     way (Appendix A ¶1's exemption). Off by default, and it falls silent on any
     backend that cannot supply candidates -- asking the query is still the
     correct behaviour, which is all RFC 8198 promises when it cannot act.
+
+    ``serve_stale`` is the maximum-stale timer (RFC 8767 §5¶11): a positive
+    number both lets the walk answer from an expired-but-retained cache entry
+    when refreshing fails and sets that retention window on the cache. Zero,
+    the default, discards on expiry and never serves stale -- the whole
+    feature is opt-in because it trades correctness for resiliency, and §6
+    leaves the timer's value to the operator. It answers only when the refresh
+    genuinely failed (a name whose servers are gone, §7¶1), never in place of
+    a reachable authority, never with the AD bit, and always with a
+    greater-than-zero TTL (§4¶4) so a client that honours it retries on the
+    recommended half-minute rather than hammering an answer it knows is old.
 
     If ``failures`` is provided (a :class:`namespy.cache.FailureCache`), the
     same loop also refuses to *start* a query whose failure is already
@@ -2160,6 +2192,35 @@ def resolve_steps(
         if origin != sname.qname:
             failures.note_query(origin, sname.qtype, sname.qclass, note, dnssec=True)
 
+    def _stale_fallback():
+        """Answer from an expired-but-retained entry, or say so and let the caller fail.
+
+        RFC 8767 §7¶1's stricture shapes the placement: stale data answers
+        only where refreshing has failed -- reached from the remembered-
+        failure seam (§5¶7's failure recheck: inside the backoff window "the
+        cache may be immediately consulted for stale data") and from the
+        out-of-servers seam (an outage in progress). A hit answers with
+        §4¶4's refreshed TTLs and no AD; a miss costs one lookup in the cache
+        and the SERVFAIL the resolver already owed. The duck-typed guard is
+        the base cache's documented fallback: a backend without a stale door
+        simply never gets here.
+        """
+        if serve_stale <= 0 or cache is None:
+            return False
+        hit = cache.stale(sname.qname, sname.qtype, sname.qclass)
+        if hit is None:
+            return False
+        age = int(max(0.0, cache.time_fn() - hit.expires_at))
+        yield ServeStale(str(sname.qname), age)
+        if isinstance(hit, PositiveEntry):
+            yield Answer(list(hit.records))
+        elif hit.rcode == DnsResponseCode.NAME_ERROR:
+            yield Nxdomain()
+        else:
+            yield Nodata(hit.soa)
+        yield Done(_synthesize_stale(sname, hit, dnssec_ok))
+        return True
+
     for _ in range(max_hops):
         if cache is not None:
             hit = cache.get(sname.qname, sname.qtype, sname.qclass)
@@ -2259,6 +2320,8 @@ def resolve_steps(
                 # A dead zone is still a dead zone for everyone: the bypass is
                 # keyed on the entry's dnssec flag, not on the client's wishes
                 # about zones that never answered.
+                if (yield from _stale_fallback()):
+                    return
                 yield Fail(_cached_failure_reason(blocked))
                 return
         entry = slist.best()
@@ -2287,6 +2350,13 @@ def resolve_steps(
                 failures.note_zone(slist.zone, reason)
             elif failures is not None:
                 _remember(reason)
+            if (yield from _stale_fallback()):
+                # The outage case RFC 8767 was written for: every server that
+                # could refresh this name failed, its notes are recorded, and
+                # the only thing left that can answer is the cache's own
+                # expired memory. Serving it is the whole point; failing the
+                # lookup instead is the outage the resolver chooses to join.
+                return
             yield Fail("no servers")
             return
         if not entry.addresses:
@@ -2793,6 +2863,55 @@ def _synthesize_response(sname, hit, dnssec_ok: bool = False, validated: bool = 
     )
 
 
+#: RFC 8767 §4¶4's recommended client-facing TTL for served-stale records --
+#: §6¶6 explains the number: 0 broke old implementations and tiny values
+#: invite a TTL-honouring client to re-query in a loop, while 30 seconds both
+#: sidesteps that and rate-limits the retry.
+_STALE_TTL = 30
+
+
+def _synthesize_stale(sname, hit, dnssec_ok: bool = False) -> Response:
+    """The response a failed refresh delivers from an expired entry (RFC 8767 §4, §7¶3).
+
+    The assembly is the cached-answer one -- a stale positive is still a
+    positive, a stale denial still carries its SOA and, under DO, its proof
+    records. Three differences, each a section of its own. No record keeps
+    its stored TTL: every one has expired, and §4¶4's MUST replaces them with
+    a value greater than 0 (the records are *rebuilt*, never edited -- the
+    originals belong to the cache entry, which must still serve its window to
+    every other question). ``AD`` never rides: RFC 4035 §3.2.3's claim is
+    present tense, and this data outlived the verdict that earned it;
+    §10¶1's calculus accepts serving stale signatures for reachability, not
+    asserting them. And the ``stale_answer`` marker rides the response so the
+    serve side can tell the client what happened (RFC 8914 §4.2's EDE, and
+    the reason §9's rejected opt-in EDNS option is not missed: the extended
+    error says in one field what the option would have signalled in two).
+    """
+    response = _synthesize_response(sname, hit, dnssec_ok, validated=False)
+    response.stale_answer = True
+    response.answers = [
+        DnsRecord(
+            record.name,
+            record.rtype,
+            record.rclass,
+            min(int(record.ttl), _STALE_TTL),
+            rdata=record.rdata,
+        )
+        for record in response.answers
+    ]
+    response.nameservers = [
+        DnsRecord(
+            record.name,
+            record.rtype,
+            record.rclass,
+            min(int(record.ttl), _STALE_TTL),
+            rdata=record.rdata,
+        )
+        for record in response.nameservers
+    ]
+    return response
+
+
 # ------------------------------------------------------------------ chain records (§4.5)
 #
 # RFC 4035 §4.5¶1 asks for the atomic entry -- the RRset and its signatures as
@@ -3240,6 +3359,7 @@ class RecursiveResolver(Resolver):
         glue_policy: GluePolicy = GluePolicy.STRICT,
         nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
         aggressive_nsec: bool = False,
+        serve_stale: float = 0.0,
         dnssec_ok: bool = False,
         trust_anchors=(),
     ):
@@ -3306,6 +3426,14 @@ class RecursiveResolver(Resolver):
             does nothing without something to widen: the entries it reads are
             stamped only under trust anchors, so without ``trust_anchors`` set
             this flag is honestly inert.
+        :param serve_stale: the maximum-stale timer of RFC 8767 §5¶11, in
+            seconds -- 0 (default) never serves expired data; a positive
+            value both widens the cache's retention of expired rows to this
+            window and lets a walk answer from one when refreshing fails
+            (every server for the name spent, or the failure remembered and
+            not yet due for a retry). The answer carries §4¶4's greater-than-
+            zero TTLs (the recommended 30 seconds), never the AD bit, and is
+            marked for RFC 8914 §4.2's Stale Answer EDE on the way out.
         :param trust_anchors: :class:`~namespy.anchors.TrustAnchor` objects to
             validate answers against -- the trust point RFC 4035 §4.4 calls
             "configured" and §4.3 makes the origin of every Secure verdict.
@@ -3361,6 +3489,7 @@ class RecursiveResolver(Resolver):
         # leave a resolver that thinks it has a policy.
         self.nxdomain_cut = NxdomainPolicy(nxdomain_cut)
         self.aggressive_nsec = bool(aggressive_nsec)
+        self.serve_stale = float(serve_stale or 0.0)
         # Frozen like edns_options: the walk reads these per lookup, and an
         # anchor list a caller mutates mid-flight would silently change what
         # "validated" meant partway down a delegation chain.
@@ -3398,6 +3527,17 @@ class RecursiveResolver(Resolver):
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None
         self.cache = cache if cache is not None else MemoryDnsCache()
+        if self.serve_stale > 0:
+            # The retention half of the timer belongs to the cache (§5¶11
+            # files it under cache management, "independent of the query
+            # resolution process") and the decision half to the walk. A cache
+            # already keeping rows longer is left alone -- widen, never
+            # narrow; a duck-typed backend with no such attribute simply
+            # retains nothing, and the walk's stale door will find no key
+            # behind it (§9's fallback to honest failure).
+            current = float(getattr(self.cache, "stale_ttl", 0.0) or 0.0)
+            if current < self.serve_stale:
+                self.cache.stale_ttl = self.serve_stale
         # RFC 9520 §3.2. `False`, rather than `None`, switches this off, because
         # `None` already means "make me the default one" everywhere else in this
         # constructor -- and a resolver built to watch a zone fail has to be able
@@ -3890,6 +4030,7 @@ class RecursiveResolver(Resolver):
                         client_cd=client_cd,
                         client_key_tags=client_key_tags,
                         aggressive_nsec=self.aggressive_nsec,
+                        serve_stale=self.serve_stale,
                     )
                     sub_response = await self._drive(
                         sub_gen,
@@ -4022,6 +4163,7 @@ class RecursiveResolver(Resolver):
             client_cd=client_cd,
             client_key_tags=client_key_tags,
             aggressive_nsec=self.aggressive_nsec,
+            serve_stale=self.serve_stale,
         )
         response = await self._drive(
             gen, self.last_trace, client_cd=client_cd, client_key_tags=client_key_tags

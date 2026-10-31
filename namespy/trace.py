@@ -112,6 +112,8 @@ class Trace:
                 )
             elif cn == "WildcardSynthesis":
                 body.append(f"    Note over C: wildcard answer: {ev.name} via {ev.via}")
+            elif cn == "ServeStale":
+                body.append(f"    Note over C: serve stale: {ev.name} (expired {ev.age}s ago)")
             elif cn == "DnssecVerdict":
                 # The verdict beside the zone that made the denial, ahead of the
                 # NXDOMAIN it judges: with anchors configured this line is the

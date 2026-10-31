@@ -266,6 +266,17 @@ def _format_response(response, args, elapsed_ms, bundle=None, cut=None):
             f";; NXDOMAIN cut: {cut.name} answered from the cached denial for "
             f"{cut.denied_by} (RFC 8020)"
         )
+    if getattr(response, "stale_answer", False):
+        # RFC 8767: the refresh failed and this is expired data, served anyway
+        # for reachability. The TTLs were reset to the recommended short value
+        # and AD was withheld, but a reader of the raw answer cannot see any of
+        # that -- so the driver says it. A marker, not a guess: the resolver
+        # stamps the attribute on the response it synthesised from a stale
+        # cache entry, exactly as it stamps dnssec_bogus on a validation refusal.
+        lines.append(
+            ";; served stale: the authoritative servers failed and this data"
+            " is past its TTL (RFC 8767)"
+        )
     lines.append("")
 
     if response.opt() is not None:
@@ -547,6 +558,22 @@ def build_parser():
         "remaining life, and a CD client is served nothing but the wire. Off by "
         "default: one poisoned proof suppresses a name's whole neighbourhood rather than "
         "one query (RFC 8198 section 9).",
+    )
+    p.add_argument(
+        "--serve-stale",
+        dest="serve_stale",
+        nargs="?",
+        const=86400,
+        default=0,
+        type=int,
+        metavar="SECONDS",
+        help="when refreshing fails, answer from an expired cache entry kept this many"
+        " seconds past its TTL (RFC 8767; bare flag means 86400, the low end of the"
+        " 1-3 day range its section 5 suggests). Such answers carry the recommended"
+        " 30-second TTL (section 4), never the AD bit, and the server marks them with"
+        " RFC 8914's Stale Answer EDE. Off by default: serving stale trades"
+        " correctness for reachability, and that trade belongs to the operator, not"
+        " to the library.",
     )
     p.add_argument(
         "--mqtype",
@@ -845,6 +872,7 @@ async def cli_query(args) -> int:
             failure_cache=_failure_cache(args),
             nxdomain_cut=_nxdomain_cut(args),
             aggressive_nsec=args.aggressive_nsec,
+            serve_stale=args.serve_stale,
             trust_anchors=anchors,
         ),
         local_addr=("0.0.0.0", 0),
@@ -937,6 +965,7 @@ async def serve(args) -> int:
                 failure_cache=_failure_cache(args),
                 nxdomain_cut=_nxdomain_cut(args),
                 aggressive_nsec=args.aggressive_nsec,
+                serve_stale=args.serve_stale,
                 trust_anchors=anchors,
             ),
             local_addr=("0.0.0.0", 0),
