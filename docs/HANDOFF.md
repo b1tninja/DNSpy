@@ -1023,7 +1023,14 @@ is Bogus too*: the window is a check that ran and refused; "could not tell" woul
 retrying stale data into permanence instead of the re-sign that fixes it. (7) The
 wildcard's synthesising name is reconstructed from the one octet that remembers it — the
 RRSIG's Labels — and the closer-match proof is then verified like the rest of the bundle,
-because a wildcard is only as strong as the denial that nothing closer exists.
+because a wildcard is only as strong as the denial that nothing closer exists. (8) *CI
+caught what the green local run could not*: the fixture generated its three RSA keys at
+import, and CI's matrix runs pytest without `namespy[crypto]` — collection died on
+`ModuleNotFoundError` before any skip guard could say its piece, the exact failure the
+guard pattern exists for. Keys now come from cached accessors on first use, and the one
+test that monkeypatches the backend *after* building the tree needed its own gate; the
+lesson generalises to any test whose fixture touches the optional extra at module level,
+and the local suite cannot surface it on a machine that always has the backend installed.
 
 **Not claimed.** The resolver still consumes none of it: `NxdomainPolicy.VALIDATED`
 refuses at the door, its message now naming the true gap — the walk must *fetch* DS and
@@ -1038,7 +1045,9 @@ coverage 92% total with `namespy/validate.py` at 97% (the remainder: defensive a
 unsigned-proof propagation and the unreachable wildcard contradictions) and the whole
 45-test file passing without network: a three-level RSA-signed tree, both NSEC and NSEC3
 legs, broken one octet at a time, plus the captured live root validated end to end as an
-answer through the new layer.
+answer through the new layer. The crypto-free parity run (cryptography import blocked by
+a PYTHONPATH shim — how CI's matrix legs see it) lands at 1229 passed / 66 skipped / 0
+errors after the lazy-key fix; CI on the first commit proved this check worth scripting.
 
 **Next, in order**: (1) `NxdomainPolicy.VALIDATED` wiring — DS/DNSKEY fetching at each
 cut, an entry kind for the keys the walk learns, `Validator` consumed at cut time and
