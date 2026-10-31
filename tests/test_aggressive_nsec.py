@@ -23,11 +23,15 @@ from namespy.nsec import collect_proof_records
 from namespy.resolver import AggressiveDenial, Sname, resolve_steps
 from namespy.trace import Trace
 
-pytestmark = pytest.mark.skipif(
+IN = int(DnsRClass.IN)
+
+#: The signed fixture tree is crypto; the three tests that never touch it -- the
+#: base-class fallback and the two CLI polarities -- must still run on the
+#: crypto-free CI matrix, which is the lesson of the earlier rounds' fixture
+#: laziness written the other way round.
+needs_tree = pytest.mark.skipif(
     not crypto_available(), reason="the signed fixture tree needs namespy[crypto]"
 )
-
-IN = int(DnsRClass.IN)
 
 
 def _aggr_walk(
@@ -80,6 +84,7 @@ def _secured_cache():
 # ------------------------------------------------------------------- the licence in action
 
 
+@needs_tree
 def test_a_validated_denial_denies_its_neighbours_name_without_a_query():
     """8198 §5.1/Appendix A ¶1: the covering NSEC was cached and validated; that is the answer.
 
@@ -112,6 +117,7 @@ def test_a_validated_denial_denies_its_neighbours_name_without_a_query():
     assert len(cache) == 1
 
 
+@needs_tree
 def test_the_events_say_proof_before_inference():
     """AggressiveDenial, then the bare Nxdomain it caused, then Done -- the NxdomainCut order."""
     cache = _secured_cache()
@@ -120,6 +126,7 @@ def test_the_events_say_proof_before_inference():
     assert kinds.index("AggressiveDenial") < kinds.index("Nxdomain") < kinds.index("Done")
 
 
+@needs_tree
 def test_a_cached_nodata_denies_another_type_at_the_same_name():
     """§5.4¶3 says nothing new to a server: the matching NSEC lists the types that exist.
 
@@ -156,6 +163,7 @@ def test_a_cached_nodata_denies_another_type_at_the_same_name():
     assert response.nameservers[0].rtype == DnsRType.SOA
 
 
+@needs_tree
 def test_an_unvalidated_entry_is_unusable_not_unbelievable():
     """Appendix B ¶2 discards; the walk then behaves as though 8198 did not exist."""
     cache = MemoryDnsCache(time_fn=wiring.Clock())
@@ -169,6 +177,7 @@ def test_an_unvalidated_entry_is_unusable_not_unbelievable():
     assert wiring._queries(events) != []  # the name went out to the network as usual
 
 
+@needs_tree
 def test_a_cd_client_is_served_the_wire_and_nothing_inferred():
     """Appendix A ¶1's exemption: "unless the CD bit was set on the incoming query".
 
@@ -193,6 +202,7 @@ def test_a_cd_client_is_served_the_wire_and_nothing_inferred():
     assert wiring._queries(events) != []
 
 
+@needs_tree
 def test_the_feature_is_off_unless_it_is_asked_for():
     """Default off, and inert when not: §9¶4's widened blast radius is why a flag exists."""
     cache = _secured_cache()
@@ -203,6 +213,7 @@ def test_the_feature_is_off_unless_it_is_asked_for():
     assert wiring._queries(events) != []
 
 
+@needs_tree
 def test_a_neighbour_in_another_zone_gets_no_inference():
     """A bundle proves names in the zone whose SOA signs it -- the guard no geometry has."""
     cache = _secured_cache()
@@ -211,6 +222,7 @@ def test_a_neighbour_in_another_zone_gets_no_inference():
     assert wiring._queries(events) != []
 
 
+@needs_tree
 def test_the_trace_names_the_proof_that_vouched():
     """The synthesised packet cannot show its own cause; the trace line has to."""
     cache = _secured_cache()
@@ -265,11 +277,13 @@ def _sname(name, qtype=int(DnsQType.AAAA)):
     return Sname(DomainName(name), qtype)
 
 
+@needs_tree
 def test_the_stamp_is_the_entrys_only_test():
     denial = synthesize_denial(_entry(validated=False), _sname("dog.zone.test."), now=wiring.NOW)
     assert denial is None
 
 
+@needs_tree
 def test_an_expired_signature_ends_the_evidence_before_the_ttl_does():
     """§7's "until the effective TTLs or signatures ... expire", the half 2308 TTLs miss (§9¶4)."""
     far = wiring.NOW + 3 * 10**8  # past the tree's fixed signature epoch of 2_000_000_000
@@ -279,6 +293,7 @@ def test_an_expired_signature_ends_the_evidence_before_the_ttl_does():
     assert synthesize_denial(_entry(), _sname("dog.zone.test."), now=wiring.NOW) is not None
 
 
+@needs_tree
 def test_a_name_below_a_delegation_is_not_this_zones_to_deny():
     """Appendix B ¶4 / §8.3¶12: an NS-without-SOA at the encloser means the walk must go on.
 
@@ -295,6 +310,7 @@ def test_a_name_below_a_delegation_is_not_this_zones_to_deny():
     assert denied is None
 
 
+@needs_tree
 def test_the_ds_at_a_proven_unsigned_cut_is_synthensible():
     """§5.4¶5/§8.6's exception: DS is the one type the delegation point's owner answers for.
 
@@ -310,12 +326,14 @@ def test_the_ds_at_a_proven_unsigned_cut_is_synthensible():
     assert response.RCODE == DnsResponseCode.NO_ERROR
 
 
+@needs_tree
 def test_a_type_the_bitmap_lists_is_never_denied():
     """§5.4¶3's own refusal rides along: ``www`` exists and lists A; A is not denied."""
     denial = synthesize_denial(_entry(), _sname("www.zone.test.", int(DnsRType.A)), now=wiring.NOW)
     assert denial is None
 
 
+@needs_tree
 def test_the_ttl_is_the_evidences_remaining_life_capped_at_three_hours():
     """9077 §3.4's replacement §5.4: "limit the maximum effective TTL" -- and never overstate."""
     response = synthesize_denial(_entry(), _sname("dog.zone.test."), now=wiring.NOW)
@@ -328,6 +346,7 @@ def test_the_ttl_is_the_evidences_remaining_life_capped_at_three_hours():
     assert _capped(soa, 10800) is soa  # at the cap already: the same object, no churn
 
 
+@needs_tree
 def test_a_proof_without_dnssec_ok_carries_nothing_to_verify():
     """The instance knob, not the client's bit: a non-DNSSEC resolver answers bare; the
     server's strip withdraws the records for DO=0 clients (4035 §3.2.1) either way."""
@@ -340,6 +359,7 @@ def test_a_proof_without_dnssec_ok_carries_nothing_to_verify():
 # ------------------------------------------------------------------------- the caches' turn
 
 
+@needs_tree
 def test_the_memory_cache_offers_zone_containing_bundles_only():
     cache = MemoryDnsCache(time_fn=wiring.Clock())
     cache.put(_entry())
@@ -348,6 +368,7 @@ def test_the_memory_cache_offers_zone_containing_bundles_only():
     assert cache.denial_candidates(DomainName("dog.zone.test."), IN + 3) == ()
 
 
+@needs_tree
 def test_the_memory_cache_forgets_expired_candidates_on_sight():
     """9077's whole reason for existing, applied to the scan: no reading past the TTL."""
     clock = wiring.Clock()
@@ -360,6 +381,7 @@ def test_the_memory_cache_forgets_expired_candidates_on_sight():
     assert len(cache) == 0  # forgotten, not merely skipped
 
 
+@needs_tree
 def test_sqlite_offers_the_same_candidates_its_rows_re_serialise():
     cache = SqliteDnsCache(":memory:", time_fn=wiring.Clock())
     cache.put(_entry())

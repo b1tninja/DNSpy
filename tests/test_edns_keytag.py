@@ -307,6 +307,7 @@ def test_the_validator_asks_its_chain_questions_with_its_own_list():
     assert by_question["sub.zone.test."].extra_edns_options == ()
 
 
+@needs_tree
 def test_the_walk_reads_the_initiating_packets_instances_into_one_copy():
     """resolve() lifts the client packet's edns-key-tag option(s), §4.2.2.2's quarry.
 
