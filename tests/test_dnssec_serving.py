@@ -41,7 +41,7 @@ from namespy.packet import (
 )
 from namespy.rdata import RData_A, RData_NSEC, RData_RRSIG
 from namespy.resolver import RecursiveResolver, _synthesize_response
-from namespy.server import DnsServer
+from namespy.server import _CLIENT_STRIP_TYPES, DnsServer
 
 ZONE = "example.com."
 HOST = DomainName("www." + ZONE)
@@ -243,15 +243,19 @@ def test_wildcard_is_not_a_request_for_the_security_types():
     assert _types_of(response, "answers") == [A]
 
 
-def test_a_ds_record_survives_because_it_is_data_and_not_decoration():
-    """DS is deliberately outside the set: withdrawing one from a referral breaks the walk.
+def test_a_ds_record_is_stripped_because_do_bought_it():
+    """The decided answer to an open question: DS is authenticating material at this hop.
 
-    RFC 4035 §3.1¶1 lists DS among what a signed zone adds for a DO=1 query, so a set built from
-    that sentence alone would sweep referrals away. A DS is a resource record a client can name, and
-    a non-DNSSEC client that receives one in a referral is no worse off than one that received the
-    zone's SOA -- which the strip has never touched.
+    RFC 4035 §3.1¶1 enumerates what a DO=1 query buys -- "additional RRSIG, NSEC, and DS RRs" --
+    and §3.2.1¶1 withdraws that set from a client that did not ask, with the exception written in
+    types ("MUST NOT strip any DNSSEC RR types that the initiating query explicitly requested").
+    A DS is data when the query names it and evidence when it does not, and this is the hop where
+    only the second reading applies: the walk's referral-riding DSes live upstream and never
+    leave, while a DS inside a non-authoritative answer taken as given would reach the very
+    clients RFC 3225 §2¶3 reports failing on records they cannot parse.
     """
-    assert int(DnsRType.DS) not in DNSSEC_SECURITY_TYPES
+    assert int(DnsRType.DS) not in DNSSEC_SECURITY_TYPES, "the walk's set keeps DS"
+    assert int(DnsRType.DS) in _CLIENT_STRIP_TYPES, "the client hop withdraws it"
     ds = _record("sub." + ZONE, DnsRType.DS, b"\x00\x01\x08\x02" + b"\x00" * 20)
     response = Response(
         ID=7,
@@ -261,6 +265,36 @@ def test_a_ds_record_survives_because_it_is_data_and_not_decoration():
     )
 
     DnsServer._strip_dnssec(_query(dnssec=False), response)
+
+    assert _types_of(response, "nameservers") == []
+    assert response.NSCOUNT == 0, "three records withdrawn, and the count knows it"
+
+
+def test_a_query_that_named_ds_keeps_it_even_at_do_zero():
+    """The exception is about the question, not the bit: a named type survives the strip."""
+    ds = _record("sub." + ZONE, DnsRType.DS, b"\x00\x01\x08\x02" + b"\x00" * 20)
+    response = Response(
+        ID=7,
+        QR=1,
+        questions=[DnsQuestion("sub." + ZONE, int(DnsRType.DS), int(DnsRClass.IN))],
+        answers=[ds],
+    )
+
+    DnsServer._strip_dnssec(_query(dnssec=False, qtype=int(DnsRType.DS)), response)
+
+    assert _types_of(response, "answers") == [int(DnsRType.DS)]
+
+
+def test_a_multi_type_query_that_named_ds_keeps_it_too():
+    ds = _record("sub." + ZONE, DnsRType.DS, b"\x00\x01\x08\x02" + b"\x00" * 20)
+    response = Response(
+        ID=7,
+        QR=1,
+        questions=[DnsQuestion(HOST, A, int(DnsRClass.IN))],
+        nameservers=[ds],
+    )
+
+    DnsServer._strip_dnssec(_query(dnssec=False), response, mqtype_answered=[int(DnsRType.DS)])
 
     assert _types_of(response, "nameservers") == [int(DnsRType.DS)]
 

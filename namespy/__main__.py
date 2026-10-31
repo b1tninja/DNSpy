@@ -500,7 +500,9 @@ def build_parser():
         "section 2). Only --validate checks those signatures; this flag alone merely fetches "
         "them, and the extra records can push an answer over the 512-octet UDP ceiling into a "
         "TCP retry (RFC 3225 section 2). When serving, a client that did not set DO still gets "
-        "the records stripped (RFC 4035 section 3.2.1)",
+        "the records stripped (RFC 4035 section 3.2.1), and a client that did can only be "
+        "served proofs this server asked for: without this flag none are fetched, so none are "
+        "cached and none echoed (RFC 8020 section 2)",
     )
     p.add_argument(
         "--validate",
@@ -932,6 +934,23 @@ async def serve(args) -> int:
         )
         logging.debug(
             "%s bound to: %s", _server_protocol, _server_transport.get_extra_info("sockname")
+        )
+        # The DNSSEC stance this process takes upstream, recorded at the one
+        # moment it is fixed. The two DO directions face different rules and
+        # only one is the operator's choice: RFC 4035 §4.1¶1 obliges a
+        # *security-aware resolver* to set DO on its own queries -- --validate
+        # honors that by implying --dnssec, records never asked for are records
+        # never checked -- and otherwise whether to pay the octets per lookup
+        # (RFC 3225 §2¶1-¶2's truncation-and-TCP arithmetic) is the operator's
+        # call. Off is a legitimate server: it simply cannot echo what it never
+        # fetched, so a DO=1 client of an off server gets denials without their
+        # proofs, RFC 8020 §2¶5's condition on the triggering query unmet
+        # because this server *was* the triggering query. Either way the
+        # client-facing strip (RFC 4035 §3.2.1, _CLIENT_STRIP_TYPES) keeps
+        # DO=0 clients clear of records they did not ask to parse.
+        logging.info(
+            "server_dnssec=%s",
+            "validate" if anchors else "records" if args.dnssec else "off",
         )
 
     except BaseException:

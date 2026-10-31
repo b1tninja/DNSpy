@@ -1230,6 +1230,54 @@ which is the precondition 9908 §5's caveats assume); (4) wildcard *synthesis*
 from cache (roadmap §4's ⬜ row) can reuse the per-lookup store question
 finally settled here.
 
+### Follow-up: the two open questions, decided — DS at the strip, and who owes DO (RFC 4035 §3.1¶1, §3.2.1¶1, §4.1¶1; RFC 3225 §1¶3, §2¶1–¶5; RFC 8020 §2¶5)
+
+**Requested**: the first item of the previous "Next" — two questions had been
+carried open across several increments: whether §3.2.1's strip must withdraw
+DS, and whether `serve` owes DO upstream regardless of the flag.
+
+**Decided, DS**: yes, at the client hop. RFC 4035 §3.1¶1 enumerates what a
+DO=1 query buys — "a security-aware authoritative name server for a signed
+zone MUST include additional RRSIG, NSEC, **and DS** RRs" — and §3.2.1¶1's
+exception is written in *types* ("MUST NOT strip any DNSSEC RR types that the
+initiating query explicitly requested"), so DS is strip material unless the
+query named it. The old exclusion was reasoned from the walk — referrals ride
+DSes per §3.1.4 and must keep them — but the walk never *emits* a referral to
+a client, and this is the one hop §3.2.1 addresses: `server._CLIENT_STRIP_TYPES`
+adds DS for `_strip_dnssec` alone, `DNSSEC_SECURITY_TYPES` stays narrow for
+judging and the walk, and the docstring now says one constant wearing both
+coats was the mistake. 3225's own definition of "DNSSEC security RRs" (§1¶3:
+SIG, KEY, NXT) could not have adjudicated a set RFC 4034 later redrew — the
+4035 enumeration is the modern successor and it includes DS. The reachable
+leak the decision closes: a DS arriving inside a non-authoritative upstream
+answer the walk takes as given, headed for the clients §2¶3 reports "failing
+(in the worst case)".
+
+**Decided, DO**: `serve --dnssec` stays the operator's call, and the stance is
+now stated at startup. §4.1¶1's MUST ("A security-aware resolver MUST include
+an OPT pseudo-RR with the DO bit set when sending queries") speaks to the
+resolver role, and `--validate` already implies the flag on that strength —
+records never asked for are records never checked. Fetching DNSSEC octets on
+every upstream query without validating anything is the trade RFC 3225 §2¶1–¶2
+argued the DO bit into existence around, so off remains legitimate; what off
+could not honestly do before was *say so*: `serve` now logs
+`server_dnssec=validate|records|off` at startup, and `--dnssec`'s help names
+the consequence for a DO=1 client — RFC 8020 §2¶5's echo is conditional on the
+triggering query having asked, and this server *is* the triggering query.
+
+**Verified**: 1359 passed, 1 skipped (+2 net: the old DS-survives pin rewritten
+into three — DS stripped at DO=0 with the recount, a query naming DS keeps it,
+a QTx naming DS keeps it), `ruff check`/`format` clean. Errata swept on 4035
+before quoting §3.1¶1/§4.1: the two verified ones (§3.1.4.1's zone-cut DS
+processing, §5.3.1's DNSKEY-try-each) touch neither sentence relied on.
+
+**Next, in order**: (1) key-tag signalling (RFC 8145: `edns-key-tag` on the
+helper DNSKEY queries, §4.2.2.1's two-list forwarding) now has an obvious
+home; (2) aggressive NSEC caching (RFC 9908 — the denials now carry verdicts,
+which is the precondition 9908 §5's caveats assume); (3) wildcard *synthesis*
+from cache (roadmap §4's ⬜ row) can reuse the per-lookup store question
+finally settled earlier.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

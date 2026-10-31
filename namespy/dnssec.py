@@ -663,17 +663,18 @@ class DuplicateRecordError(ValueError):
 #: RFC 4035 §3.1 introduces three of them ("a security-aware authoritative name server for a signed
 #: zone MUST include additional RRSIG, NSEC, and DS RRs" is §3.1¶1 telling the server where they go)
 #: and RFC 5155 adds NSEC3 and NSEC3PARAM, which its §11 registers in IANA's "DNS SECURITY RR Type"
-#: registry alongside the first three. This is the set RFC 4035 §3.2.1 makes conditional on the
-#: client: if the initiating query's DO bit is clear, "the name server side MUST strip any
-#: authenticating DNSSEC RRs from the response but MUST NOT strip any DNSSEC RR types that the
-#: initiating query explicitly requested".
+#: registry alongside the first three.
 #:
-#: DS is deliberately *not* here, though §3.1¶1 lists it among what a signed zone adds to a
-#: DO=1 response. A DS is data a client asks for by name, and withdrawing one from a referral would
-#: break the walk rather than hide anything: the strip exists to spare non-DNSSEC clients records it
-#: cannot parse (RFC 3225 §2¶3 reports such resolvers failing outright), not to withhold a resource
-#: record. DNSKEY is included even though it only ever appears when queried directly, because the
-#: query-matches-type exception below is what protects it in that case.
+#: DS is deliberately *not* here, though RFC 4035 §3.1¶1 lists it among what a signed zone adds to
+#: a DO=1 response. This set is the *resolver-side* one: types that are evidence rather than answer
+#: when judging a response, and types whose presence a walk must not treat as an answer of its own
+#: -- and a walk consumes §3.1.4's referral-riding DSes as exactly the data they are. The
+#: client-facing question ("what must §3.2.1's strip withdraw", where DS *does* belong, decided at
+#: §3.1¶1's own enumeration) is a different scope and lives with the answer:
+#: :data:`namespy.server._CLIENT_STRIP_TYPES`. One constant wearing both coats was the mistake;
+#: the query-matches-type exception protects DS-as-answer in either. DNSKEY is included even
+#: though it only ever arrives when queried directly (§3.1.2's conditional piggyback aside),
+#: because the same exception is what protects it as an answer in that case.
 DNSSEC_SECURITY_TYPES: frozenset[int] = frozenset(
     {
         int(DnsRType.RRSIG),

@@ -113,7 +113,7 @@ from .edns import (
     find_option,
     nsid_of,
 )
-from .enums import DnsOpCode, DnsQR, DnsResponseCode
+from .enums import DnsOpCode, DnsQR, DnsResponseCode, DnsRType
 from .mqtype import (
     MQTYPE_RECOMMENDED_QTX_LIMIT,
     mqtype_query_rejection,
@@ -209,6 +209,31 @@ _SECTIONS = (
     ("nameservers", "NSCOUNT"),
     ("additional_records", "ARCOUNT"),
 )
+
+#: The records a DO=0 client must not receive unless its query named the type.
+#:
+#: :data:`~namespy.dnssec.DNSSEC_SECURITY_TYPES` plus DS -- and the addition is
+#: a decision, taken against the exact text rather than the shared constant's
+#: convenience. RFC 4035 §3.1¶1 enumerates what a DO=1 query buys: a signed
+#: zone "MUST include additional RRSIG, NSEC, and DS RRs" (NSEC3/NSEC3PARAM
+#: join via RFC 5155, DNSKEY via §3.1.2's conditional piggyback), and §3.2.1¶1
+#: withdraws the same set for a client that did not ask: "MUST strip any
+#: authenticating DNSSEC RRs from the response but MUST NOT strip any DNSSEC RR
+#: types that the initiating query explicitly requested." Note how both
+#: sentences speak of *types* -- a DS is data when the query names it, and
+#: authentication material when it does not.
+#:
+#: The shared constant keeps DS out because it serves the walk too, and the
+#: walk consumes §3.1.4's referral-riding DSes -- a legitimate use, and the
+#: only place the omission has ever been about. This is the client-facing hop,
+#: the one §3.2.1 addresses: referrals never leave this server, but a DS can
+#: still arrive inside a non-authoritative upstream answer that the walk takes
+#: as given, and RFC 3225 §2¶3 is on the record about what such clients used to
+#: do with records they could not parse -- "failing (in the worst case) or
+#: entire responses being ignored (in the better case)". Stripping here costs
+#: nothing the recursion needs and closes the class of client the DO bit
+#: exists to protect.
+_CLIENT_STRIP_TYPES = DNSSEC_SECURITY_TYPES | {int(DnsRType.DS)}
 
 
 class DnsServer(asyncio.Protocol):
@@ -702,7 +727,8 @@ class DnsServer(asyncio.Protocol):
         RFC 4035 §3.2.1¶1, second sentence, in the client's terms: "If the DO bit in an initiating
         query is not set, the name server side MUST strip any authenticating DNSSEC RRs from the
         response but MUST NOT strip any DNSSEC RR types that the initiating query explicitly
-        requested." The set is :data:`~namespy.dnssec.DNSSEC_SECURITY_TYPES`; the exception is read
+        requested." The set is :data:`_CLIENT_STRIP_TYPES` -- §3.1¶1's list of what DO buys, DS
+        included; the exception is read
         off the question, and the QTx list of a RFC 10029 multi-type query counts with it -- a client
         that named RRSIG among the types it wanted asked for that type explicitly, whatever the OPT
         option's encoding suggests about sections.
@@ -721,7 +747,7 @@ class DnsServer(asyncio.Protocol):
         """
         requested = {int(question.qtype) for question in request.questions}
         requested.update(int(qtype) for qtype in mqtype_answered or ())
-        withdraw = DNSSEC_SECURITY_TYPES - requested
+        withdraw = _CLIENT_STRIP_TYPES - requested
         if not withdraw:
             return
         changed = False
