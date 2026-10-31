@@ -88,6 +88,20 @@ def _name_text(name):
     return name.canonical_text
 
 
+def _name_labels(name) -> tuple:
+    """Case-folded label tuple of *name*, for suffix tests (:meth:`DomainName._labels`).
+
+    The row stores :func:`_name_text` -- escaped and case-folded -- which
+    :class:`~namespy.names.DomainName` re-parses to the same labels a live query
+    carries, escaped dots included. Keys collapse names to one row; a zone
+    suffix test needs the labels themselves, which no text split can give back
+    safely once a label may contain an escaped dot.
+    """
+    if not isinstance(name, DomainName):
+        name = DomainName(str(name))
+    return name._labels()
+
+
 def _decode_soa(payload):
     """Recover the SOA that proved a denial, or ``None`` when it cannot be read.
 
@@ -275,6 +289,49 @@ class SqliteDnsCache(DnsCache):
             _unpack_proofs(proofs),
             validated=bool(validated),
         )
+
+    def denial_candidates(self, name, qclass):
+        """Every live proof-carrying denial in the class, zone-containing *name*.
+
+        The memory backend's scan with SQL doing the coarse half: ``kind`` and
+        ``length(proofs)`` narrow the rows in the engine, the zone suffix is
+        Python's, because the name is stored in one text spelling while the
+        suffix test is case-folded labels. Deepest zone first, for the same
+        reason as :class:`~namespy.cache.MemoryDnsCache.denial_candidates`: the
+        caller stops at the first complete proof and should stop at the
+        strongest one.
+        """
+        qc = int(qclass)
+        now = self.time_fn()
+        rows = self._conn.execute(
+            "SELECT name, qtype, rcode, expires_at, payload, proofs, validated "
+            "FROM rrset_cache WHERE qclass=? AND kind IN (?,?) AND length(proofs)>0 "
+            "AND expires_at>?",
+            (qc, _KIND_NXDOMAIN, _KIND_NODATA, now),
+        ).fetchall()
+        needle = _name_labels(name)
+        found = []
+        for row_name, row_qtype, rcode, expires_at, payload, proofs, validated in rows:
+            soa = _decode_soa(payload)
+            if soa is None:
+                continue
+            top = _name_labels(soa.name)
+            if top and (len(needle) < len(top) or needle[-len(top) :] != top):
+                continue
+            found.append(
+                NegativeEntry(
+                    row_name,
+                    row_qtype,
+                    qc,
+                    rcode,
+                    soa,
+                    expires_at,
+                    _unpack_proofs(proofs),
+                    validated=bool(validated),
+                )
+            )
+        found.sort(key=lambda entry: len(_name_labels(entry.soa.name)), reverse=True)
+        return tuple(found)
 
     def put(self, entry):
         key_name = _name_text(entry.name)

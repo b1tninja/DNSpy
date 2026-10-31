@@ -103,6 +103,13 @@ class Trace:
                 # are indistinguishable, so this line is the only place the
                 # denied name and the ancestor that denied it appear together.
                 body.append(f"    Note over C: NXDOMAIN cut: {ev.name} below {ev.denied_by}")
+            elif cn == "AggressiveDenial":
+                # The proof's name is rarely related to the queried one -- that
+                # is the whole nature of the inference -- so the line says which
+                # kind of denial was written and which entry vouched for it.
+                body.append(
+                    f"    Note over C: aggressive {ev.kind}: {ev.name} proven by {ev.proven_by}"
+                )
             elif cn == "DnssecVerdict":
                 # The verdict beside the zone that made the denial, ahead of the
                 # NXDOMAIN it judges: with anchors configured this line is the

@@ -39,6 +39,8 @@ hints from the network is now the explicit, awaited
 * RFC 8106 section 2 (root hints: an initial address set is required)
 * RFC 9156 (QNAME minimisation -- opt-in via ``qname_min``; see
   :mod:`namespy.minimis` for the probe schedule)
+* RFC 8198 / RFC 9077 (aggressive use of validated cached denials -- opt-in via
+  ``aggressive_nsec``; see :mod:`namespy.aggressive` for the gates)
 """
 
 import asyncio
@@ -60,6 +62,7 @@ from socket import gaierror
 from typing import NamedTuple
 
 from . import enable_path_mtu_discovery
+from .aggressive import synthesize_denial
 from .bundle import (
     BundledType,
     BundleResult,
@@ -286,6 +289,12 @@ class Resolver(asyncio.Protocol):
     #: it -- and a test that builds a bare ``Resolver()`` -- filters strictly.
     glue_policy = GluePolicy.STRICT
     nxdomain_cut = NxdomainPolicy.ALWAYS
+
+    #: Whether cached validated proofs may deny names they were not written for
+    #: (RFC 8198 §5); see :meth:`RecursiveResolver.__init__`. Off is the class
+    #: default, so a driver that never sets it synthesises nothing -- the
+    #: pre-8198 behaviour RFC 4035 §4.5 originally called prudent.
+    aggressive_nsec = False
 
     #: Trust anchors the walk judges answers under, positive and negative; see
     #: :meth:`RecursiveResolver.__init__`. Empty is the unvalidating default,
@@ -1029,6 +1038,26 @@ class NxdomainCut:
 
     name: str
     denied_by: str
+
+
+@dataclass(frozen=True)
+class AggressiveDenial:
+    """A cached, validated proof denied this name and the resolver wrote the answer (RFC 8198 §5).
+
+    The entry's name and the answer's kind are reported because the synthesised
+    packet is otherwise indistinguishable from a fetched one -- same RCODE, same
+    authority shape -- while the entry whose bundle proves the answer can carry
+    an unrelated name *and* an unrelated RCODE: the denial cached for ``aaa``
+    synthesises ``dog``'s NXDOMAIN, the one cached for ``www AAAA`` synthesises
+    ``www TXT``'s NODATA. The trace line is the only place the evidence and the
+    inference appear together, which is the same reason :class:`NxdomainCut`
+    exists and reads more sharply here: with the cut, at least the denying name
+    is an ancestor; here it need not be related to the queried name at all.
+    """
+
+    name: str
+    proven_by: str
+    kind: str
 
 
 @dataclass(frozen=True)
@@ -1777,6 +1806,7 @@ def resolve_steps(
     now: float | None = None,
     client_cd: bool = False,
     client_key_tags: tuple = (),
+    aggressive_nsec: bool = False,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1860,6 +1890,20 @@ def resolve_steps(
     DNAME), the name that does not exist is the last of the chain ... and not the
     QNAME" -- checking at the origin would miss a denial reached through an alias.
 
+    ``aggressive_nsec`` turns on the aggressive use of cached proofs (RFC 8198
+    §5, TTLs per RFC 9077 §3.4): when nothing matches ``(qname, qtype)`` and no
+    cut applies, the cached denials' NSEC/NSEC3 bundles are examined -- by the
+    same response validators a live answer faces -- and a validated bundle that
+    proves *this* denial synthesises the answer without a query. Every gate
+    (:mod:`namespy.aggressive` states them with their texts): validated entries
+    only (Appendix B ¶2), a complete proof for the queried name or nothing
+    (§5.4/§8.4-§8.7 in full, with Appendix A ¶4's MUST-fallback on an incomplete
+    one), no Opt-Out span (§5.2¶3), unexpired signatures (§7's "until the
+    effective TTLs or signatures expire"), and the CD client never answered this
+    way (Appendix A ¶1's exemption). Off by default, and it falls silent on any
+    backend that cannot supply candidates -- asking the query is still the
+    correct behaviour, which is all RFC 8198 promises when it cannot act.
+
     If ``failures`` is provided (a :class:`namespy.cache.FailureCache`), the
     same loop also refuses to *start* a query whose failure is already
     remembered, and records the failures it hits (RFC 9520 §3.2). Two shapes are
@@ -1941,8 +1985,8 @@ def resolve_steps(
     #: the answer was supposed to be.
     sec_validator: Validator | None = None
     sec_servers: dict = {}
+    clock = now if now is not None else (cache.time_fn() if cache is not None else None)
     if anchors:
-        clock = now if now is not None else (cache.time_fn() if cache is not None else None)
         sec_validator = Validator(anchors=tuple(anchors), now=clock)
 
     def _offer(zone, reply, server=None):
@@ -2091,6 +2135,35 @@ def resolve_steps(
                             and bool(getattr(entry, "validated", False)),
                         )
                     )
+                    return
+            if aggressive_nsec and not client_cd:
+                # RFC 8198 Appendix A ¶1's second check, run in its stated place:
+                # before any query, does a cached proof deny this name? The CD
+                # exemption rides with it -- "unless the CD bit was set on the
+                # incoming query" is Appendix A's own clause, and §3.2.2¶3's
+                # "should not interfere" says the same in this server's voice:
+                # a client that validates for itself asked for the wire, not for
+                # an inference, however well the inference was proven.
+                for candidate in cache.denial_candidates(sname.qname, sname.qclass):
+                    response = synthesize_denial(
+                        candidate,
+                        sname,
+                        now=clock,
+                        remaining=int(
+                            max(0.0, candidate.expires_at - cache.time_fn())
+                        ),  # the cache's own clock owns entry expiry; `clock` answers RRSIGs
+                        dnssec_ok=dnssec_ok,
+                        assert_ad=sec_validator is not None,
+                    )
+                    if response is None:
+                        continue
+                    kind = "nxdomain" if response.RCODE == DnsResponseCode.NAME_ERROR else "nodata"
+                    yield AggressiveDenial(str(sname.qname), str(candidate.name), kind)
+                    if kind == "nxdomain":
+                        yield Nxdomain()
+                    else:
+                        yield Nodata(candidate.soa)
+                    yield Done(response)
                     return
         if failures is not None:
             blocked = failures.match(sname.qname, sname.qtype, sname.qclass)
@@ -2890,6 +2963,7 @@ class RecursiveResolver(Resolver):
         qname_min: bool = False,
         glue_policy: GluePolicy = GluePolicy.STRICT,
         nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
+        aggressive_nsec: bool = False,
         dnssec_ok: bool = False,
         trust_anchors=(),
     ):
@@ -2946,6 +3020,16 @@ class RecursiveResolver(Resolver):
             wrong for serving, because it throws away the reason the negative
             cache has a subtree-wide claim at all. :class:`NxdomainPolicy` says
             what each stance costs. Also accepted as the equivalent string.
+        :param aggressive_nsec: whether the NSEC/NSEC3 bundles already cached
+            with validated denials may answer names and types they were not
+            written for -- RFC 8198's aggressive use, gate by gate in
+            :mod:`namespy.aggressive`. Off by default because it widens the
+            blast radius §9 of that document names: "one successful attack would
+            be able to suppress many queries for new names, up to the negative
+            TTL", where the default must repeat the attack per query. It also
+            does nothing without something to widen: the entries it reads are
+            stamped only under trust anchors, so without ``trust_anchors`` set
+            this flag is honestly inert.
         :param trust_anchors: :class:`~namespy.anchors.TrustAnchor` objects to
             validate answers against -- the trust point RFC 4035 §4.4 calls
             "configured" and §4.3 makes the origin of every Secure verdict.
@@ -3000,6 +3084,7 @@ class RecursiveResolver(Resolver):
         # and NxdomainPolicy.NEVER must arrive as one thing, and a typo must not
         # leave a resolver that thinks it has a policy.
         self.nxdomain_cut = NxdomainPolicy(nxdomain_cut)
+        self.aggressive_nsec = bool(aggressive_nsec)
         # Frozen like edns_options: the walk reads these per lookup, and an
         # anchor list a caller mutates mid-flight would silently change what
         # "validated" meant partway down a delegation chain.
@@ -3528,6 +3613,7 @@ class RecursiveResolver(Resolver):
                         anchors=self.trust_anchors,
                         client_cd=client_cd,
                         client_key_tags=client_key_tags,
+                        aggressive_nsec=self.aggressive_nsec,
                     )
                     sub_response = await self._drive(
                         sub_gen,
@@ -3659,6 +3745,7 @@ class RecursiveResolver(Resolver):
             anchors=self.trust_anchors,
             client_cd=client_cd,
             client_key_tags=client_key_tags,
+            aggressive_nsec=self.aggressive_nsec,
         )
         response = await self._drive(
             gen, self.last_trace, client_cd=client_cd, client_key_tags=client_key_tags

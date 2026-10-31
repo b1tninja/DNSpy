@@ -268,6 +268,29 @@ class DnsCache(ABC):
         """
         return None  # noqa: RET501 - explicit: "no cut available" is the contract
 
+    def denial_candidates(self, name, qclass):  # noqa: ARG002 - the fallback ignores both
+        """Cached negative entries whose proof bundles might deny *(name, *)*.
+
+        RFC 8198 Appendix A ¶1's second lookup -- "the validator ... checks to
+        see whether any cached and validated NSEC record denies the existence of
+        the sought record(s)" -- which needs a question :meth:`get` cannot ask:
+        the denial that covers ``dog.example`` was written under
+        ``albatross.example``, an owner that is neither the name nor any of its
+        ancestors. Candidates are therefore every live negative entry that
+        carries a proof bundle in the right class whose zone (the SOA's owner)
+        contains *name* -- the filtering the caller cannot do cheaply. What a
+        candidate *proves* is decided after it is handed over, by the RFC 4035
+        §5.4 / RFC 5155 §8.4-§8.7 validators, so this method is allowed to
+        under-report and must never be trusted to over-report: a candidate is a
+        bundle to examine, never an answer.
+
+        The base implementation returns nothing, the same documented fallback as
+        :meth:`nxdomain_at`: aggressive caching is a SHOULD built on a SHOULD,
+        and a backend that cannot supply candidates leaves the resolver doing
+        what it did before the feature existed.
+        """
+        return ()
+
 
 class MemoryDnsCache(DnsCache):
     """Process-local dict-backed :class:`DnsCache`.
@@ -328,6 +351,47 @@ class MemoryDnsCache(DnsCache):
             return None
         self._entries.move_to_end(key)
         return entry
+
+    def denial_candidates(self, name, qclass):
+        """The LRU walk, newest first: every live proof-carrying denial in the zone.
+
+        A full scan, which the cut's index exists to avoid and this one accepts:
+        the covering NSEC's owner is nobody's ancestor, so no ancestor walk can
+        find it (the base method's docstring), and the alternative is a sorted
+        per-zone NSEC table (RFC 8198 Appendix A ¶2's ``NSEC_TABLE``) that would
+        have to be maintained through every put, eviction, and LRU move for a
+        scan that runs once per uncached name on a cache this package keeps
+        bounded. Deepest zone first, because the denial of a smaller name proves
+        more than the denial of a larger one, and a caller that stops at the
+        first complete proof should stop at the best one.
+
+        Expired entries are forgotten on sight, as :meth:`get` does: this is a
+        read, and a read that outlives a TTL and reports it anyway is the bug
+        RFC 9077 was written to close.
+        """
+        wanted = int(qclass)
+        needle = _labels(name)
+        found = []
+        for key, entry in list(self._entries.items()):
+            if not isinstance(entry, NegativeEntry) or not entry.proofs:
+                continue
+            if entry.expired(self.time_fn()):
+                self._forget(key)
+                continue
+            if key[2] != wanted or entry.soa is None:
+                continue
+            top = _labels(entry.soa.name)
+            if not top:
+                # The root zone: an empty label tuple is every name's suffix,
+                # and ``needle[-0:]`` is the whole needle rather than nothing --
+                # the slice would say "no match" for exactly the zone that
+                # contains everything.
+                found.append(entry)
+                continue
+            if len(needle) >= len(top) and needle[-len(top) :] == top:
+                found.append(entry)
+        found.sort(key=lambda entry: len(_labels(entry.soa.name)), reverse=True)
+        return tuple(found)
 
     def put(self, entry):
         key = entry.key

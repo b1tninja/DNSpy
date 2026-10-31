@@ -1351,7 +1351,75 @@ per-lookup store question finally settled earlier; (3) §5's Key Tag Query
 rather than signalling, and its §5.2 querier rules mirror what this round
 already knows how to compute.
 
-## Previous round: MQTYPE (RFC 10029)
+### Follow-up: aggressive NSEC caching — denials from cached proofs (RFC 8198 §5, App. A–B, §7, §9; RFC 9077 §3.4)
+
+**First, a citation corrected**: the three "Next" lists before this one said
+"aggressive NSEC caching (RFC 9908)". RFC 9908 is *Clarification and
+Enhancement of the CSR Attributes Definition in RFC 7030* — certificate
+enrollment, nothing to do with DNS. The feature the lists meant (and the
+roadmap row at §6 always named correctly) is **RFC 8198**, *Aggressive Use of
+DNSSEC-Validated Cache*, with its TTL rules as rewritten by **RFC 9077**. The
+"§5 caveats" the lists referred to are RFC 8198 §5's own. The mis-citation was
+caught by reading the document before implementing against it.
+
+Shipped: `namespy/aggressive.py` (`synthesize_denial`) at the walk's
+cache-lookup step (8198 App. A ¶3 places it there), the cache's second new
+lookup (`DnsCache.denial_candidates`, both backends, documented fallback in
+the base — a covering NSEC's owner is nobody's ancestor, so neither `get` nor
+`nxdomain_at`'s walk can find it), the `aggressive_nsec` knob
+(`RecursiveResolver`, `resolve_steps`, CLI `--aggressive-nsec`, default off),
+and the `AggressiveDenial` trace event. The gates, each with its text in the
+module docstring: the validated stamp is the entry's only test (App. B ¶2);
+the bundle is re-run through the *full* response validators — §5.4 for NSEC,
+§8.4–§8.7 for NSEC3 — against the queried name, so an incomplete proof falls
+back to the network exactly as App. A ¶4's MUST says; an Opt-Out covering
+record forbids synthesis (§5.2¶3); signatures count as well as TTLs (§7's
+"until the effective TTLs or signatures expire"), read as a timestamp, never
+re-verified — the stamp-at-write doctrine holds; the synthesised TTL is the
+entry's remaining life capped at 10800 (§5.4¶2 as 9077 §3.4 replaced it, §9¶3
+behind it); a CD client is never answered from synthesis (App. A ¶1); nothing
+synthesised is ever written back.
+
+Two things the reading caught that a sketch would have missed. (1) *Cross-cut
+synthesis*: a parent zone's NSEC spans reach below its delegations with tidy
+geometry, and answering from them would deny names the child zone may hold.
+The hazard is already closed in the walks themselves — both closest-encloser
+machines reject an NS-without-SOA or DNAME at the encloser (§8.3¶12, which is
+8198 App. B ¶4 verbatim in intent) — and the one shape the response validators
+never needed a guard for, NODATA synthesised from a *matching* record at a cut
+name, gets the check in `_nodata_from`, with the exception the text demands:
+DS is the one type the delegation point answers for (§5.4¶5, §8.6), so the
+proven-unsigned answer is synthesisable and the TXT one is not. (2) *Two
+clocks*: entry expiry runs on the cache's `time_fn` and signature windows on
+UNIX seconds, and the fixture tree deliberately keeps them apart (1000.0
+versus 1.8e9) — a `synthesize_denial` that re-checked `entry.expired(now)`
+with the signature clock read every entry as expired and the bug surfaced as
+"synthesis silently does nothing". The function now takes the caller-measured
+`remaining` and leaves freshness to the backends, which forget expired rows
+on read anyway; hoisting `clock = ...` out of the `if anchors:` branch fixed
+the same conflation's twin (an aggressive walk without anchors used an
+unbound variable — caught by the unvalidated-entry refusal test, which is
+exactly the test that refuses synthesis and must still walk).
+
+**Verified**: 1397 passed, 1 skipped (+21 net, new `tests/test_aggressive_nsec.py`:
+neighbour NXDOMAIN and other-type NODATA with zero queries and no cache
+growth, event order, unsigned entry, CD client, default off, foreign zone,
+trace line; unit gates — stamp, signature epoch, cut refusals *and* the DS
+exception, bitmap contradiction, TTL cap both directions, bare proof;
+`denial_candidates` on both backends plus the `()` fallback; both CLI flag
+polarities), `ruff check`/`format` clean, `mypy namespy` exits 0.
+
+**Next, in order**: (1) wildcard *synthesis* from cache — 8198 §5.3's positive
+half ("we revise this recommendation": a cache-deduced wildcard SHOULD answer
+when the cache can prove the name would not exist without it — needs
+`nsec_proves_wildcard_answer`/`nsec3_proves_wildcard_answer` fed from the same
+`denial_candidates` scan plus the wildcard RRset itself, which the current
+bundles do not carry: proofs hold NSEC/NSEC3+RRSIG only, so the write side
+grows first); (2) the §4.5 row's other half — chain records in the cache
+rather than per-lookup store — is the same data question viewed from
+validate.py's side; (3) RFC 8145 §5's Key Tag Query (`#kt`) remains unbuilt
+and optional.
+
 
 Shipped: the wire form of both options in both directions, the server's half of using them
 (§3.4's combination), and now the client's half too — `RecursiveResolver.resolve_bundle`
