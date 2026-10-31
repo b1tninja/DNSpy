@@ -235,7 +235,27 @@ class DnsRecord:
             LOGGER.debug("no RDATA codec for %s; keeping it opaque", type_name_of(rtype_raw))
             rdata: RData = RData(data[cursor:end])
         else:
-            rdata = codec.parse_from(data, cursor, rdlength)
+            try:
+                rdata = codec.parse_from(data, cursor, rdlength)
+            except ValueError as exc:
+                # A codec's constructor enforces field invariants -- an RRSIG
+                # signature must not be empty, a DNSKEY public key, a DS
+                # digest, an NSEC3 hash the length its algorithm mandates --
+                # and raises the one exception class a *programmer* mistakes
+                # with, :class:`ValueError`. Reached through ``parse_from`` the
+                # same words mean something else: this wire record describes an
+                # RR no sender could legitimately have sent, which is a parse
+                # failure. The parser's whole contract is that malformed input
+                # surfaces only as :class:`DnsPacketParseError` -- one class the
+                # server and resolver already catch -- so a constructor's
+                # ``ValueError`` escaping through here would crash the reader on
+                # a single corrupt octet, the exact failure the wire fuzzing
+                # property exists to forbid.
+                raise DnsPacketParseError(
+                    f"invalid {type_name_of(rtype_raw)} RDATA at offset {cursor}: {exc}",
+                    data=data,
+                    offset=cursor,
+                ) from exc
 
         record = cls(
             name,

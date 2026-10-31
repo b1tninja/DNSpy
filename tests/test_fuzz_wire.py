@@ -52,6 +52,7 @@ green fuzz tier as "no crashes", never as "no regressions".
 from __future__ import annotations
 
 import hypothesis.strategies as st
+import pytest
 from hypothesis import HealthCheck, assume, given, settings
 
 from namespy.enums import DnsQR
@@ -421,3 +422,34 @@ def test_one_corrupt_octet_never_brings_down_the_parser(
     again, again_end = DnsPacket.parse(canonical)
     assert again_end == len(canonical)
     assert bytes(again) == canonical
+
+
+def test_an_rrsig_with_an_empty_signature_fails_the_parse_not_the_process():
+    """The one exception vocabulary the wire may speak: ``DnsPacketParseError``.
+
+    Found by the property above, then pinned here: RRSIG RDATA whose signature
+    field is zero octets long reaches the codec's constructor, which enforces
+    "a signature exists" with :class:`ValueError` -- the right word from an
+    API caller and the wrong crash from a datagram. The record boundary
+    converts the one to the other; this is the record of why the conversion
+    must stay.
+    """
+    rdata = (
+        b"\x00\x01"  # type covered: A
+        b"\x05"  # algorithm: RSASHA1
+        b"\x02"  # labels
+        b"\x00\x00\x00\x3c"  # original TTL
+        b"\x00\x00\x00\x64"  # expiration
+        b"\x00\x00\x00\x01"  # inception
+        b"\x00\x00"  # key tag
+        b"\x00"  # signer's name: the root
+        b""  # signature: absent -- the constructor's invariant, the wire's lie
+    )
+    record = (
+        b"\x01a\x04test\x00"  # a.test.
+        b"\x00\x2e"  # type: RRSIG
+        b"\x00\x01"  # class: IN
+        b"\x00\x00\x00\x3c" + len(rdata).to_bytes(2, "big") + rdata  # TTL
+    )
+    with pytest.raises(DnsPacketParseError):
+        DnsRecord.parse(record, 0)
