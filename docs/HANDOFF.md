@@ -1409,6 +1409,20 @@ exception, bitmap contradiction, TTL cap both directions, bare proof;
 `denial_candidates` on both backends plus the `()` fallback; both CLI flag
 polarities), `ruff check`/`format` clean, `mypy namespy` exits 0.
 
+**A lesson the CI re-taught, twice**: the previous round's "CI green" was
+wrong — run 41245125423 failed on the crypto-free ubuntu runner because
+`test_the_walk_reads_the_initiating_packets_instances_into_one_copy` calls
+the signed helpers without `@needs_tree` (local crypto masked it; the file's
+other fifteen tree tests were marked). This round's push caught it, and the
+fix commit `b205729` marks that test *and* re-cuts the new file: a
+module-level skipif over-skips, so its two CLI tests and the base-cache
+fallback are deliberately unmarked and run everywhere. Verified both ways
+locally: full suite with crypto; with `cryptography` blocked, the two files
+run their unmarked tests and skip the rest, nothing failing. Master is now
+green on CI, Security, and Socket. The standing rule earns its keep:
+**green means the CI run, not the local one** — `gh run list` after every
+push, not after every test suite.
+
 **Next, in order**: (1) wildcard *synthesis* from cache — 8198 §5.3's positive
 half ("we revise this recommendation": a cache-deduced wildcard SHOULD answer
 when the cache can prove the name would not exist without it — needs
