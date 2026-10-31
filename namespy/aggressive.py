@@ -45,7 +45,9 @@ only ever sees entries and a name.
 
 from __future__ import annotations
 
-from .cache import NegativeEntry
+from typing import NamedTuple
+
+from .cache import NegativeEntry, PositiveEntry
 from .enums import DnsQR, DnsResponseCode, DnsRType
 from .names import DomainName
 from .nsec import (
@@ -55,12 +57,15 @@ from .nsec import (
     nsec3_proves_no_data,
     nsec3_proves_no_ds,
     nsec3_proves_nxdomain,
+    nsec3_proves_wildcard_answer,
     nsec3_proves_wildcard_no_data,
     nsec3_record_is_from_proper_zone,
     nsec_proves_no_data,
     nsec_proves_nxdomain_response,
+    nsec_proves_wildcard_answer,
     nsec_record_is_from_proper_zone,
     proof_entries,
+    wildcard_at,
 )
 from .packet import DnsRecord, Response
 from .rdata import RData_RRSIG
@@ -85,8 +90,8 @@ def _at_or_under(name, apex) -> bool:
     return len(labels) >= len(top) and labels[-len(top) :] == top
 
 
-def _proof_is_live(entry, now: float) -> bool:
-    """Whether every RRSIG in the bundle is still inside its validity window.
+def _records_live(records, now: float) -> bool:
+    """Whether *records* carry at least one RRSIG and every one still covers *now*.
 
     Reading ``SIGNATURE EXPIRATION`` is not re-validation -- it is the second
     half of §7's "until the effective TTLs or signatures for those records
@@ -95,13 +100,18 @@ def _proof_is_live(entry, now: float) -> bool:
     hours)" while "their RRSIG expiration time can be much further in the
     future", and a bundle whose signature died young proves nothing at any TTL.
     """
-    for record in entry.proofs:
-        if int(record.rtype) != int(DnsRType.RRSIG):
-            continue
-        rdata = record.rdata
-        if isinstance(rdata, RData_RRSIG) and not rdata.within_validity(now):
-            return False
-    return True
+    signatures = [record for record in records if int(record.rtype) == int(DnsRType.RRSIG)]
+    if not signatures:
+        return False
+    return all(
+        isinstance(record.rdata, RData_RRSIG) and record.rdata.within_validity(now)
+        for record in signatures
+    )
+
+
+def _proof_is_live(entry, now: float) -> bool:
+    """The denial bundle's window test: every covering signature of every proof."""
+    return _records_live(entry.proofs, now)
 
 
 def _capped(record: DnsRecord, ttl: int) -> DnsRecord:
@@ -287,3 +297,166 @@ def synthesize_denial(
         questions=list(sname.questions),
         nameservers=nameservers,
     )
+
+
+# ------------------------------------------------------------------ the positive half (§5.3)
+
+
+class Synthesis(NamedTuple):
+    """One synthesised answer and the record of what it rests on.
+
+    *proven_by* names the cache material that vouched -- the denial's entry for
+    the negative kinds, the template's wildcard owner for the positive one --
+    because a synthesised packet carries no evidence of its own cause.
+    """
+
+    response: Response
+    kind: str  # "nxdomain" | "nodata" | "wildcard"
+    proven_by: str
+    soa: object = None
+
+
+def _template_zone(template) -> DomainName | None:
+    """The zone whose key signed the template's RRset -- its RRSIG's signer."""
+    for record in template.records:
+        if int(record.rtype) == int(DnsRType.RRSIG) and isinstance(record.rdata, RData_RRSIG):
+            return DomainName(record.rdata.signer_name)
+    return None
+
+
+def synthesize_wildcard(cache, sname, *, now, assert_ad: bool = False) -> Synthesis | None:
+    """The answer *sname* would receive through a cached wildcard, or ``None``.
+
+    RFC 8198 §5.3 revised the old caution the way its negative siblings were
+    revised: "As long as the validating resolver can determine that a name
+    would not exist without the wildcard match, determined according to the
+    rules set out in Section 5.3.4 of [RFC4035] (NSEC), or in Section 8.8 of
+    [RFC5155], it SHOULD synthesize an answer ... using the cache-deduced
+    wildcard. If the corresponding wildcard record is not in the cache, it
+    MUST fall back to send the query." Both halves are gates here.
+
+    *The corresponding wildcard record*: the deepest ancestor of QNAME with a
+    cached entry at its wildcard node is the only wildcard allowed to answer
+    -- RFC 4592 §3.3.1's "no search for an alternate" read from the resolver's
+    side. If that entry is unvalidated or its signatures have died, the answer
+    is the network, not the next-wildcard-up; an entry at the deepest wildcard
+    node that fails any gate stops the climb rather than moving past it.
+
+    *Would not exist without the match*: the §5.3.4 / §8.8 closer-match proof,
+    run against a cached, validated, signature-live denial bundle from the
+    template's own zone. The thin span test those sections state is sound at a
+    chain record for exactly one reason -- an NSEC3 covering the next closer
+    name proves the intervening names are absent (tree closure), which is what
+    makes this wildcard, not a deeper one, the nearest permitted to answer. An
+    Opt-Out span is refused: it proves only the absence of a DS, not of a
+    delegation, so it cannot say "the name would not exist" for a positive
+    answer (§5.2¶3 read onto the positive half).
+    """
+    qname = DomainName(sname.qname)
+    qtype = int(sname.qtype)
+    template = None
+    for ancestor in reversed(qname.hierarchy()):
+        ancestor = DomainName(ancestor)
+        if ancestor == qname:
+            continue
+        candidate = cache.get(wildcard_at(ancestor), qtype, sname.qclass)
+        if candidate is None:
+            continue  # an expired read vanished from the cache; the climb goes on
+        if (
+            isinstance(candidate, PositiveEntry)
+            and getattr(candidate, "validated", False)
+            and candidate.records
+            and [x for x in DomainName(candidate.name).labels() if x][:1] == [b"*"]
+            and _records_live(candidate.records, now)
+        ):
+            template = candidate
+        break  # deepest wildcard node reached, usable or not -- §3.3.1, no alternate
+    if template is None:
+        return None
+    zone = _template_zone(template)
+    if zone is None:
+        return None
+    remaining = int(max(0.0, template.expires_at - cache.time_fn()))
+    if remaining <= 0:
+        return None
+    for entry in cache.denial_candidates(qname, sname.qclass):
+        if not getattr(entry, "validated", False) or entry.soa is None:
+            continue
+        if not _at_or_under(qname, entry.soa.name) or DomainName(entry.soa.name) != zone:
+            # A zone's chain proves absence only within that zone, and only
+            # the same zone that signed the wildcard can witness that this was
+            # the nearest wildcard permitted to answer.
+            continue
+        if not _proof_is_live(entry, now):
+            continue
+        nsec_entries = proof_entries(entry.proofs, int(DnsRType.NSEC))
+        nsec3_entries = proof_entries(entry.proofs, int(DnsRType.NSEC3))
+        try:
+            if nsec3_entries:
+                proof = nsec3_proves_wildcard_answer(qname, template.name, nsec3_entries, zone)
+                if proof.via_opt_out:
+                    continue
+            elif nsec_entries:
+                nsec_proves_wildcard_answer(qname, template.name, nsec_entries)
+            else:
+                continue
+        except (ProofError, ValueError):
+            continue
+        answers = [
+            DnsRecord(
+                qname,
+                record.rtype,
+                record.rclass,
+                min(int(record.ttl), remaining),
+                rdata=record.rdata,
+            )
+            for record in template.records
+        ]
+        # The presentation is the authority's own for a synthesised answer:
+        # records at QNAME under the wildcard's signatures, the Labels field
+        # being the proof of the match -- the same evidence a directly-asked
+        # client receives, and the reason this function takes no dnssec_ok:
+        # there is nothing extra to carry, and the authority section stays
+        # empty.
+        return Synthesis(
+            Response(
+                QR=DnsQR.RESPONSE,
+                AA=False,
+                AD=assert_ad,
+                RCODE=DnsResponseCode.NO_ERROR,
+                questions=list(sname.questions),
+                answers=answers,
+            ),
+            "wildcard",
+            str(template.name),
+        )
+    return None
+
+
+def synthesize(cache, sname, *, now, dnssec_ok: bool = False, assert_ad: bool = False):
+    """The answer the cache can write for *sname* without the network, or ``None``.
+
+    Denials first -- an entry's own bundle proving the queried name absent is
+    the nearer evidence -- and the wildcard answer after, which needs the
+    denial candidates as its closer-match witness either way. One synthesis,
+    one source named: the kinds differ but the doctrine is one -- validated
+    stamps, live signatures, complete proofs, nothing written back, and
+    §5¶2's MUST to fall back when any part is missing.
+    """
+    for candidate in cache.denial_candidates(sname.qname, sname.qclass):
+        response = synthesize_denial(
+            candidate,
+            sname,
+            now=now,
+            remaining=int(max(0.0, candidate.expires_at - cache.time_fn())),
+            dnssec_ok=dnssec_ok,
+            assert_ad=assert_ad,
+        )
+        if response is None:
+            continue
+        if response.RCODE == DnsResponseCode.NAME_ERROR:
+            return Synthesis(response, "nxdomain", str(candidate.name))
+        return Synthesis(response, "nodata", str(candidate.name), soa=candidate.soa)
+    # No dnssec_ok for the wildcard path: a synthesised answer carries its own
+    # proof (the RRSIG Labels field), so there is nothing the knob could add.
+    return synthesize_wildcard(cache, sname, now=now, assert_ad=assert_ad)

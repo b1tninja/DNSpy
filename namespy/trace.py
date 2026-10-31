@@ -110,6 +110,8 @@ class Trace:
                 body.append(
                     f"    Note over C: aggressive {ev.kind}: {ev.name} proven by {ev.proven_by}"
                 )
+            elif cn == "WildcardSynthesis":
+                body.append(f"    Note over C: wildcard answer: {ev.name} via {ev.via}")
             elif cn == "DnssecVerdict":
                 # The verdict beside the zone that made the denial, ahead of the
                 # NXDOMAIN it judges: with anchors configured this line is the

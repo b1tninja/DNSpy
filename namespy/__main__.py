@@ -535,16 +535,18 @@ def build_parser():
         "--aggressive-nsec",
         dest="aggressive_nsec",
         action="store_true",
-        help="answer names and types that cached proofs deny, without asking (RFC 8198: "
-        "a validated denial's NSEC/NSEC3 records span more than the question they arrived "
-        "for, and once validated a resolver SHOULD use them). Only entries this resolver "
-        "fully verified are ever read -- so without --validate the flag is inert -- every "
-        "synthesised denial is a complete RFC 4035 5.4 / RFC 5155 8.4-8.7 proof for the "
-        "queried name itself, Opt-Out spans are refused, expired signatures end the "
-        "evidence before the TTL does, answers carry RFC 9077's effective-TTL limits, and "
-        "a CD client is served nothing but the wire. Off by default: one poisoned proof "
-        "suppresses a name's whole neighbourhood rather than one query "
-        "(RFC 8198 section 9).",
+        help="answer from cached proofs without asking (RFC 8198: once validated a "
+        "resolver SHOULD use a denial's NSEC/NSEC3 to deny neighbouring names, and a "
+        "validated wildcard to synthesize positive answers for names beneath it). Only "
+        "entries this resolver fully verified are ever read -- so without --validate the "
+        "flag is inert -- every synthesised denial is a complete RFC 4035 5.4 / "
+        "RFC 5155 8.4-8.7 proof for the queried name itself and every synthesised "
+        "positive a complete RFC 4035 5.3.4 / RFC 5155 8.8 closer-match proof, Opt-Out "
+        "spans are refused, expired signatures end the evidence before the TTL does, "
+        "denials carry RFC 9077's effective-TTL limits and positives the template's own "
+        "remaining life, and a CD client is served nothing but the wire. Off by "
+        "default: one poisoned proof suppresses a name's whole neighbourhood rather than "
+        "one query (RFC 8198 section 9).",
     )
     p.add_argument(
         "--mqtype",

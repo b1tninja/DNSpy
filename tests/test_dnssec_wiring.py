@@ -33,6 +33,7 @@ from namespy.rdata import (
     RData_NS,
     RData_RRSIG,
     RData_SOA,
+    RData_TXT,
 )
 from namespy.resolver import (
     DnssecVerdict,
@@ -198,6 +199,13 @@ def zone_denials(*, flip_apex=False):
             "zone.test.",
             "y.zone.test.",
             DnsRType.NSEC,
+            [_nsec("*.y.zone.test.", [int(DnsRType.TXT)])],
+            "zone",
+        )
+        + _signed(
+            "zone.test.",
+            "*.y.zone.test.",
+            DnsRType.NSEC,
             [_nsec("zone.test.", [int(DnsRType.TXT)])],
             "zone",
         )
@@ -293,6 +301,82 @@ def nodata(qname, records):
     return _resp(qname, DnsQType.AAAA, aa=True, nameservers=records)
 
 
+# --------------------------------------------------------------------------- the wildcard
+#
+# *.y.zone.test. owns a TXT; the chain's last edge runs y -> *.y -> apex, so the
+# span covering any nonexistent name under y is the wildcard's own NSEC --
+# exactly the shape RFC 4035 §5.4¶4 and RFC 5155 §8.8 prove a synthesised
+# answer with.
+
+WILD_TXT = b"wildcard answers all"
+
+
+def wildcard_txt_rrset(*, flip=False):
+    """The wildcard's TXT RRset as the zone really has it: owner ``*.y.zone.test.``."""
+    return _signed(
+        "zone.test.",
+        "*.y.zone.test.",
+        DnsRType.TXT,
+        [RData_TXT([WILD_TXT])],
+        "zone",
+        flip=flip,
+    )
+
+
+def wildcard_answer(name="deep.y.zone.test.", *, flip=False):
+    """A TXT answer for *name* synthesised through the wildcard.
+
+    The wildcard's bits under the queried name, signed as the wildcard's
+    bytes -- the RRSIG's Labels field (3, the signed name's count minus the
+    asterisk) is what remembers the expansion, and §5.3.4¶1 makes the answer
+    owe a closer-match denial, so the authority section carries the zone's
+    whole chain: the ``*.y`` NSEC spans every nonexistent name beneath it.
+    """
+    expanded = [_rec(name, r.rtype, r.rdata, ttl=r.ttl) for r in wildcard_txt_rrset(flip=flip)]
+    return _resp(
+        name,
+        DnsQType(int(DnsRType.TXT)),
+        aa=True,
+        answers=expanded,
+        nameservers=list(zone_denials()),
+    )
+
+
+def _wildcard_script(name="deep.y.zone.test.", *, flip=False):
+    """Root -> test. -> zone.test. -> a wildcard-synthesised TXT answer, then the keys."""
+    return [
+        root_referral(name),
+        tld_referral(name),
+        wildcard_answer(name, flip=flip),
+        key_answer(".", root_keys()),
+        key_answer("test.", tld_keys()),
+        key_answer("zone.test.", zone_keys()),
+    ]
+
+
+def _txt_walk(
+    cache,
+    name,
+    *,
+    responses=(),
+    anchors=(),
+    aggressive=False,
+    client_cd=False,
+    dnssec_ok=True,
+):
+    """``_walk`` at QTYPE=TXT -- the wildcard branch's type -- with the aggressive knob."""
+    sname = Sname(DomainName(name), DnsQType(int(DnsRType.TXT)))
+    kwargs = {
+        "dnssec_ok": dnssec_ok,
+        "now": NOW,
+        "aggressive_nsec": aggressive,
+        "client_cd": client_cd,
+    }
+    if anchors:
+        kwargs["anchors"] = tuple(anchors)
+    return _drive(resolve_steps(sname, _seed_slist(sname), cache, **kwargs), list(responses))
+
+
 # --------------------------------------------------------------------------- the driver
 
 
@@ -338,9 +422,12 @@ def _walk(
     qtype=DnsQType.AAAA,
     client_cd=False,
     failures=None,
+    aggressive=False,
 ):
     sname = Sname(DomainName(name), qtype)
     kwargs = {"dnssec_ok": True, "anchors": tuple(anchors), "now": NOW}
+    if aggressive:
+        kwargs["aggressive_nsec"] = True
     if policy is not None:
         kwargs["nxdomain_cut"] = policy
     if client_cd:

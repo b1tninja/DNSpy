@@ -1493,6 +1493,63 @@ may predate it), 6841 0x20, 9824 compact digests, 10001 §4.2 families,
 9471 §3 — with the P4 experimental rows (DoT/DoH/DoQ forwarding, 9539 §4
 opportunistic encryption) awaiting an explicit decline or a forwarding mode.
 
+### Follow-up: the wildcard answers for names nobody asked about — §5.3's positive half (RFC 8198 §5.3; RFC 4035 §4.5¶4, §5.3.4; RFC 5155 §8.8; RFC 4592 §3.3.1, §4.1-§4.2)
+
+Shipped: a validated wildcard-expanded answer files its template, and the
+cache writes positive answers for other names through it. The write side
+(`_cache_wildcard_template`, beside the chain writer) deduces the expansion
+from the covering RRSIG's Labels field — §4.5¶4's own sentence named this
+deduction — and rebuilds the signed name with the canonical helper
+(`signed_owner_name`), storing the RRset at the wildcard's own owner, data
+and signatures together, stamped and authoritative. SOA and NS never
+template (RFC 4592 §4.1¶1 "can never be a source of synthesis"; §4.2¶3 leaves
+wildcard NS undefined). The read side (`synthesize_wildcard`, with the
+denials in `aggressive.py`, same `--aggressive-nsec` knob, orchestrated by
+`synthesize`: denials first, wildcard after) enforces §5.3's two halves:
+the template — deepest wildcard node with a cache entry, §3.3.1's "no
+search for an alternate", a present-but-unusable entry means the network,
+not the shallower wildcard — and the closer-match denial, the §5.3.4 / §8.8
+proof run whole against a validated signature-live bundle from the
+template's own zone.
+
+Three things the design turned on. (1) The span proofs in §5.3.4/§8.8 are
+thin — matching-QNAME refusal plus a covering span — and they are sound
+cross-lookup only beside the same-zone rule: an NSEC(3) covering the NEXT
+CLOSER proves every intervening name absent by tree closure, and a wildcard
+above a zone cut cannot be the parent zone's signed data at all, so a cached
+template's signer is its zone and the witnessing bundle must be that zone's.
+(2) The wire packet, not the cached entry, is the write-side input: the
+positive entry deliberately stores only the queried name's data (AD rides
+the stamp), so the covering RRSIG has to be read where it still sits —
+`response.answers`. (3) The two clocks again: served TTLs bounded by the
+template's remaining life on the cache's clock, the template loadable only
+while its signatures live on the signature's — and 9077 §3.4's three-hour
+negative cap does NOT reach here: a synthesized positive is data, not
+negative information.
+
+**Verified**: 1420 passed, 1 skipped (+16 net, new
+`tests/test_wildcard_synthesis.py`: judged-secure-and-filed, sibling
+answered with zero queries, grandchild too (tree closure), TTL bounds,
+no-template and no-denial fall back, off-by-default, CD exempt, unstamped
+and expired-signature templates refused, forged answer files nothing and
+refuses, denial-first ordering, AD down for anchorless readers, SOA/NS never
+template, explicit answers never template, trace line). The fixture zone
+grew its `*.y.zone.test.` TXT branch on the chain's wrap edge (y → *.y →
+apex — canonical order preserved; every existing proof span unchanged —
+verified by the 47 existing wiring/aggressive tests passing untouched apart
+from the `_walk(aggressive=)` kwarg). `ruff check`/`format` clean,
+`mypy namespy` exits 0. Roadmap: the wildcard row and the aggressive row's
+remaining clause closed.
+
+**Next, in order** (non-DNSSEC now — the aggressive pair is complete):
+(1) 8767 serve-stale — check first whether the existing EDE 2/22 code means
+the row predates implementation or the feature is genuinely unbuilt;
+(2) 7828/9210 TCP connection reuse with edns-tcp-keepalive; (3) 6841 0x20
+QNAME-case entropy; (4) 9824 compact NSEC3 digest RR types; (5) 10001 §4.2
+address families; (6) 8509/9535 anchor maintenance; (7) 9364/9904/9905/9906
+algorithm set; (8) 5891/3492 IDNA (P2 — the largest); (9) 9471 §3 referral
+TC; (10) 8145 §5 #kt (optional); the P4 rows await a decline decision.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

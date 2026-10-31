@@ -62,7 +62,7 @@ from socket import gaierror
 from typing import NamedTuple
 
 from . import enable_path_mtu_discovery
-from .aggressive import synthesize_denial
+from .aggressive import synthesize
 from .bundle import (
     BundledType,
     BundleResult,
@@ -72,7 +72,7 @@ from .bundle import (
     query_option_for,
 )
 from .cache import FailureCache, MemoryDnsCache, NegativeEntry, PositiveEntry
-from .dnssec import DNSSEC_SECURITY_TYPES
+from .dnssec import DNSSEC_SECURITY_TYPES, signed_owner_name
 from .edns import (
     MQTYPE_QUERY_OPTION_CODE,
     extended_error_presentation,
@@ -1058,6 +1058,23 @@ class AggressiveDenial:
     name: str
     proven_by: str
     kind: str
+
+
+@dataclass(frozen=True)
+class WildcardSynthesis:
+    """A cached wildcard answered this name, and the closer-match proof vouched (RFC 8198 §5.3).
+
+    The positive sibling of :class:`AggressiveDenial`, and harder to see from
+    the packet alone: a synthesised answer is byte-honest -- the authority's
+    own records and signature, the Labels field carrying the match's proof --
+    yet no query revealed the name. The event names the template the answer
+    was expanded from, which is where an operator tracing "why does this name
+    exist in my cache and not on any wire" will look first, and the only place
+    the walk says so.
+    """
+
+    name: str
+    via: str
 
 
 @dataclass(frozen=True)
@@ -2192,33 +2209,35 @@ def resolve_steps(
                     )
                     return
             if aggressive_nsec and not client_cd:
-                # RFC 8198 Appendix A ¶1's second check, run in its stated place:
-                # before any query, does a cached proof deny this name? The CD
-                # exemption rides with it -- "unless the CD bit was set on the
-                # incoming query" is Appendix A's own clause, and §3.2.2¶3's
-                # "should not interfere" says the same in this server's voice:
-                # a client that validates for itself asked for the wire, not for
-                # an inference, however well the inference was proven.
-                for candidate in cache.denial_candidates(sname.qname, sname.qclass):
-                    response = synthesize_denial(
-                        candidate,
-                        sname,
-                        now=clock,
-                        remaining=int(
-                            max(0.0, candidate.expires_at - cache.time_fn())
-                        ),  # the cache's own clock owns entry expiry; `clock` answers RRSIGs
-                        dnssec_ok=dnssec_ok,
-                        assert_ad=sec_validator is not None,
-                    )
-                    if response is None:
-                        continue
-                    kind = "nxdomain" if response.RCODE == DnsResponseCode.NAME_ERROR else "nodata"
-                    yield AggressiveDenial(str(sname.qname), str(candidate.name), kind)
-                    if kind == "nxdomain":
+                # RFC 8198 Appendix A ¶1's second check, run in its stated
+                # place: before any query, does a cached proof -- a denial's
+                # NSEC/NSEC3 span or a validated wildcard template -- resolve
+                # this name? The CD exemption rides with it: "unless the CD
+                # bit was set on the incoming query" is Appendix A's own
+                # clause, and §3.2.2¶3's "should not interfere" says the same
+                # in this server's voice -- a client that validates for itself
+                # asked for the wire, not for an inference, however well the
+                # inference was proven. `synthesize` tries the denials first
+                # and the wildcard after; either yields a response and names
+                # the cache material it stood on.
+                synthesis = synthesize(
+                    cache,
+                    sname,
+                    now=clock,
+                    dnssec_ok=dnssec_ok,
+                    assert_ad=sec_validator is not None,
+                )
+                if synthesis is not None:
+                    if synthesis.kind == "wildcard":
+                        yield WildcardSynthesis(str(sname.qname), synthesis.proven_by)
+                        yield Answer(synthesis.response.answers)
+                    elif synthesis.kind == "nxdomain":
+                        yield AggressiveDenial(str(sname.qname), synthesis.proven_by, "nxdomain")
                         yield Nxdomain()
                     else:
-                        yield Nodata(candidate.soa)
-                    yield Done(response)
+                        yield AggressiveDenial(str(sname.qname), synthesis.proven_by, "nodata")
+                        yield Nodata(synthesis.soa)
+                    yield Done(synthesis.response)
                     return
         if failures is not None:
             blocked = failures.match(sname.qname, sname.qtype, sname.qclass)
@@ -2847,6 +2866,78 @@ def _chain_is_live(records, now) -> bool:
     )
 
 
+def _cache_wildcard_template(cache, sname, response, now) -> None:
+    """Store the wildcard an expanded answer came through, if it came through one.
+
+    RFC 4035 §4.5¶4 spells this entry out by name: "By using the RRSIG record,
+    it is possible to deduce that an answer was synthesized from a wildcard.
+    A security-aware recursive name server could store this wildcard data and
+    use it to generate positive responses to queries other than the name for
+    which the original answer was first received." The deduction is the Labels
+    field (§4.5¶4's "by using the RRSIG record"): a signature taken through a
+    wildcard carries the wildcard's label count, one short of the expanded
+    owner's -- the same arithmetic §5.4¶3 reads on the NSEC side and
+    ``_validate_wildcard`` read at judgment time, and the name is rebuilt the
+    identical way with ``signed_owner_name``.
+
+    It reads the wire packet, not the cached entry, because the entry is the
+    *queried* name's data without its signature (AD rides the stamp); the
+    answer section is where the covering RRSIG still sits beside the records it
+    signed. The records are then stored at the wildcard's own name, which is
+    who they really belong to -- the wire's owner is a presentation of an
+    expansion this entry will use for other names too, and the signature was
+    computed over the wildcard's canonical RRset. Two types never template: a
+    wildcard owning SOA "can never be a source of synthesis" (RFC 4592 §4.1¶1)
+    and a wildcard owning NS has semantics RFC 4592 §4.2¶3 leaves deliberately
+    undefined. The gate is the caller's ``validated``: an answer this resolver
+    judged secure is the only warrant a template needs -- the judgment already
+    verified the closer-match proof (§5.3.4) for these exact bytes.
+    """
+    qtype = int(sname.qtype)
+    if response is None or qtype in (int(DnsRType.SOA), int(DnsRType.NS)):
+        return
+    data = [r for r in response.answers if int(r.rtype) == qtype]
+    sigs = [
+        r
+        for r in response.answers
+        if int(r.rtype) == int(DnsRType.RRSIG)
+        and int(getattr(r.rdata, "type_covered", 0) or 0) == qtype
+    ]
+    if not data or not sigs:
+        return
+    sig = sigs[0].rdata
+    owner = data[0].name
+    try:
+        wildcard, from_wildcard = signed_owner_name(owner, int(sig.labels))
+    except ValueError:
+        return  # Labels exceeds the owner's count: a signature over nothing anyone named
+    if not from_wildcard:
+        # Equal counts mean the name signed itself: the answer is this name's,
+        # not a wildcard's, and nothing wider may be deduced from it (§5.4¶3's
+        # "wildcard expansion could not have been used").
+        return
+    template = [
+        DnsRecord(wildcard, r.rtype, r.rclass, r.ttl, rdata=r.rdata) for r in (*data, *sigs)
+    ]
+    ttl = min(int(getattr(r, "ttl", 0) or 0) for r in template)
+    if ttl <= 0:
+        return
+    existing = cache.get(wildcard, qtype, sname.qclass)
+    if isinstance(existing, PositiveEntry) and existing.expires_at >= now + ttl:
+        return  # a live template -- or the name's own explicit answer -- already speaks
+    cache.put(
+        PositiveEntry(
+            wildcard,
+            qtype,
+            sname.qclass,
+            template,
+            now + ttl,
+            authoritative=True,  # the zone signed this RRset at this owner name
+            validated=True,
+        )
+    )
+
+
 def _cache_chain(cache, material, now) -> None:
     """File the lookup's verified chain material, one atomic entry per RRset.
 
@@ -2962,6 +3053,8 @@ def _write_cache(cache, sname, terminal_event, response, validated=False):
                 validated=validated,
             )
         )
+        if validated:
+            _cache_wildcard_template(cache, sname, response, now)
         return
     if isinstance(terminal_event, Nodata):
         ttl = _negative_ttl_seconds(terminal_event.soa)
