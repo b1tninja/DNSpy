@@ -1665,6 +1665,61 @@ part of (1), then 6841, 9824, 10001, 8509/9535, 9364/9904/9905/9906, IDNA,
 9471, 8145 §5; 9539 §4 opportunistic encryption reuses the same transports
 pointed at the authority leg, later than the stub's use of them.
 
+### Follow-up: DNS over TLS for the stub, paced by edns-tcp-keepalive (RFC 7858, RFC 7828)
+
+Increment B of the stub track. `--stub-transport dot` (or an
+`Upstream(transport="dot")`) now forwards over TLS, and the connection it
+opens is a *session*: held across queries, paced by the keepalive option,
+remembered when it fails.
+
+Shipped: `Upstream` gains `transport="dot"` (default port 853 per §3.1¶1,
+with §3.1¶2's "MUST NOT be port 53" respected by construction -- TLS is
+chosen by transport name, never guessed onto 53) and `server_name`, the
+identity the certificate must answer to, written `1.2.3.4:853#dns.example`.
+Authentication is the door, not a knob: this build declines §4.1's
+unauthenticated profile outright (privacy without identity on an attackable
+path feeds a stub any answer, and cleartext transports exist for operators
+who mean that), so `dot` without a name is a startup sentence, and the
+handshake rides `ssl.create_default_context` -- BCP195's posture -- through
+the `_tls_context()` seam where an application adds its enterprise CA the
+same way the tests add their generated cert.
+
+Reuse is §3.4's: one `_Session` per upstream -- reader, writer, lock, idle
+timer -- registered at connect, so a concurrent query waits on the session's
+lock instead of opening a rival handshake (§3.3¶2's pipelining left
+unexercised deliberately: one exchange at a time discharges §3.3¶3's
+matching duty by ID alone, and a stub's tail latency belongs to its
+client). The framing moved to the base as `_stream_exchange` -- the walk's
+TCP fallback and the TLS sessions speak §3.3¶1's one-write length prefix
+through the same code.
+
+RFC 7828 gives the idle life: the empty request option (§3.2.1¶4's MUST,
+`keepalive_option()`) rides every stream query; `keepalive_of()` reads the
+response across 4-octet, draft-era 1-octet, empty and absent forms, keeping
+0 distinct from None; `_idle_seconds` honours the offer, floors it at 2 s
+(reuse renewed per-query is a handshake tax with none of the benefit),
+defaults it to 30; TIMEOUT 0 closes now (§3.2.2¶3). §3.1¶4's memory:
+handshake failures, refusals and timeouts remember an upstream for an hour
+-- the paragraph's own example -- and `forward` skips it silently until the
+deadline; a live answer clears the note, and a session that merely died
+idle mid-queue re-opens invisibly with one retry.
+
+**Verified**: 1471 passed, 1 skipped (+14: `tests/test_stub_dot.py` -- a
+real TLS server on loopback with a `cryptography`-generated day-cert,
+skip-gated on the extra: round-trip RD/intact over TLS, the empty option
+observed server-side, sequential and concurrent reuse (connections == 1),
+zero-closes/offered-held/floor-held/default-held, name mismatch fails
+closed *and stays remembered* (no second SYN), 853 defaults, the full
+option parse table). `ruff`/`format`/`mypy` clean. Roadmap: the 7858 row to
+done; a new 7828/9210 row opened at 🟡 (stub transports done, walk TCP
+reuse and server-side keepalive remain).
+
+**Next, in order**: (1) **DoH** (RFC 8484) -- `application/dns-message`
+over HTTP/2; the honest decision is stdlib-versus-extra, made when writing
+it; (2) the 7828 row's remaining halves; (3) the earlier list as it fits --
+6841, 9824, 10001, 8509/9535, 9364/9904/9905/9906, IDNA, 9471, 8145 §5;
+9539 §4 reuses these transports on the authority leg, later.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

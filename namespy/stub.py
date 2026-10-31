@@ -42,23 +42,66 @@ division: the list arrives from outside, validated as literals at the door.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import ipaddress
 import logging
+import ssl
 
+from .edns import keepalive_of, keepalive_option
 from .enums import DnsRClass, DnsResponseCode, DnsRType
 from .names import DomainName
-from .packet import DnsRecord
+from .packet import EDNS_DO_BIT, DnsRecord, Query
 from .rdata import RData_A, RData_AAAA
 from .resolver import Resolver
 
 LOGGER = logging.getLogger("namespy.stub")
 
-#: The transports this build can speak to a recursive server. "dot" (RFC 7858)
-#: and "doh" (RFC 8484) join the tuple as their transports land; refusing an
-#: unimplemented name at the door of :class:`Upstream` is kinder than
-#: accepting a configuration that would fail mid-query.
-TRANSPORTS: tuple[str, ...] = ("udp", "tcp")
+#: The transports this build can speak to a recursive server. "doh" (RFC 8484)
+#: joins the tuple when its HTTP layer lands; refusing an unimplemented name
+#: at the door of :class:`Upstream` is kinder than accepting a configuration
+#: that would fail mid-query.
+TRANSPORTS: tuple[str, ...] = ("udp", "tcp", "dot")
+
+#: The port each transport defaults to, when the configuration text names no
+#: port: 53 for the two cleartext forms, 853 for DNS over TLS -- RFC 7858
+#: §3.1's "By default, a DNS client desiring privacy from DNS over TLS ...
+#: MUST establish a TCP connection to port 853", and its warning that a
+#: negotiated alternative "MUST NOT be port 53" is why the dot default could
+#: not simply inherit 53.
+DEFAULT_PORTS = {"udp": 53, "tcp": 53, "dot": 853}
+
+#: RFC 7828 §3.2.2's default idle horizon when a keepalive conversation
+#: happened but named no timeout, and the floor below which even an offered
+#: timeout is not trusted (a server offering 1 second makes reuse a
+#: round-trip tax for nothing). §3.4¶2's "some amount of time" is this
+#: build's reading of it; §6's 30 seconds is the same number, arrived at
+#: independently.
+_KEEPALIVE_DEFAULT_S = 30.0
+_KEEPALIVE_FLOOR_S = 2.0
+
+#: RFC 7858 §3.1¶4's "reasonable period (such as one hour per server)" for
+#: remembering a server that refused DNS over TLS -- timeout, refusal, or a
+#: handshake that ended in failure, all three saying the same thing about
+#: this host. One hour is the document's own example and this build's
+#: constant: long enough that a lookup storm does not re-pound a dead 853,
+#: short enough that a fixed server is reachable again the same working day.
+_DOT_REMEMBER_S = 3600.0
+
+
+def _idle_seconds(timeout: int | None) -> float:
+    """How long a stream may rest after an answer offering *timeout*.
+
+    The whole of RFC 7828 §3.2.2's client arithmetic, spelled once: none
+    offered (or nothing usable in the option) rides the conservative default,
+    an offered number is honoured -- except below :data:`_KEEPALIVE_FLOOR_S`,
+    where reuse would cost a handshake per lookup and the server's offer is
+    declined in favour of the floor. A ``0`` never arrives here: §3.2.2¶3's
+    close-now is a decision the caller acts on before arming anything.
+    """
+    if timeout is None:
+        return _KEEPALIVE_DEFAULT_S
+    return max(float(timeout), _KEEPALIVE_FLOOR_S)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,55 +110,77 @@ class Upstream:
 
     *host* is an IP literal -- the stub does not resolve its own bootstrap
     servers, which is the same reason the root hints are addresses rather
-    than names. *port* leaves 53 for the plain transports; the encrypted
-    transports' defaults (853, 443) belong to the transports, not to this
-    record. *transport* is validated against :data:`TRANSPORTS` at
-    construction so a typo is a startup sentence, not a silent fallback.
+    than names. *port* defaults by transport (:data:`DEFAULT_PORTS`): 53
+    clear, 853 for ``dot``. *transport* is validated against
+    :data:`TRANSPORTS` at construction so a typo is a startup sentence, not a
+    silent fallback.
+
+    *server_name* is the identity a ``dot`` connection authenticates: RFC
+    7858 §3.2¶1 sends the client through [BCP195]'s best practices, whose
+    first practice is validating the certificate against the name the client
+    meant to reach -- and an IP literal cannot be that name. The host stays
+    an address (the thing to connect to) while this carries the name (the
+    thing to believe); configuration text supplies both, ``#``-joined:
+    ``1.2.3.4:853#dns.example.net``. An unauthenticated ``dot`` upstream is
+    refused at the door: privacy without authentication is the profile
+    §4.1 sketches, but this build declines to be the way into it -- the
+    on-path attacker that profile tolerates can feed a stub any answer, and
+    an operator who wants that has the cleartext transports to say it with.
     """
 
     host: str
-    port: int = 53
+    port: int | None = None
     transport: str = "udp"
+    server_name: str | None = None
 
     def __post_init__(self) -> None:
         ip = ipaddress.ip_address(self.host)  # ValueError is the right refusal
         object.__setattr__(self, "host", str(ip))  # one canonical text form
-        port = int(self.port)
-        if not 0 < port <= 65535:
-            raise ValueError(f"upstream port {self.port!r} is not a usable port number")
-        object.__setattr__(self, "port", port)
         if self.transport not in TRANSPORTS:
             raise ValueError(
                 f"unknown upstream transport {self.transport!r}; "
                 f"this build forwards over {', '.join(TRANSPORTS)}"
+            )
+        port = DEFAULT_PORTS[self.transport] if self.port is None else int(self.port)
+        if not 0 < port <= 65535:
+            raise ValueError(f"upstream port {self.port!r} is not a usable port number")
+        object.__setattr__(self, "port", port)
+        if self.transport == "dot" and not self.server_name:
+            raise ValueError(
+                f"dot upstream {self.host}:{port} names no server to authenticate; "
+                "append #<name> to the configuration text"
             )
 
     @classmethod
     def parse(cls, text: str) -> Upstream:
         """Read one upstream from configuration text.
 
-        ``1.0.0.1``, ``1.0.0.1:5353``, ``2606:4700:4700::1001`` and
+        ``1.0.0.1``, ``1.0.0.1:5353``, ``2606:4700:4700::1001``,
         ``[2606:4700:4700::1001]:853`` -- brackets around the IPv6 wherever a
-        port follows, because a colon is otherwise doing two jobs.
+        port follows, because a colon is otherwise doing two jobs -- and
+        ``<address>#<name>`` to add the identity a ``dot`` transport
+        authenticates.
         """
         text = text.strip()
+        address, _, tls_name = text.partition("#")
+        name = tls_name.strip() or None
         port: int | None = None
-        if text.startswith("["):
-            host, sep, rest = text[1:].partition("]")
+        if address.startswith("["):
+            host, sep, rest = address[1:].partition("]")
             if not sep:
                 raise ValueError(f"unbalanced brackets in upstream {text!r}")
             if rest:
                 if not rest.startswith(":"):
                     raise ValueError(f"expected ':' before the port in upstream {text!r}")
                 port = _parse_port(rest[1:], text)
-        elif text.count(":") == 1:
-            host, _, digits = text.partition(":")
+        elif address.count(":") == 1:
+            host, _, digits = address.partition(":")
             port = _parse_port(digits, text)
         else:
-            host = text
+            host = address
         if port is None:
-            return cls(host=host)
-        return cls(host=host, port=port)
+            return cls(host=host, server_name=name)
+        return cls(host=host, port=port, server_name=name)
 
 
 def _parse_port(digits: str, text: str) -> int:
@@ -138,6 +203,54 @@ def _host_address_record(host: str) -> DnsRecord:
     if ip.version == 6:
         return DnsRecord(root, DnsRType.AAAA, DnsRClass.IN, 0, rdata=RData_AAAA(ip))
     return DnsRecord(root, DnsRType.A, DnsRClass.IN, 0, rdata=RData_A(ip))
+
+
+class _Session:
+    """One held TCP (or TLS) stream to an upstream, and its idle life.
+
+    A connection is shared, never snatched: the lock admits one exchange at
+    a time (the conservative reading of RFC 7828 §3.3¶3's matching duties --
+    every response that arrives is the answer to the query whose lock this
+    is, or the stream is discarded), and :attr:`timer` is RFC 7828 §3.2.2¶2's
+    "initiate close of the connection before the timeout expires", armed from
+    the server's offered TIMEOUT (floored at :data:`_KEEPALIVE_FLOOR_S`,
+    defaulted to :data:`_KEEPALIVE_DEFAULT_S`) after each answer. A waiter
+    that finds the session closed on winning the lock has lost it to the
+    timer, not to the server -- its caller re-opens rather than failing.
+    """
+
+    __slots__ = ("closed", "lock", "reader", "timer", "writer")
+
+    def __init__(self, reader, writer):
+        self.reader = reader
+        self.writer = writer
+        self.lock = asyncio.Lock()
+        self.timer: asyncio.TimerHandle | None = None
+        self.closed = False
+
+    def arm_idle(self, seconds: float, loop) -> None:
+        self.cancel_idle()
+        self.timer = loop.call_later(seconds, self._on_idle)
+
+    def _on_idle(self) -> None:
+        self.timer = None
+        self.close_now()
+
+    def cancel_idle(self) -> None:
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+    def close_now(self) -> None:
+        self.closed = True
+        self.cancel_idle()
+        writer, self.writer = self.writer, None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as exc:  # best-effort teardown, said not raised
+                LOGGER.debug("stub_stream_close_failed(err=%s)", type(exc).__name__)
+                del exc
 
 
 class StubResolver(Resolver):
@@ -186,6 +299,19 @@ class StubResolver(Resolver):
         self._v6_ready = None
         self.upstreams = tuple(Upstream.parse(u) if isinstance(u, str) else u for u in upstreams)
         self.dnssec_ok = bool(dnssec_ok)
+        #: Held ``dot`` streams, keyed by the upstream they belong to. One
+        #: connection per upstream: RFC 7858 §3.4¶1-¶2 asks for exactly this
+        #: reuse "to avoid excess TCP connections, each with a single query",
+        #: and a stub whose every client lookup re-hands-hakes TLS is the
+        #: implementation that paragraph was written against.
+        self._sessions: dict[Upstream, _Session] = {}
+        #: RFC 7858 §3.1¶4's memory of servers that refused DNS over TLS --
+        #: keyed by upstream, valued by the monotonic deadline before which
+        #: retrying is rude. Only ``dot`` failures earn a note: a dead UDP
+        #: upstream is retried because the next packet may simply be the one
+        #: that gets through, while a TLS handshake that completed badly has
+        #: told us something durable about this host.
+        self._dot_dead: dict[Upstream, float] = {}
         if edns_payload_size is not None:
             self.edns_payload_size = int(edns_payload_size)
         if query_timeout is not None:
@@ -202,7 +328,22 @@ class StubResolver(Resolver):
         feeding a walk would want and nothing else.
         """
         refused = None
+        now = asyncio.get_running_loop().time()
         for upstream in self.upstreams:
+            deadline = self._dot_dead.get(upstream)
+            if deadline is not None:
+                if now < deadline:
+                    # §3.1¶4: this host said it cannot do TLS recently
+                    # enough that asking again is re-pounding a door we
+                    # know is shut. Silence here is the remembered answer.
+                    self.log.debug(
+                        "stub_dot_remembered_dead(host=%s port=%d retry_in=%.0fs)",
+                        upstream.host,
+                        upstream.port,
+                        deadline - now,
+                    )
+                    continue
+                del self._dot_dead[upstream]
             response = await self._ask(upstream, questions, rd=rd, client_cd=client_cd)
             if response is None:
                 self.log.debug(
@@ -228,13 +369,163 @@ class StubResolver(Resolver):
         kwargs = {"RD": rd}
         if client_cd:
             kwargs["CD"] = True
+        if upstream.transport == "dot":
+            return await self._ask_dot(upstream, questions, **kwargs)
         return await self.query(
             list(questions),
             None,
             _host_address_record(upstream.host),
             port=upstream.port,
             force_tcp=upstream.transport == "tcp",
+            # edns-tcp-keepalive belongs to stream transports only: RFC 7828
+            # §3.2.1¶1 forbids it in a UDP query ("MUST ignore" is the
+            # server's half of the same sentence, §3.3.1¶1, and this client
+            # does not make servers do paperwork). The udp transport's TCP
+            # *fallback* goes without the option -- that connection is
+            # opened to rescue one answer, not arranged for a future, and
+            # §3.2.1¶2's permission to signal a desire to hold a connection
+            # is not an obligation to invent one mid-fallback.
+            extra_edns_options=(keepalive_option(),) if upstream.transport == "tcp" else (),
             **kwargs,
+        )
+
+    async def _ask_dot(self, upstream, questions, **kwargs):
+        """One query over a held TLS stream: §3.3's framing, §3.4's reuse.
+
+        The composition is the same ``Query`` + EDNS advertisement the
+        cleartext transports send -- a TLS answer is a DNS answer -- and the
+        *stream* is the stub's, outliving the exchange. Reuse is eager and
+        shared: the session lives in the map from the moment it connects, so
+        a second concurrent query finds it and *waits on its lock* rather
+        than opening a rival connection (RFC 7858 §3.4¶1: reuse one
+        connection, don't pile them up); §3.3¶2's preference for pipelining
+        over waiting is left unexercised deliberately -- with one exchange
+        in flight per stream, §3.3¶3's matching duty is dischargeable by ID
+        alone, and a stub's tail latency is its client's.
+        After the answer the idle timer is re-armed with whatever RFC 7828
+        says: the server's offered TIMEOUT (floored at
+        :data:`_KEEPALIVE_FLOOR_S`), or :data:`_KEEPALIVE_DEFAULT_S` when it
+        named none or the conversation did not happen; a TIMEOUT of 0 closes
+        now (§3.2.2¶3's "send no more queries on that connection").
+
+        Failures split the way §3.1¶4 splits them: a connection or handshake
+        that never came up marks this upstream dead for
+        :data:`_DOT_REMEMBER_S`, because that is the document's own remedy
+        for servers that "don't support DNS over TLS"; a stream that died
+        while it waited its turn (the idle timer fired mid-queue) is
+        invisible -- one fresh attempt, then success, or silence. A live
+        answer always clears the dead-note: it is the retry the paragraph
+        intends.
+        """
+        dns_packet = Query(questions=list(questions), **kwargs)
+        if self.edns_payload_size:
+            dns_packet.add_edns(
+                int(self.edns_payload_size),
+                options=(keepalive_option(),),
+                flags=EDNS_DO_BIT if self.dnssec_ok else 0,
+            )
+        wire = bytes(dns_packet)
+        for attempt in (1, 2):
+            session = self._sessions.get(upstream)
+            if session is not None and session.closed:
+                self._drop_session(upstream, session)
+                session = None
+            fresh = session is None
+            if fresh:
+                try:
+                    session = await self._dot_connect(upstream)
+                except Exception as exc:
+                    self._note_dot_dead(upstream, exc)
+                    return None
+                self._sessions[upstream] = session
+            try:
+                async with session.lock:
+                    if session.closed:
+                        # idle-timed-out (or died) while this call queued for
+                        # the lock -- a network event, not a server statement
+                        raise ConnectionError("session ended before its turn")
+                    pkt = await self._stream_exchange(
+                        session.reader, session.writer, wire, dns_packet, upstream.host
+                    )
+                    if pkt is None:
+                        raise ConnectionError("upstream answered something else")
+                    timeout = keepalive_of(pkt.edns_options())
+                    if timeout == 0:
+                        self._drop_session(upstream, session)
+                    else:
+                        session.arm_idle(_idle_seconds(timeout), asyncio.get_running_loop())
+            except Exception as exc:
+                self._drop_session(upstream, session)
+                if fresh:
+                    self._note_dot_dead(upstream, exc)
+                    return None
+                if attempt == 2:
+                    self.log.debug(
+                        "stub_dot_stream_failed(host=%s port=%d err=%s)",
+                        upstream.host,
+                        upstream.port,
+                        type(exc).__name__,
+                    )
+                    return None
+                continue  # the shared session died mid-queue: retry on a fresh one
+            self._dot_dead.pop(upstream, None)  # a live answer clears the note
+            return pkt
+        return None  # unreachable: both attempts return or continue above
+
+    def _drop_session(self, upstream, session) -> None:
+        """Retire *session*, and only it, from the reuse map."""
+        if self._sessions.get(upstream) is session:
+            del self._sessions[upstream]
+        session.close_now()
+
+    async def _dot_connect(self, upstream) -> _Session:
+        """TLS to an authenticated name: BCP195, exactly as §3.2¶1 prescribes.
+
+        :func:`ssl.create_default_context` *is* BCP195's default posture
+        (protocol floor, chain validation, hostname match), and
+        ``server_hostname`` carries the identity the certificate must answer
+        to -- §5's requirement that the server "be authenticated based on
+        its presented certificate" against the name the configuration
+        intended, not the address it happened to reach.
+        """
+        context = self._tls_context()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                upstream.host,
+                upstream.port,
+                ssl=context,
+                server_hostname=upstream.server_name,
+            ),
+            timeout=self.query_timeout,
+        )
+        self.log.debug(
+            "stub_dot_connected(host=%s port=%d name=%s)",
+            upstream.host,
+            upstream.port,
+            upstream.server_name,
+        )
+        return _Session(reader, writer)
+
+    def _tls_context(self) -> ssl.SSLContext:
+        """The trust the ``dot`` transport extends.
+
+        A method rather than a call site because trust is exactly the part
+        an application must be able to edit: a stub behind an enterprise
+        TLS-inspecting resolver loads its private CA the same way a test
+        loads the certificate it generated, and both want BCP195's settings
+        around that extra root rather than instead of them. Subclasses add
+        their cafile; the checks stay on.
+        """
+        return ssl.create_default_context()
+
+    def _note_dot_dead(self, upstream, exc) -> None:
+        self._dot_dead[upstream] = asyncio.get_running_loop().time() + _DOT_REMEMBER_S
+        self.log.debug(
+            "stub_dot_unavailable(host=%s port=%d err=%s remembered=%ds)",
+            upstream.host,
+            upstream.port,
+            type(exc).__name__,
+            int(_DOT_REMEMBER_S),
         )
 
     async def aclose(self) -> None:
@@ -242,6 +533,10 @@ class StubResolver(Resolver):
         task, self._v6_ready = self._v6_ready, None
         if task is not None and not task.done():
             task.cancel()
+        for session in self._sessions.values():
+            session.close_now()
+        self._sessions.clear()
+        self._dot_dead.clear()
         for transport in (self.transport, self.transport_v6):
             if transport is not None:
                 try:

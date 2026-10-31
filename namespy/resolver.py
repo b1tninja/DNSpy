@@ -733,21 +733,7 @@ class Resolver(asyncio.Protocol):
             )
             return None
         try:
-            writer.write(struct.pack("!H", len(wire)) + wire)
-            await writer.drain()
-            nbuf = await asyncio.wait_for(reader.readexactly(2), timeout=self.query_timeout)
-            (n,) = struct.unpack("!H", nbuf)
-            data = await asyncio.wait_for(reader.readexactly(n), timeout=self.query_timeout)
-            (pkt, _off) = DnsPacket.parse(data)
-            if int(pkt.ID) != int(query_packet.ID) or not _is_expected_response(
-                query_packet, pkt, host
-            ):
-                self.log.warning("resolver_tcp_response_mismatch(dst=%s id=%s)", host, pkt.ID)
-                return None
-            self.log.debug(
-                "resolver_tcp_ok(dst=%s id=%s rcvd_len=%d)", host, getattr(pkt, "ID", -1), len(data)
-            )
-            return pkt
+            pkt = await self._stream_exchange(reader, writer, wire, query_packet, host)
         except Exception as e:
             self.log.debug(
                 "resolver_tcp_failed(dst=%s id=%s err=%s)",
@@ -765,6 +751,41 @@ class Resolver(asyncio.Protocol):
                 # connection down (a server that RSTs instead of finishing the
                 # close) must not turn a good response into an error.
                 self.log.debug("resolver_tcp_close_failed(err=%s)", type(exc).__name__)
+        return pkt
+
+    async def _stream_exchange(self, reader, writer, wire, query_packet, host):
+        """One length-prefixed exchange on an already-open stream.
+
+        RFC 1035 section 4.2.2's two-octet framing, with the prefix and the
+        message written in a single call: RFC 7766 section 8 and RFC 7828
+        section 3.3 paragraph 1 both ask for one TCP segment rather than a
+        two-segment message whose first octet a network could, in principle,
+        deliver alone. The answer is checked against *query_packet* exactly
+        as a UDP answer is -- RFC 7828 section 3.3 paragraph 3 states the
+        matching duty for shared connections, and even on a connection used
+        once a middlebox, a stale pipelined response or a broken ID field can
+        hand back something that is not the answer to this question.
+
+        The caller owns the stream and its teardown; this method only reads
+        and writes, raising whatever the transport raises (or returning
+        ``None`` for an answer that fails matching) for the caller to turn
+        into its own failure path.
+        """
+        writer.write(struct.pack("!H", len(wire)) + wire)
+        await writer.drain()
+        nbuf = await asyncio.wait_for(reader.readexactly(2), timeout=self.query_timeout)
+        (n,) = struct.unpack("!H", nbuf)
+        data = await asyncio.wait_for(reader.readexactly(n), timeout=self.query_timeout)
+        (pkt, _off) = DnsPacket.parse(data)
+        if int(pkt.ID) != int(query_packet.ID) or not _is_expected_response(
+            query_packet, pkt, host
+        ):
+            self.log.warning("resolver_tcp_response_mismatch(dst=%s id=%s)", host, pkt.ID)
+            return None
+        self.log.debug(
+            "resolver_tcp_ok(dst=%s id=%s rcvd_len=%d)", host, getattr(pkt, "ID", -1), len(data)
+        )
+        return pkt
 
     # -- the UDP receive plumbing. On the base, not on :class:`RecursiveResolver`,
     # because :meth:`query` above is written against it and a stub resolver (see

@@ -585,8 +585,9 @@ def build_parser():
         default=[],
         help="forward the query to a recursive server instead of walking from the "
         "root (RFC 1034 section 5.3.1, the stub resolver): UPSTREAM is an address "
-        "literal, optionally with :port; repeat the flag for backups, which are "
-        "asked in order. A REFUSED answer means this upstream declined the "
+        "literal, optionally :port and optionally #<name> (the identity a TLS "
+        "upstream is authenticated against); repeat the flag for backups, which "
+        "are asked in order. A REFUSED answer means this upstream declined the "
         "recursive arrangement, so the next is asked; every other answer comes "
         "back exactly as it arrived. Requires --serve to be absent.",
     )
@@ -598,7 +599,10 @@ def build_parser():
         help="transport for --forward upstreams (default: udp). udp retries the "
         "way every DNS answer is retried -- a timeout or a truncated answer is "
         "asked again over TCP (RFC 1035 section 4.2.2, RFC 7766); tcp asks over "
-        "TCP first. Only meaningful with --forward.",
+        "TCP first and asks to keep the connection idle when the server will "
+        "(RFC 7828); dot is DNS over TLS (RFC 7858, default port 853) with the "
+        "server authenticated against its #<name>. Only meaningful with "
+        "--forward.",
     )
     p.add_argument(
         "--mqtype",

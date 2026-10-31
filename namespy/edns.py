@@ -94,6 +94,8 @@ __all__ = [
     "ERROR_OPTION_CODE",
     "EXTENDED_ERROR_INFO_OCTETS",
     "EXTENDED_ERROR_PRIVATE_USE_MIN",
+    "KEEPALIVE_OPTION_CODE",
+    "KEEPALIVE_TIMEOUT_OCTETS",
     "KEY_TAG_OCTETS",
     "KEY_TAG_OPTION_CODE",
     "MAX_EDNS_OPTION_OCTETS",
@@ -138,6 +140,25 @@ NSID_OPTION_CODE = 3
 
 #: OPTION-CODE 10, "DNS Cookie" (RFC 7873 section 8).
 COOKIE_OPTION_CODE = 10
+
+#: OPTION-CODE 11, "edns-tcp-keepalive" (RFC 7828 section 4.1, registered by
+#: section 5). The *request* form is empty -- section 3.2.1's para 4 "Clients
+#: MUST specify an OPTION-LENGTH of 0 and omit the TIMEOUT value", the client
+#: asks whether the server will hold the connection, without presuming an
+#: answer -- while the *response* carries a TIMEOUT: 4 octets of seconds in
+#: this build (section 3.1 para 3's allowance for a 1-octet draft-era form is
+#: read at the parse door, not smuggled into the type). It is a TCP-only
+#: conversation: 3.2.1 para 1 forbids the option in UDP queries and 3.2.2
+#: para 1 tells a client to ignore it on a UDP response, which is why this
+#: package offers it to :mod:`namespy.stub`'s TCP transports and never to a
+#: datagram.
+KEEPALIVE_OPTION_CODE = 11
+
+#: OCTETS in a response's TIMEOUT field (RFC 7828 section 3.1 para 1: "a
+#: 32-bit TIMEOUT field"). A length-0 option is the response form that means
+#: "keepalive supported, no timeout offered" -- section 3.2.2 para 3's
+#: reading of TIMEOUT 0, close now, is reached through the same parse.
+KEEPALIVE_TIMEOUT_OCTETS = 4
 
 #: OPTION-CODE 12, "EDNS Padding" (RFC 7830 section 3 assigns it; section 5 is
 #: the IANA record).
@@ -219,6 +240,7 @@ COOKIE_MAX_OCTETS = 40
 _OPTION_NAMES = {
     NSID_OPTION_CODE: "NSID",
     COOKIE_OPTION_CODE: "COOKIE",
+    KEEPALIVE_OPTION_CODE: "edns-tcp-keepalive",
     PADDING_OPTION_CODE: "PADDING",
     KEY_TAG_OPTION_CODE: "edns-key-tag",
     ERROR_OPTION_CODE: "EDE",
@@ -498,6 +520,47 @@ def nsid_of(options) -> bytes | None:
     """
     option = find_option(options, NSID_OPTION_CODE)
     return None if option is None else option.data
+
+
+def keepalive_option() -> EdnsOption:
+    """A client's edns-tcp-keepalive: the empty request form, always.
+
+    RFC 7828 section 3.2.1 paragraph 4: "Clients MUST specify an
+    OPTION-LENGTH of 0 and omit the TIMEOUT value." The client does not
+    negotiate a lifetime from its side -- it asks whether the server will
+    hold the connection, and the server's response answers with the number.
+    Callers that reach for this on a UDP query are breaking paragraph 1's
+    MUST NOT; the TCP transports in :mod:`namespy.stub` are its only
+    intended users, and the timeout is read back with :func:`keepalive_of`.
+    """
+    return EdnsOption(KEEPALIVE_OPTION_CODE, b"")
+
+
+def keepalive_of(options) -> int | None:
+    """The TIMEOUT the server offered, or ``None`` when it offered nothing.
+
+    Three sentences of RFC 7828 section 3.2.2 compose this reading. A
+    response carrying no such option after a query that asked means "assume
+    the server does not support keepalive" (paragraph 4) -- ``None``, and the
+    caller behaves per RFC 7766, closing when idle. A zero-length option is a
+    server that speaks keepalive without naming a lifetime -- also ``None``,
+    but a caller may still hold the connection on its own conservative
+    timer. A TIMEOUT of 0 is paragraph 3's "send no more queries on that
+    connection" and reads here as ``0``, distinct from both. A 4-octet
+    TIMEOUT is this build's own number; section 3.1 paragraph 3's allowance
+    for a 1-octet draft-era timeout is read too, since a server written
+    against the draft exists in the world and one more octet width costs one
+    more line, not one more concept. Any other length is a server that said
+    something unparseable, which is exactly "nothing offered".
+    """
+    option = find_option(options, KEEPALIVE_OPTION_CODE)
+    if option is None or option.data == b"":
+        return None
+    if len(option.data) == KEEPALIVE_TIMEOUT_OCTETS:
+        return int.from_bytes(option.data, "big")
+    if len(option.data) == 1:
+        return int(option.data[0])
+    return None
 
 
 def nsid_presentation(data: bytes) -> str:
