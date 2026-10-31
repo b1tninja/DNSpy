@@ -1278,6 +1278,79 @@ which is the precondition 9908 §5's caveats assume); (3) wildcard *synthesis*
 from cache (roadmap §4's ⬜ row) can reuse the per-lookup store question
 finally settled earlier.
 
+### Follow-up: key-tag signalling — RFC 8145's option 14, played three ways (§4.1-§4.3, §7; RFC 4033 §2; RFC 4034 App. B)
+
+**Requested**: the first item of the previous "Next" — the walk's helper DNSKEY
+queries now know which zones they ask, and that knowledge is exactly what
+`edns-key-tag` asks a querier to have.
+
+**Read first, and it corrected an assumption**: §4's option is *telemetry*, not
+a fetch directive — a signal of which KSKs the validator already pins so zone
+operators can time a rollover (§7¶1). The subsetting mechanism people
+misattribute to it is §5's Key Tag Query (the `#kt` QNAME scheme), a different
+tool this increment deliberately does not build. §4.3 asks a responder for two
+things only: it MAY log the tags, and §4.3¶2's MUST NOT forbids putting the
+option in any response.
+
+**Delivered**: the codec (`KEY_TAG_OPTION_CODE` 14, `key_tag_option`,
+`key_tag_lists`, `key_tags_of`, `MAX_KEY_TAGS = 32` in `namespy/edns.py`) —
+instances kept separate because §4.2.2.1¶2 transmits own and client lists as
+"separate instances of the edns-key-tag option code", flattening reserved for
+the copier's §4.2.2.2 reading; the cap taken seriously per §4.2.2.1¶3 with
+§7¶3's "made up" tags as its reason. `Validator.key_tags_for(zone)` reads
+exactly §4.2¶3's two admitted sources — anchors in either RFC 4033 §2 shape,
+and DS records the descent collected — and nothing else, because §4.2¶6's MUST
+NOT is not manners: a tag lifted from an answer's DNSKEY would put a forged
+key's number into data an operator acts on. The walk then plays three roles:
+**querier** — chain-fetch DNSKEYs carry the validator's own list (§4.2.2.1¶1),
+DS fetches carry nothing (§4.2¶2, the option's only truly universal rule);
+**copier** — a client's list rides the zone's own hop, as a second instance
+behind a differing own list in the section's example order (§4.2.2.1¶2) or
+alone when this server validates nothing (§4.2.2.2); **silent responder** —
+reply OPTs are built from the response's own news, so §4.3¶2 holds by
+construction. The plumbing gained `SendQuery.extra_edns_options` and a
+per-request `client_key_tags` beside `client_cd`, extracted from the
+initiating packet the same way.
+
+**The hop gate (§4.2¶3's quiet requirement)**: the list is "the KSK(s) of the
+zone *for which the server is authoritative*", and an iterative walk can point
+at that server before the answer only where the queried name is the zone
+itself — so the root routing a DNSKEY question for zone.test. carries no list,
+and §7¶2 (listeners infer validators from lists) says why that restraint is
+not fussiness. Refused on purpose: §4.2.2.1¶3's MAY to combine tags across
+concurrent queries — it would make the server a store of who-knows-what, and
+per-request copying is the only claim the document says a recursive resolver
+owns.
+
+**Findings along the way**: (1) inbound leniency decided against the module's
+own FORMERR ledger — COOKIE and EDE have length rules *their documents* state;
+8145 orders no rejection (§4.2¶7: "no action needs to be taken"), so a
+malformed instance reads as no list rather than refusing a query nobody meant
+to break — the reasoning recorded in `_edns_options_or_error`. (2) Two test
+fakes monkeypatched onto `_send_for_entry` pinned its three-parameter shape;
+the widened call surfaced them, and both were updated rather than the driver
+compensated — the signature is the honest interface. (3) The
+`entry.zone == sname.qname` gate means a DNSKEY query for a *non-apex* name
+carries no list even at the zone hop — the walk does not know which zone will
+answer authoritatively for such a name until it does, and guessing is the
+"made up" error in a different costume.
+
+**Verified**: 1376 passed, 1 skipped (+17 net, new `tests/test_edns_keytag.py`:
+codec shapes and the §4.1 figure, cap, empty/out-of-range refusal,
+instance-preservation and flattening, malformed-as-nothing, claims from
+DS-anchors, DNSKEY-anchors, and descent-collected DS only, dedup, the copy
+gate, two-instance forwarding and its identical-list collapse, helper lists
+per zone with the DS query silent, packet extraction end-to-end, responder
+silence), `ruff check`/`format` clean, `mypy namespy` exits 0.
+
+**Next, in order**: (1) aggressive NSEC caching (RFC 9908 — the denials now
+carry verdicts, which is the precondition 9908 §5's caveats assume);
+(2) wildcard *synthesis* from cache (roadmap §4's ⬜ row) can reuse the
+per-lookup store question finally settled earlier; (3) §5's Key Tag Query
+(`#kt`) remains unbuilt — reachable now if a deployment ever wants subsetting
+rather than signalling, and its §5.2 querier rules mirror what this round
+already knows how to compute.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

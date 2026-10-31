@@ -74,6 +74,8 @@ from .edns import (
     MQTYPE_QUERY_OPTION_CODE,
     extended_error_presentation,
     extended_errors_of,
+    key_tag_option,
+    key_tags_of,
     nsid_of,
     nsid_presentation,
 )
@@ -935,6 +937,15 @@ class SendQuery:
     #: resolution step, for the same reason ``probe`` does: a reader counting queries
     #: should be able to count them *by purpose*.
     helper: bool = False
+    #: EDNS(0) options belonging to *this* query alone, appended after the
+    #: resolver's instance-wide ones. The key tag list of RFC 8145 is the tenant:
+    #: §4.2¶2 ties the edns-key-tag option to one question type -- "MUST NOT
+    #: include ... for non-DNSKEY queries" -- so a resolver-wide setting could
+    #: only either leak the option onto every query or never send it, and both
+    #: answers are wrong. The same per-question logic that keeps ``extra_qtypes``
+    #: off glue sub-walks and minimisation probes keeps this off them too: those
+    #: questions are the walk's own, not the client's.
+    extra_edns_options: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1765,6 +1776,7 @@ def resolve_steps(
     anchors: tuple = (),
     now: float | None = None,
     client_cd: bool = False,
+    client_key_tags: tuple = (),
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1818,6 +1830,23 @@ def resolve_steps(
     could serve it, and the failure is noted -- RFC 9520 §3.4 turned 4035 §4.7's
     MAY into a MUST, with §3.2's backoff as the TTL guidance, which is the
     amplification guard §4.7¶4 wanted.
+
+    ``client_key_tags`` is the key-tag list from the initiating query's
+    edns-key-tag option(s) (RFC 8145), and it travels for exactly one question
+    type: §4.2¶2's "MUST NOT include the edns-key-tag option for non-DNSKEY
+    queries" gates it, and nothing else in a lookup of any other type could use
+    it anyway. Even among DNSKEY queries it rides only the hop whose server is
+    the zone's own -- §4.2¶3 wants the tags of the KSKs of "the zone for which
+    the server is authoritative", and before the answer arrives the walk can
+    know that only where the queried name is the zone itself. On the hops it
+    does ride, the two forwarding rules of §4.2.2 apply: a validating
+    recursive server sends its own list and the client's as separate instances
+    when they differ (§4.2.2.1¶2, own list first as in the section's example),
+    and one that validates nothing copies the client's list as an act of
+    respect for "the wishes of the validating downstream resolver" (§4.2.2.2).
+    The chain fetches the validator makes for itself carry only its own list:
+    those answers judge this resolver's chain, and a client's tags say something
+    about the client that a parent's name server has no use hearing second-hand.
 
     ``nxdomain_cut`` decides whether a denial cached at or above the name may
     answer for it without a query (RFC 8020 §2 -- see :class:`NxdomainPolicy`). It
@@ -1960,7 +1989,26 @@ def resolve_steps(
             if server is None:
                 return verdict
             fetches += 1
-            reply = yield SendQuery(server, [DnsQuestion(name, rtype, sname.qclass)], helper=True)
+            helper_options = ()
+            if int(rtype) == int(DnsRType.DNSKEY):
+                # RFC 8145 §4.2.2.1¶1: "a recursive resolver SHOULD include the
+                # edns-key-tag option in its DNSKEY queries as described above" --
+                # and "above" is §4.2¶3, whose only admitted sources are this
+                # validator's anchors and the zone's DS records, which is exactly
+                # what key_tags_for reads (§4.2¶6's MUST NOT forbids more). The
+                # client's list is deliberately absent here: this answer judges
+                # the walk's own chain and never reaches the client, so the
+                # client's tags would be second-hand telemetry at a server the
+                # client will never ask directly.
+                tags = sec_validator.key_tags_for(name)
+                if tags:
+                    helper_options = (key_tag_option(tags),)
+            reply = yield SendQuery(
+                server,
+                [DnsQuestion(name, rtype, sname.qclass)],
+                helper=True,
+                extra_edns_options=helper_options,
+            )
             _offer(from_zone, reply)
             sec_validator.invalidate()
 
@@ -2121,7 +2169,40 @@ def resolve_steps(
             questions = sname.questions
             bundle = extra_qtypes
         attempted.add(entry.zone)
-        response = yield SendQuery(entry, questions, probe=probe is not None, extra_qtypes=bundle)
+        query_options: tuple = ()
+        if probe is None and int(sname.qtype) == int(DnsRType.DNSKEY) and entry.zone == sname.qname:
+            # Two gates before the stance. RFC 8145 §4.2¶2: the option is for
+            # DNSKEY queries and nothing else (a §9156 probe is QTYPE=A, so it
+            # never carries one). And §4.2¶3 describes the list as "the Key
+            # Tag(s) of the KSK(s) of the zone *for which the server is
+            # authoritative*" -- which on a walk from the roots is true of one
+            # hop only, the zone's own server. Sending zone.test.'s tags to a
+            # root server that is merely routing the question would answer a
+            # question nobody there is asking. Then the stance: with anchors,
+            # this server's own list goes first and the client's follows as a
+            # second instance, which is §4.2.2.1¶2's transmitted shape ("the
+            # two Key Tag lists using separate instances of the edns-key-tag
+            # option code"); with none, the client's list rides as §4.2.2.2
+            # asks a non-validating recursive resolver to copy it.
+            own_opt = None
+            client_opt = None
+            if sec_validator is not None:
+                own = sec_validator.key_tags_for(sname.qname)
+                own_opt = key_tag_option(own) if own else None
+            if client_key_tags:
+                client_opt = key_tag_option(tuple(client_key_tags))
+                if own_opt is not None and own_opt.data == client_opt.data:
+                    # §4.2.2.1¶2 conditions the two-list forwarding on a list
+                    # "that differs from its own"; identical lists travel once.
+                    client_opt = None
+            query_options = tuple(o for o in (own_opt, client_opt) if o is not None)
+        response = yield SendQuery(
+            entry,
+            questions,
+            probe=probe is not None,
+            extra_qtypes=bundle,
+            extra_edns_options=query_options,
+        )
         if sec_validator is not None:
             # Every response is evidence, whatever the walk makes of it: a referral's
             # authority section carries the child's DS under the parent's signature
@@ -3280,14 +3361,14 @@ class RecursiveResolver(Resolver):
             additional_records=additional_records,
         )
 
-    async def _send_for_entry(self, entry, questions, extra_qtypes=()):
+    async def _send_for_entry(self, entry, questions, extra_qtypes=(), edns_options=()):
         """Send the query to this entry, trying all known addresses."""
         if not entry.addresses:
             return None
 
         ns_record = DnsRecord(entry.zone, DnsRType.NS, DnsRClass.IN, 0, rdata=entry.ns)
 
-        extra_options = ()
+        extra_options = tuple(edns_options)
         if extra_qtypes:
             primary = getattr(questions[0], "qtype", None) if questions else None
             try:
@@ -3357,7 +3438,7 @@ class RecursiveResolver(Resolver):
                 extended_error_presentation(error),
             )
 
-    async def _drive(self, gen, trace, depth=0, client_cd=False):
+    async def _drive(self, gen, trace, depth=0, client_cd=False, client_key_tags=()):
         """Pump the resolve_steps generator and fulfill its effects.
 
         *depth* bounds sub-resolutions (a glueless NS whose address must itself be
@@ -3371,7 +3452,11 @@ class RecursiveResolver(Resolver):
         request that exempts the outer answer from validation and cache writes
         exempts the address of the nameserver that answers it too, and a
         sub-resolution that silently re-imposed the validating stance would
-        change the client's request halfway down.
+        change the client's request halfway down. *client_key_tags* inherits the
+        same reasoning -- it is carried down for completeness and honesty about
+        whose request a sub-walk serves, though RFC 8145 §4.2¶2's type gate means
+        it can only ever ride on a DNSKEY question, which glue lookups (A and
+        AAAA) never are.
         """
         if depth > self.max_depth:
             self.log.debug("resolver_depth_exceeded(depth=%d limit=%d)", depth, self.max_depth)
@@ -3385,7 +3470,12 @@ class RecursiveResolver(Resolver):
             trace.record(step)
 
             if isinstance(step, SendQuery):
-                sent = await self._send_for_entry(step.entry, step.questions, step.extra_qtypes)
+                sent = await self._send_for_entry(
+                    step.entry,
+                    step.questions,
+                    step.extra_qtypes,
+                    edns_options=step.extra_edns_options,
+                )
                 if isinstance(sent, Response):
                     # RFC 4035 §4.6¶3: "A resolver MUST disregard the meaning of
                     # the CD and AD bits in a response unless the response was
@@ -3437,9 +3527,14 @@ class RecursiveResolver(Resolver):
                         dnssec_ok=self.dnssec_ok,
                         anchors=self.trust_anchors,
                         client_cd=client_cd,
+                        client_key_tags=client_key_tags,
                     )
                     sub_response = await self._drive(
-                        sub_gen, child_trace, depth + 1, client_cd=client_cd
+                        sub_gen,
+                        child_trace,
+                        depth + 1,
+                        client_cd=client_cd,
+                        client_key_tags=client_key_tags,
                     )
                     if not isinstance(sub_response, Response):
                         continue
@@ -3540,6 +3635,15 @@ class RecursiveResolver(Resolver):
             self.last_trace = trace
         slist = self.sbelt.copy_for(sname)
         client_cd = bool(getattr(dns_packet, "CD", False))
+        # The initiating query's edns-key-tag instance(s), flattened per
+        # key_tags_of's reading of RFC 8145 §4.2.2.2. A walk started from a name
+        # rather than a client packet -- the CLI, a library caller, a glue
+        # sub-resolution -- has no packet options and so sends no list of its
+        # own beyond the validator's, which is §4.2.1.2's MUST NOT for a
+        # non-validating stub honoured by construction: there is no downstream
+        # validator here whose wishes could be copied.
+        packet_options = getattr(dns_packet, "edns_options", None)
+        client_key_tags = key_tags_of(packet_options()) if packet_options is not None else ()
         gen = resolve_steps(
             sname,
             slist,
@@ -3554,8 +3658,11 @@ class RecursiveResolver(Resolver):
             dnssec_ok=self.dnssec_ok,
             anchors=self.trust_anchors,
             client_cd=client_cd,
+            client_key_tags=client_key_tags,
         )
-        response = await self._drive(gen, self.last_trace, client_cd=client_cd)
+        response = await self._drive(
+            gen, self.last_trace, client_cd=client_cd, client_key_tags=client_key_tags
+        )
         if isinstance(response, Response):
             response.ID = dns_packet.ID
             # RFC 4035 §3.2.2¶2: "The name server side MUST copy the setting of

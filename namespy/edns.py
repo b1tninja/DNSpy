@@ -94,8 +94,11 @@ __all__ = [
     "ERROR_OPTION_CODE",
     "EXTENDED_ERROR_INFO_OCTETS",
     "EXTENDED_ERROR_PRIVATE_USE_MIN",
+    "KEY_TAG_OCTETS",
+    "KEY_TAG_OPTION_CODE",
     "MAX_EDNS_OPTION_OCTETS",
     "MAX_EXTENDED_ERROR_CODE",
+    "MAX_KEY_TAGS",
     "MQTYPE_QUERY_OPTION_CODE",
     "MQTYPE_RESPONSE_OPTION_CODE",
     "NSID_OPTION_CODE",
@@ -110,6 +113,9 @@ __all__ = [
     "extended_error_presentation",
     "extended_errors_of",
     "find_option",
+    "key_tag_lists",
+    "key_tag_option",
+    "key_tags_of",
     "nsid_of",
     "nsid_option",
     "nsid_presentation",
@@ -136,6 +142,30 @@ COOKIE_OPTION_CODE = 10
 #: OPTION-CODE 12, "EDNS Padding" (RFC 7830 section 3 assigns it; section 5 is
 #: the IANA record).
 PADDING_OPTION_CODE = 12
+
+#: OPTION-CODE 14, "edns-key-tag" (RFC 8145 section 4.1, registered by section 6).
+#: Its payload is one or more 16-bit key tags, and RFC 8145 is emphatic about what
+#: the list *is*: the tags of the trust anchors or DS-pinned KSKs the querier
+#: already holds -- a signal of what the validator knows, so zone operators can
+#: time a key rollover -- and emphatic about what it is not: a fetch directive
+#: (§4.3 asks a responder for nothing but a MUST NOT on putting it in responses).
+#: The option belongs on DNSKEY queries only (§4.2¶2's MUST NOT covers everything
+#: else), and a query may carry several instances, one per list (§4.2.2.1¶2).
+KEY_TAG_OPTION_CODE = 14
+
+#: Octets in one KEY-TAG value (RFC 8145 section 4.1¶5: "One or more 16-bit Key
+#: Tag values"), which is also why an odd-length option is malformed rather than
+#: merely short -- half a tag is not a tag.
+KEY_TAG_OCTETS = 2
+
+#: A limit on the key tags one outgoing option carries, because RFC 8145
+#: section 4.2.2.1¶3 makes the recommendation and section 7¶3 supplies the motive:
+#: the tags "might be 'made up' by some DNS clients with malicious, or at least
+#: mischievous, intentions", inflated lists being the published way to stall a
+#: rollover. Thirty-two is roomy for a real validator -- a zone rolls one or two
+#: KSKs at a time, and trust-anchor files count in single digits -- while a
+#: four-octet tag makes the worst case a tidy 64 octets of OPT RDATA.
+MAX_KEY_TAGS = 32
 
 #: OPTION-CODE 15. RFC 8914 section 5.1 registers it as "Extended DNS Error", and
 #: section 2 then calls it EDE throughout ("The Extended DNS Error (EDE) option can
@@ -190,6 +220,7 @@ _OPTION_NAMES = {
     NSID_OPTION_CODE: "NSID",
     COOKIE_OPTION_CODE: "COOKIE",
     PADDING_OPTION_CODE: "PADDING",
+    KEY_TAG_OPTION_CODE: "edns-key-tag",
     ERROR_OPTION_CODE: "EDE",
     MQTYPE_QUERY_OPTION_CODE: "MQTYPE-Query",
     MQTYPE_RESPONSE_OPTION_CODE: "MQTYPE-Response",
@@ -478,6 +509,74 @@ def nsid_presentation(data: bytes) -> str:
     interpretation nobody had the standing to make.
     """
     return data.hex()
+
+
+def key_tag_option(values) -> EdnsOption:
+    """Pack key tags into one edns-key-tag option (RFC 8145 §4.1).
+
+    Duplicates are folded and the list is capped at :data:`MAX_KEY_TAGS`, the
+    sender's side of §4.2.2.1¶3's recommendation; order is preserved, because a
+    validator's own list usually starts with the key it most recently rolled to
+    and a responder's logs read better when the wire says what the code meant.
+
+    Raises :exc:`ValueError` on an empty list -- §4.1¶5's figure says "one or
+    more", and an empty signal is not a partial one but a different statement,
+    the one §4.2¶2-¶6 frame as *sending no option at all*. Values outside the
+    16-bit field raise too: a tag is "[RFC4034] Appendix B" arithmetic, and
+    Appendix B cannot produce 65536.
+    """
+    tags: list[int] = []
+    for value in values:
+        tag = int(value)
+        if not 0 <= tag <= 0xFFFF:
+            raise ValueError(f"key tag {tag} outside the 16-bit field")
+        if tag not in tags:
+            tags.append(tag)
+    if not tags:
+        raise ValueError("edns-key-tag carries one or more key tags, not zero")
+    kept = tags[:MAX_KEY_TAGS]
+    return EdnsOption(KEY_TAG_OPTION_CODE, struct.pack(f"!{len(kept)}H", *kept))
+
+
+def key_tag_lists(options) -> tuple[tuple[int, ...], ...]:
+    """Every edns-key-tag instance, each list intact (RFC 8145 §4.2.2.1¶2).
+
+    Instances, not a flattening: a validating recursive server transmits its own
+    list and its client's as "separate instances of the edns-key-tag option
+    code", and a reader that merged them would report one validator where the
+    wire carries two. Malformed instances are skipped rather than
+    failing the message: §4.2¶7 tells a client that sees the option in the wrong
+    direction to ignore it, and an odd-length list in the right direction is
+    somebody's mistake about a 16-bit field, worth nothing on any response path.
+    """
+    lists = []
+    for option in options:
+        if option.code != KEY_TAG_OPTION_CODE:
+            continue
+        if not option.data or len(option.data) % KEY_TAG_OCTETS:
+            continue
+        tags = struct.unpack(f"!{len(option.data) // KEY_TAG_OCTETS}H", option.data)
+        lists.append(tags)
+    return tuple(lists)
+
+
+def key_tags_of(options) -> tuple[int, ...]:
+    """The union of every instance's tags, deduplicated and order-preserved.
+
+    The copier's reading: RFC 8145 §4.2.2.2 tells a non-validating recursive
+    resolver to copy "the edns-key-tag option seen in received queries", and a
+    copy of a two-instance list as one flattened instance says the same thing --
+    which tags the downstream validator knows -- without pretending the
+    distinction between two clients' lists that the flattening erases means
+    something to a responder. The §4.2.2.1 two-list shape needs
+    :func:`key_tag_lists` instead.
+    """
+    tags: list[int] = []
+    for one in key_tag_lists(options):
+        for tag in one:
+            if tag not in tags:
+                tags.append(tag)
+    return tuple(tags)
 
 
 def cookie_length_valid(length: int) -> bool:

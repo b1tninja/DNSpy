@@ -110,7 +110,7 @@ class FakeNetwork:
         #: have one, and reading the list is how that gets asserted.
         self.bundles = []
 
-    async def __call__(self, entry, questions, extra_qtypes=()):
+    async def __call__(self, entry, questions, extra_qtypes=(), edns_options=()):
         address = entry.addresses[0] if entry.addresses else None
         qname = questions[0].name
         self.sent.append((str(entry.ns), str(address)))

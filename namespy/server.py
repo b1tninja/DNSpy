@@ -547,7 +547,13 @@ class DnsServer(asyncio.Protocol):
         Everything else the query carried is dropped on the floor, which is the
         documented treatment of an option a responder has no behaviour for
         ("Any OPTION-CODE values not understood by a responder or requestor MUST
-        be ignored", RFC 6891 section 6.1.2). Padding is the interesting
+        be ignored", RFC 6891 section 6.1.2). The edns-key-tag option is the one
+        "else" that is understood and dropped anyway, because RFC 8145 section
+        4.3 paragraph 2 states it flatly: "A responder MUST NOT include the
+        edns-key-tag option in any DNS response" -- section 4.2.2.1 paragraph 5
+        says the same to a validating recursive server about its final response
+        to its client. The signal travels upstream and stops there. Padding is
+        the interesting
         case, because here the code *is* understood and the answer is still no:
         RFC 7830 section 4 makes padding a MUST for a responder that is asked,
         while section 6 forbids the option outright on a transport that is not
@@ -615,6 +621,15 @@ class DnsServer(asyncio.Protocol):
         NSID is opaque and any length is legal, and an unregistered code is not
         evaluated at all -- section 6.1.2's "MUST be ignored" covers its payload too,
         so refusing a private-code option for its contents would be inventing a rule.
+        A third modelled option could have joined the refusers: RFC 8145 section
+        4.1 paragraph 4 defines edns-key-tag's OPTION-LENGTH as "2 x number of
+        key-tag values present", so an odd length is arithmetic nobody meant -- but
+        the document orders no rejection anywhere (its only receiving instruction,
+        section 4.2 paragraph 7, is "no action needs to be taken and the client MUST
+        ignore"), so a malformed instance simply carries no list here
+        (:func:`~namespy.edns.key_tag_lists` skips it) and the query proceeds with
+        the tags that *were* readable. FORMERR for a signal the RFC lets a responder
+        only log would refuse service over a courtesy.
 
         MQTYPE (RFC 10029) is judged by its own document's list rather than by a
         length, because its option carries a *list* and the ways to get a list wrong

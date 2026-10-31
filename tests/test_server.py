@@ -299,7 +299,7 @@ async def test_recursive_walk_result_is_relayed_end_to_end():
     resolver = RecursiveResolver(cache=MemoryDnsCache())
     server, _resolver, transport = make_server(resolver=resolver)
 
-    async def authoritative(entry, questions, extra_qtypes=()):
+    async def authoritative(entry, questions, extra_qtypes=(), edns_options=()):
         return Response(
             ID=0,
             QR=DnsQR.RESPONSE,

@@ -403,6 +403,40 @@ class Validator:
                 ds_records.append(anchor.ds_record())
         return ds_records, keys
 
+    def key_tags_for(self, zone) -> tuple[int, ...]:
+        """The key tags this validator can honestly claim for *zone*'s KSKs (RFC 8145 §4.2¶3).
+
+        §4.2¶3 pins the source twice: the option "represents the Key Tag(s) of the
+        KSK(s) of the zone", "learned from the zone's DS record(s) (found in the
+        parent) or from a trust anchor", and §4.2¶6's MUST NOT closes the door
+        behind it -- tags for "keys that are not learned via either" belong nowhere
+        on the wire. That matters beyond manners: the list is rollover telemetry
+        (§7¶1), so a tag lifted from an answer's RRSIG or DNSKEY would launder a
+        forged key's number into data a zone operator acts on. So the sources are
+        exactly two -- the configured anchors, in both shapes RFC 4033 §2 allows (a
+        DS-shaped anchor brings its own tag; a DNSKEY-shaped one brings the tag of
+        the key itself, computed the same Appendix B way the DS's was), and whatever
+        the descent stored as this zone's DS RRset on its way down.
+
+        An empty tuple means *send nothing*: §4.2.2.1¶4 leaves a validator's own
+        DNSKEY query option-less when there is nothing to claim, and inventing a
+        placeholder would be exactly the "made up" tag §7¶3 warns the collector
+        about.
+        """
+        tags: list[int] = []
+        ds_anchors, key_anchors = self._trusted_for(zone)
+        for record in ds_anchors:
+            tags.append(record.key_tag)
+        for key in key_anchors:
+            tags.append(key.key_tag)
+        for ds in self.store.rdatas(zone, int(DnsRType.DS)):
+            tags.append(ds.key_tag)
+        seen: list[int] = []
+        for tag in tags:
+            if tag not in seen:
+                seen.append(tag)
+        return tuple(seen)
+
     def _verify(self, name, rtype: int, rdatas: tuple, keys, *, signer) -> tuple[str, str]:
         """Check one RRset's signatures under keys already known authentic.
 
