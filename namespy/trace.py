@@ -116,6 +116,11 @@ class Trace:
                 # whole difference between "proved" and "asserted", and an
                 # operator comparing two cuts reads the status first.
                 body.append(f"    Note over C: dnssec {ev.status}: {ev.zone}")
+            elif cn == "ChainFromCache":
+                # The absence of a query is otherwise invisible; this line is
+                # the only place a trace shows which chain leg the cache
+                # carried instead of the network.
+                body.append(f"    Note over C: chain from cache: {ev.qtype} {ev.name}")
             elif cn == "Demote":
                 ns = ev.entry.ns if ev.entry is not None else "?"
                 body.append(f"    Note over C: demote {ns} ({ev.reason})")

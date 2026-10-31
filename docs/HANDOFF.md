@@ -1434,6 +1434,66 @@ rather than per-lookup store — is the same data question viewed from
 validate.py's side; (3) RFC 8145 §5's Key Tag Query (`#kt`) remains unbuilt
 and optional.
 
+### Follow-up: chain records enter the cache — the §5.2¶6 fetches have somewhere to land (RFC 4035 §4.5, §5.2¶6; TTL-and-signature unity per 8198 §7)
+
+The validation-pipeline row's last clause was a door left open on purpose:
+"chain records live in a per-lookup store rather than the cache ... revisit if
+wildcard synthesis wants reused proofs." This is that revisit's first half —
+the data plumbing, without the synthesis yet.
+
+Shipped: a lookup whose verdict is secure files every DNSKEY and DS RRset it
+saw as an atomic entry (RFC 4035 §4.5¶1 — the RRset with its covering RRSIGs,
+min-TTL expiry, discarded whole), stamped `validated` because *this* resolver
+verified those exact bytes end to end a moment ago; the hint loop in
+`_fetch_chain` consults `cache.get(name, rtype, ...)` before its `SendQuery`,
+and a stamped entry whose every signature still covers the moment feeds the
+validator's store instead of the wire, traced as `ChainFromCache` — an
+absence of a query is otherwise invisible. The ledger (`sec_material`, filled
+in `_offer` beside the store) keeps what the store cannot: the store buckets
+rdatas and drops the TTLs a cache entry must carry.
+
+Three decisions the texts forced. (1) *The write gate is the secure verdict*:
+bogus verdicts refuse to cache anything (§4.7's BAD-entry cache is the
+optional one and this resolver does not exercise it), unvalidated walks never
+reach the ledger, and an Insecure verdict's chain evidence is one signed
+no-DS proof that already lives in its denial's bundle. (2) *The stamp
+licenses the load, never the verdict*: unstamped DNSKEY material — a client's
+own DNSKEY query having cached an answer — is refused as chain input because
+this validator never verified it (§4.3's states are the validator's answers,
+not the cache's), and even stamped material is re-verified signature-by-
+signature against this resolver's anchors when the chain runs, as always.
+(3) *Expiry is absence, never Bogus*: the signature-window read at load time
+is the two-clock filter named last round — cache clock, signature clock —
+and a stale cached key must send the walk back to the network (§9¶4's
+poisoned-long-TTL row), not convict a live zone. A fresher stamped entry is
+never aged out by a re-verification of the same bytes.
+
+**Verified**: 1404 passed, 1 skipped (+7 net, new `tests/test_chain_cache.py`:
+chain filed by a secure walk with atomic data+sig groups, second name in the
+zone climbs the cache with zero helpers and three packets, unstamped material
+refused, expired-signature-alive-TTL entry refused and re-fetched, bogus and
+unvalidated walks file nothing, writer unit seam (min-TTL, fresher guard,
+unsigned refusal), trace line), no existing test changed its expectation
+except the aggressive round's `len(cache) == 1`, which chain entries
+legitimately outgrew — rewritten to compare the baseline before and after the
+synthesising walk. `ruff check`/`format` clean, `mypy namespy` exits 0.
+
+**Next, in order**: (1) wildcard *synthesis* from cache (8198 §5.3, 4592) —
+now nearly reachable: chain material crosses lookups, but proof bundles still
+carry no wildcard RRsets, so the write side must start filing the template
+(`*.encloser` owner — §4.5¶4's own sentence: "a security-aware recursive name
+server could store this wildcard data and use it to generate positive
+responses") before the serving side can deduce from it; the RRSIG Labels
+field is the deduction (fewer labels than the expanded owner means
+synthesised); (2) RFC 8145 §5's Key Tag Query (`#kt`) remains unbuilt and
+optional; (3) then the non-DNSSEC rows in roadmap order — 7828/9210 TCP
+keepalive, 8767 serve-stale (check the existing EDE 2/22 code first, the row
+may predate it), 6841 0x20, 9824 compact digests, 10001 §4.2 families,
+8509/9535 maintenance, 9364/9904/9905/9906 algorithm set, 5891/3492 IDNA,
+9471 §3 — with the P4 experimental rows (DoT/DoH/DoQ forwarding, 9539 §4
+opportunistic encryption) awaiting an explicit decline or a forwarding mode.
+
+## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them
 (§3.4's combination), and now the client's half too — `RecursiveResolver.resolve_bundle`

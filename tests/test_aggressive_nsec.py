@@ -113,8 +113,13 @@ def test_a_validated_denial_denies_its_neighbours_name_without_a_query():
     assert int(DnsRType.NSEC) in types  # DO asked, so the proof rides (8020 §2¶5's habit)
 
     # And the synthesis wrote nothing back: one proof, one entry, no second
-    # generation of negative data to outlive the first.
-    assert len(cache) == 1
+    # generation of negative data to outlive the first. (The chain records the
+    # first walk filed are counted in the baseline -- what must not grow is a
+    # synthesised answer of the walk's own making.)
+    before = len(cache)
+    events_again = _aggr_walk(cache, "dog.zone.test.", responses=[], anchors=(wiring._anchor(),))
+    assert _aggressive(events_again) is not None
+    assert len(cache) == before
 
 
 @needs_tree

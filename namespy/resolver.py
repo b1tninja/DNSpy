@@ -85,7 +85,7 @@ from .edns import (
 from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType, is_data_rrtype
 from .minimis import QnameMinimiser
 from .names import DomainName
-from .nsec import collect_proof_records
+from .nsec import collect_proof_records, name_order_key
 from .packet import (
     EDNS_DO_BIT,
     OPT_RTYPE,
@@ -96,7 +96,7 @@ from .packet import (
     Query,
     Response,
 )
-from .rdata import RData_A, RData_AAAA, type_name_of
+from .rdata import RData_A, RData_AAAA, RData_RRSIG, type_name_of
 from .trace import Trace
 from .validate import SecurityStatus, ValidationVerdict, Validator
 
@@ -1079,6 +1079,25 @@ class DnssecVerdict:
 
 
 @dataclass(frozen=True)
+class ChainFromCache:
+    """A chain fetch the verdict demanded was answered by the cache, not the wire.
+
+    RFC 4035 §4.5's atomic-entry rule makes a validated chain record cacheable
+    like any other answer, and the walk files its DNSKEY and DS material under
+    a secure verdict precisely so the next lookup's §5.2¶6 fetches have
+    somewhere to land. The event reports what is otherwise an absence: a hint
+    satisfied without a :class:`SendQuery`, invisible in the trace and
+    indistinguishable in the answer. Naming the zone and type says which chain
+    leg the cache carried, which is the fact an operator comparing two walks'
+    query counts needs.
+    """
+
+    name: str
+    qtype: str
+    zone: str
+
+
+@dataclass(frozen=True)
 class Cname:
     """An alias was encountered; *target* must be re-anchored as the new SNAME.
 
@@ -1985,6 +2004,15 @@ def resolve_steps(
     #: the answer was supposed to be.
     sec_validator: Validator | None = None
     sec_servers: dict = {}
+    #: Chain-shaped records seen during this lookup -- DNSKEY and DS data with
+    #: the RRSIGs that cover them -- kept in arrival order beside the validator's
+    #: store because the store buckets rdatas and drops the TTLs a cache entry
+    #: must carry. A lookup that ends secure files these into the cache (RFC 4035
+    #: §4.5: helper queries are responses like any other, and §4.5¶1's atomic
+    #: entry is exactly an RRset travelling with its signatures), so the next
+    #: lookup's §5.2¶6 fetches consult data this resolver already verified
+    #: rather than re-climbing the chain from the root.
+    sec_material: dict = {}
     clock = now if now is not None else (cache.time_fn() if cache is not None else None)
     if anchors:
         sec_validator = Validator(anchors=tuple(anchors), now=clock)
@@ -1998,10 +2026,10 @@ def resolve_steps(
         """
         if sec_validator is None or reply is None:
             return
-        sec_validator.store.add(
-            [*reply.answers, *reply.nameservers, *reply.additional_records],
-            zone=zone,
-        )
+        arrived = [*reply.answers, *reply.nameservers, *reply.additional_records]
+        sec_validator.store.add(arrived, zone=zone)
+        for record in arrived:
+            _file_chain_record(sec_material, record)
         if server is not None:
             sec_servers.setdefault(str(DomainName(zone)), server)
 
@@ -2029,6 +2057,33 @@ def resolve_steps(
             if hint is None or fetches >= _MAX_SEC_FETCHES:
                 return verdict
             name, rtype, from_zone = hint
+            if cache is not None:
+                hit = cache.get(name, rtype, sname.qclass)
+                if (
+                    isinstance(hit, PositiveEntry)
+                    and getattr(hit, "validated", False)
+                    and _chain_is_live(hit.records, clock)
+                ):
+                    # The stamped, signature-live chain entry this resolver (or
+                    # one it trusts the cache of) verified before: §5.2¶6's MUST
+                    # is to *obtain* the record, and a cache the same validator
+                    # filled is obtaining. The validator will re-verify these
+                    # bytes against its own anchors as it always does -- the
+                    # stamp licenses the load, never the verdict -- and the
+                    # window check above is the load-time filter the two clocks
+                    # make necessary: an entry alive on the cache clock can carry
+                    # a signature that died on the signature's, and §4.5¶1's
+                    # discard-the-atomic-entry rule plus 8198 §7's "or signatures"
+                    # make the older of the two the usable life.
+                    fetches += 1
+                    sec_validator.store.add(hit.records, zone=from_zone)
+                    sec_validator.invalidate()
+                    yield ChainFromCache(
+                        str(DomainName(name)),
+                        getattr(DnsRType(int(rtype)), "name", str(rtype)),
+                        str(DomainName(from_zone)),
+                    )
+                    continue
             server = sec_servers.get(str(DomainName(from_zone)))
             if server is None:
                 return verdict
@@ -2444,13 +2499,22 @@ def resolve_steps(
                 and isinstance(step, (Answer, Nodata, Nxdomain))
                 and not (sec_validator is not None and client_cd)
             ):
+                validated_flag = bool(sec_verdict is not None and sec_verdict.ad_worthy)
                 _write_cache(
                     cache,
                     sname,
                     step,
                     response,
-                    validated=bool(sec_verdict is not None and sec_verdict.ad_worthy),
+                    validated=validated_flag,
                 )
+                if validated_flag and sec_material:
+                    # The verdict is secure and the chain it stood on is in
+                    # hand: file it (see `_file_chain_record`'s ledger and
+                    # `_cache_chain`'s rules). An insecure verdict writes
+                    # nothing -- its chain evidence is the signed no-DS proof,
+                    # and that already lives in the denial's bundle; a bogus
+                    # one never reaches here at all.
+                    _cache_chain(cache, sec_material, clock)
             if (
                 failures is not None
                 and isinstance(step, (Answer, Nodata, Nxdomain))
@@ -2708,6 +2772,125 @@ def _synthesize_response(sname, hit, dnssec_ok: bool = False, validated: bool = 
         questions=questions,
         nameservers=nameservers,
     )
+
+
+# ------------------------------------------------------------------ chain records (§4.5)
+#
+# RFC 4035 §4.5¶1 asks for the atomic entry -- the RRset and its signatures as
+# one cacheable unit, discarded whole when any part expires -- and every query
+# the walk sends, helper ones included, receives such a response. The chain
+# fetches §5.2¶6 demands are therefore cacheable like any other answer, and
+# the resolver's own secure verdicts are what license the write: these exact
+# bytes were verified against this resolver's anchors end to end a moment ago.
+
+#: The two RR types the authentication chain is made of: the DS that vouches
+#: for a zone's keys (RFC 4033 §5's first link) and the DNSKEY the signatures
+#: verify against. Proofs ride elsewhere (denial bundles), and NSEC3 needs no
+#: parameter record -- each NSEC3 carries its own (RFC 5155 §3).
+CHAIN_CACHE_TYPES: frozenset[int] = frozenset({int(DnsRType.DNSKEY), int(DnsRType.DS)})
+
+
+def _file_chain_record(material: dict, record) -> None:
+    """Add one chain-shaped record to the lookup's ledger, deduplicated.
+
+    Grouped by owner and the RRset it belongs to -- a DNSKEY/DS by its own
+    type, an RRSIG by its Type Covered, which is how §4.5¶1's atomic entry
+    reassembles: owner plus type is exactly the <QNAME, QTYPE> pair the entry
+    will be stored under, and the signature's owner is the RRset owner by
+    §3.1.1, so data and covering signatures meet in one group whatever zone
+    signed them (the DS at a cut is signed by the parent; the group is still
+    the DS's).
+    """
+    code = int(record.rtype)
+    if code in CHAIN_CACHE_TYPES:
+        group_type = code
+    elif code == int(DnsRType.RRSIG):
+        covered = int(getattr(record.rdata, "type_covered", 0) or 0)
+        if covered not in CHAIN_CACHE_TYPES:
+            return
+        group_type = covered
+    else:
+        return
+    slot = material.get((name_order_key(record.name), group_type))
+    if slot is None:
+        slot = material[(name_order_key(record.name), group_type)] = {
+            "name": record.name,
+            "rtype": group_type,
+            "rclass": record.rclass,
+            "records": [],
+            "seen": set(),
+        }
+    blob = bytes(record.rdata)
+    if blob not in slot["seen"]:
+        slot["seen"].add(blob)
+        slot["records"].append(record)
+
+
+def _chain_is_live(records, now) -> bool:
+    """Whether the group carries at least one RRSIG and every one still covers *now*.
+
+    Both halves bite. A group with no signature could not have passed the
+    verification whose verdict licenses the write, so its presence means
+    someone hand-built the entry -- unusable. A signature outside its window
+    ends the record's usable life however long its TTL runs: §4.5¶1 counts the
+    signatures as part of the atomic entry, and RFC 8198 §7's sentence says
+    "or signatures" for a reason §9¶4's poisoned-long-TTL scenario makes
+    practical. This is a window read, not a re-verification: the validator
+    still checks the bytes themselves when the chain next runs.
+    """
+    signatures = [record for record in records if int(record.rtype) == int(DnsRType.RRSIG)]
+    if not signatures:
+        return False
+    return all(
+        isinstance(record.rdata, RData_RRSIG) and record.rdata.within_validity(now)
+        for record in signatures
+    )
+
+
+def _cache_chain(cache, material, now) -> None:
+    """File the lookup's verified chain material, one atomic entry per RRset.
+
+    The gate is the caller's: it has just seen a secure verdict, which is what
+    makes these bytes ones this resolver verified, and the write stamps them so
+    the read side can tell verified material from some other client's DNSKEY
+    query that merely resolved. Unsigned groups are refused entry rather than
+    half-cached (§3.1.4¶2's DS-with-its-RRSIGs is the shape secure chains
+    arrive in). TTL is the group's own minimum -- §4.5¶1's atomic discard,
+    measured on the cache's clock; the signature window on the signature's
+    clock is filtered at load by `_chain_is_live`, the same two-clock honesty
+    the aggressive layer learned. A fresher stamped entry already filed for
+    the same RRset is kept: a lookup that re-verified nothing newer must not
+    age out data a later signature extends.
+    """
+    cache_now = cache.time_fn()
+    for slot in material.values():
+        records = slot["records"]
+        has_data = any(int(r.rtype) != int(DnsRType.RRSIG) for r in records)
+        if not has_data or not _chain_is_live(records, now):
+            continue
+        ttl = min(int(getattr(r, "ttl", 0) or 0) for r in records)
+        if ttl <= 0:
+            continue
+        owner = slot["name"]
+        rclass = slot["rclass"]
+        existing = cache.get(owner, slot["rtype"], rclass)
+        if (
+            isinstance(existing, PositiveEntry)
+            and getattr(existing, "validated", False)
+            and existing.expires_at >= cache_now + ttl
+        ):
+            continue
+        cache.put(
+            PositiveEntry(
+                owner,
+                slot["rtype"],
+                rclass,
+                records,
+                cache_now + ttl,
+                authoritative=True,  # it came straight from the zone that signs it
+                validated=True,
+            )
+        )
 
 
 def _negative_ttl_seconds(soa_record):
