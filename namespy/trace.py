@@ -74,6 +74,8 @@ class Trace:
                 qtype = ev.questions[0].qtype if ev.questions else None
                 qtype_name = getattr(qtype, "name", str(qtype))
                 marker = " (probe)" if getattr(ev, "probe", False) else ""
+                if getattr(ev, "helper", False):
+                    marker += " (dnssec)"
                 # Counted, not named: this module deliberately dispatches on class names so
                 # it never has to import the resolver, and the type *names* would mean an
                 # import of the registry that knows them. The count is also the fact worth
@@ -101,6 +103,12 @@ class Trace:
                 # are indistinguishable, so this line is the only place the
                 # denied name and the ancestor that denied it appear together.
                 body.append(f"    Note over C: NXDOMAIN cut: {ev.name} below {ev.denied_by}")
+            elif cn == "DnssecVerdict":
+                # The verdict beside the zone that made the denial, ahead of the
+                # NXDOMAIN it judges: with anchors configured this line is the
+                # whole difference between "proved" and "asserted", and an
+                # operator comparing two cuts reads the status first.
+                body.append(f"    Note over C: dnssec {ev.status}: {ev.zone}")
             elif cn == "Demote":
                 ns = ev.entry.ns if ev.entry is not None else "?"
                 body.append(f"    Note over C: demote {ns} ({ev.reason})")

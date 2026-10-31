@@ -92,6 +92,7 @@ from .packet import (
 )
 from .rdata import RData_A, RData_AAAA, type_name_of
 from .trace import Trace
+from .validate import Validator
 
 LOGGER = logging.getLogger(__name__)
 
@@ -195,13 +196,15 @@ class NxdomainPolicy(enum.Enum):
 
     :attr:`VALIDATED` is §2¶3: "a validating resolver MAY decide to implement the
     'NXDOMAIN cut' behavior (described in the first paragraph of this section)
-    only when the NXDOMAIN response has been validated with DNSSEC". The validator
-    that answers that question exists (:class:`namespy.validate.Validator` -- the four
-    states of RFC 4035 §4.3), but the resolver walk does not yet fetch the DS and
-    DNSKEY RRsets it would need to answer it at cut time, so constructing this policy
-    raises instead of quietly behaving like :attr:`NEVER`. The two emit the same
-    packets, and a caller who asked for validated-only would have no way to tell
-    "the proofs did not check out" from "there is no verification at all".
+    only when the NXDOMAIN response has been validated with DNSSEC". The cut
+    requires the *remembered* verdict of :mod:`namespy.validate` -- the chain the
+    walk itself composed and judged under its ``trust_anchors`` when the denial
+    arrived, stamped into the entry's ``validated`` flag -- and unvalidated
+    entries, whether unsigned, bogus, or merely unjudgeable, are not cut: the
+    walk descends and asks, as :attr:`NEVER` does. It refuses construction
+    without trust anchors, because a validator with no trust point marks
+    everything unvalidated, and a policy doing that while named for proof would
+    be the silent fallback this door was first built to prevent.
 
     Three things no stance of this policy changes, in the same spirit as
     :class:`GluePolicy`:
@@ -221,8 +224,8 @@ class NxdomainPolicy(enum.Enum):
     #: Deny only the exact name cached; walk below it. Diagnostics only.
     NEVER = "never"
 
-    #: Cut only on DNSSEC-validated denials (RFC 8020 §2¶3). The walk cannot yet
-    #: produce a verdict at cut time, and refuses to be constructed until it can.
+    #: Cut only on DNSSEC-validated denials (RFC 8020 §2¶3). Requires
+    #: ``trust_anchors``; unvalidated entries are walked, never cut.
     VALIDATED = "validated"
 
 
@@ -280,6 +283,11 @@ class Resolver(asyncio.Protocol):
     #: it -- and a test that builds a bare ``Resolver()`` -- filters strictly.
     glue_policy = GluePolicy.STRICT
     nxdomain_cut = NxdomainPolicy.ALWAYS
+
+    #: Trust anchors the walk judges negative answers under; see
+    #: :meth:`RecursiveResolver.__init__`. Empty is the unvalidating default,
+    #: and the only one a bare ``Resolver()`` can honestly have.
+    trust_anchors = ()
 
     #: Optional DNS suffix the resolver assumes for *relative* names — those
     #: whose presentation form does not end in the root terminator (``.``).
@@ -919,6 +927,13 @@ class SendQuery:
     #: minimisation probe asks for a shorter child name whose answer says nothing about
     #: the extras' RRsets. Both build their own SendQuery, and neither passes this on.
     extra_qtypes: tuple = ()
+    #: True for a DNSSEC chain query -- the DS or DNSKEY a validation needs and the
+    #: walk did not already receive (RFC 4035 section 5.2 para 6 makes querying the
+    #: parent for an absent DS a MUST). The question is ordinary and the answer is
+    #: fed to no cache; the flag exists so a trace can tell a chain fetch from a
+    #: resolution step, for the same reason ``probe`` does: a reader counting queries
+    #: should be able to count them *by purpose*.
+    helper: bool = False
 
 
 @dataclass(frozen=True)
@@ -1002,6 +1017,24 @@ class NxdomainCut:
 
     name: str
     denied_by: str
+
+
+@dataclass(frozen=True)
+class DnssecVerdict:
+    """The validation layer's answer about a denial this lookup just received.
+
+    *status* is one of the RFC 4035 §4.3 states and *reason* the sentence that
+    explains it; *zone* is the apex whose keys the chain ended at. The event is
+    emitted only when the resolver has trust anchors configured, and it precedes
+    the ``Nxdomain``/``Nodata`` it judged, because that ordering is the argument:
+    "secure, therefore this NXDOMAIN may cut" (RFC 8020 §2¶3) or "insecure,
+    therefore it proves nothing" -- a verdict printed after the answer reads like
+    a comment on it rather than the reason for it.
+    """
+
+    zone: str
+    status: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -1612,6 +1645,14 @@ def classify(
     yield Done(response)
 
 
+#: How many chain queries a single validating lookup may send. The chain to the
+#: root is at most 127 labels and in practice four hops deep; eight missing records
+#: means something is deeply unusual, and a loop that kept asking was the failure
+#: mode this bound exists against -- the walk gives up and reports Indeterminate,
+#: which costs a re-ask later, never a spin now.
+_MAX_SEC_FETCHES = 8
+
+
 def resolve_steps(
     sname,
     slist,
@@ -1624,6 +1665,8 @@ def resolve_steps(
     failures=None,
     extra_qtypes: tuple = (),
     dnssec_ok: bool = False,
+    anchors: tuple = (),
+    now: float | None = None,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1642,6 +1685,20 @@ def resolve_steps(
     bare RCODE 3 (RFC 8020 §2¶5 makes those records part of the answer). It is the instance knob and
     not a client's DO bit: the walk has no client. What a particular client may see is decided once,
     on the way out, by :class:`namespy.server.DnsServer` -- see RFC 4035 §3.2.1.
+
+    ``anchors`` switches on validation of the negatives this walk receives: the
+    records every response carries are bucketed into one ``DnssecStore`` per walk
+    (a referral's DS rides along for free -- RFC 4035 §3.1.4 obliges signed
+    delegations to carry it), and a terminal denial is judged under the anchors by
+    ``namespy.validate``. Whatever the chain lacks is asked for, one query at a
+    time, of the zone that holds it -- §5.2¶6's "MUST query the name servers for
+    the parent zone for the DS RRset" is this loop's name -- and the verdict both
+    precedes the terminal event (a ``DnssecVerdict``) and travels into the cached
+    entry's ``validated`` flag, which is what :attr:`NxdomainPolicy.VALIDATED`
+    reads at the cut. Empty anchors, the default, keeps the walk exactly as it
+    was: gathering, judging, and stamping nothing. ``now`` pins the signature
+    window for the whole lookup; ``None`` takes the cache's clock, then the wall
+    clock.
 
     ``nxdomain_cut`` decides whether a denial cached at or above the name may
     answer for it without a query (RFC 8020 §2 -- see :class:`NxdomainPolicy`). It
@@ -1724,6 +1781,65 @@ def resolve_steps(
     #: Whether a denial cached above a name may answer for it (RFC 8020 §2).
     #: Decided once: a policy cannot change partway down a walk.
     cut_enabled = nxdomain_cut is NxdomainPolicy.ALWAYS
+    #: ...and whether such a cut additionally requires the remembered SECURE verdict
+    #: that only a validating walk writes (RFC 8020 §2¶3, NxdomainPolicy.VALIDATED).
+    require_validated = nxdomain_cut is NxdomainPolicy.VALIDATED
+
+    #: The evidence one lookup accumulates for :mod:`namespy.validate`, and the
+    #: servers of every zone it reached, kept so a chain fetch has somebody
+    #: authoritative to ask. The clock is pinned once per lookup: a climb that
+    #: straddled a signature window mid-way would judge the same bytes two ways
+    #: in one verdict, and RFC 4035 §5.3.1 offers no rule for which of the two
+    #: the answer was supposed to be.
+    sec_validator: Validator | None = None
+    sec_servers: dict = {}
+    if anchors:
+        clock = now if now is not None else (cache.time_fn() if cache is not None else None)
+        sec_validator = Validator(anchors=tuple(anchors), now=clock)
+
+    def _offer(zone, reply, server=None):
+        """File everything *reply* carried as the data of the zone that sent it.
+
+        *server* is the :class:`SlistEntry` it was asked of: the first server seen
+        for a zone is the one later chain fetches go to, because the walk has
+        already proved it answers for that zone.
+        """
+        if sec_validator is None or reply is None:
+            return
+        sec_validator.store.add(
+            [*reply.answers, *reply.nameservers, *reply.additional_records],
+            zone=zone,
+        )
+        if server is not None:
+            sec_servers.setdefault(str(DomainName(zone)), server)
+
+    def _fetch_chain(qname, qtype, rcode, zone):
+        """Judge *zone*'s denial of this name, fetching chain data as hints demand.
+
+        A generator because the fetching is the walk's own :class:`SendQuery`
+        effect: the verdict loop asks the driver, in the middle of this lookup,
+        for the DS or DNSKEY that RFC 4035 §5.2¶6 says a resolver MUST go and ask
+        for. Each hint is offered once per (name, type, zone) -- the
+        :class:`~namespy.validate.Validator`'s side of the bargain -- and
+        ``_MAX_SEC_FETCHES`` bounds the pathological zone besides. A hint whose
+        zone the walk never reached is terminal: DNS offers no way to ask
+        somebody else for authoritative data, and §4.3¶5's "not able to obtain"
+        is the honest end of that road.
+        """
+        fetches = 0
+        while True:
+            verdict = sec_validator.validate_denial(qname, qtype, rcode=rcode, zone=zone)
+            hint = verdict.fetch_hint
+            if hint is None or fetches >= _MAX_SEC_FETCHES:
+                return verdict
+            name, rtype, from_zone = hint
+            server = sec_servers.get(str(DomainName(from_zone)))
+            if server is None:
+                return verdict
+            fetches += 1
+            reply = yield SendQuery(server, [DnsQuestion(name, rtype, sname.qclass)], helper=True)
+            _offer(from_zone, reply)
+            sec_validator.invalidate()
 
     def _remember(reason):
         """Note that this name cannot be resolved right now (RFC 9520 §3.2)."""
@@ -1752,8 +1868,8 @@ def resolve_steps(
                     yield Nodata(hit.soa)
                 yield Done(_synthesize_response(sname, hit, dnssec_ok))
                 return
-            if cut_enabled:
-                cut = _nxdomain_cut(cache, sname.qname, sname.qclass)
+            if cut_enabled or require_validated:
+                cut = _nxdomain_cut(cache, sname.qname, sname.qclass, require_validated)
                 if cut is not None:
                     # RFC 8020 §2¶1: the cached NXDOMAIN for an ancestor makes
                     # this name "unreachable", so the lookup ends here without
@@ -1834,6 +1950,13 @@ def resolve_steps(
             bundle = extra_qtypes
         attempted.add(entry.zone)
         response = yield SendQuery(entry, questions, probe=probe is not None, extra_qtypes=bundle)
+        if sec_validator is not None:
+            # Every response is evidence, whatever the walk makes of it: a referral's
+            # authority section carries the child's DS under the parent's signature
+            # (RFC 4035 §3.1.4), which is chain data the descent hands over for free
+            # and the only place most lookups ever see it. Even a discarded probe
+            # referral carries a DS worth keeping.
+            _offer(entry.zone, response, server=entry)
         # Whatever this server offered as an explanation, kept for the reason
         # strings built below. It decides nothing in this loop -- see
         # :func:`_extended_error_note` for the sentence that forbids that.
@@ -1895,8 +2018,45 @@ def resolve_steps(
             # (including tests) can observe a populated cache the moment the
             # Answer/Nxdomain/Nodata is visible — the generator pauses at
             # ``yield step`` and may never be resumed past Done.
+            sec_verdict = None
+            denying_zone = None
+            if (
+                sec_validator is not None
+                and response is not None
+                and isinstance(step, (Nodata, Nxdomain))
+            ):
+                # The verdict is computed here, at the moment the denial and every
+                # record that can judge it are both in hand -- not later at the cut,
+                # when the keys may have aged out of cache and the walk would be
+                # re-judging a memory with fresh questions about data it can no
+                # longer see. RFC 4035 §4.5's atomic-entry guidance caches a
+                # response as one unit for one TTL; the verdict rides along as the
+                # entry's own history of that check.
+                denial_rcode = (
+                    DnsResponseCode.NAME_ERROR
+                    if isinstance(step, Nxdomain)
+                    else DnsResponseCode.NO_ERROR
+                )
+                soa = getattr(step, "soa", None) or next(
+                    (r for r in response.nameservers if int(r.rtype) == int(DnsRType.SOA)),
+                    None,
+                )
+                # The SOA the answer carries is the denying zone's own apex (RFC 8020
+                # Appendix A: "The accompanying SOA record indicates the apex of the
+                # zone"), which beats trusting the Slist's idea of the current zone
+                # when a server has answered for a name it does not control.
+                denying_zone = soa.name if soa is not None else entry.zone
+                sec_verdict = yield from _fetch_chain(
+                    sname.qname, int(sname.qtype), denial_rcode, denying_zone
+                )
             if cache is not None and isinstance(step, (Answer, Nodata, Nxdomain)):
-                _write_cache(cache, sname, step, response)
+                _write_cache(
+                    cache,
+                    sname,
+                    step,
+                    response,
+                    validated=bool(sec_verdict is not None and sec_verdict.secure),
+                )
             if failures is not None and isinstance(step, (Answer, Nodata, Nxdomain)):
                 # Recovery, and it has to be explicit rather than left to the clock.
                 # An answer is direct evidence that whatever was remembered about
@@ -1920,6 +2080,10 @@ def resolve_steps(
                 # the query key's business, and RFC 9520 section 2.5 lists alias
                 # loops among the failures worth remembering.
                 _remember(step.reason)
+            if sec_verdict is not None:
+                # Before the event it judged: the verdict is why the NXDOMAIN below
+                # may cut, and a reader should meet the reason before the fact.
+                yield DnssecVerdict(str(denying_zone), sec_verdict.status.value, sec_verdict.reason)
             yield step
             if isinstance(step, (Done, Fail)):
                 # Fail is terminal for the same reason Done is: classify emits it
@@ -2022,11 +2186,22 @@ def _cached_failure_reason(entry) -> str:
     return f"cached failure for {subject}: {entry.reason} (strike {entry.strikes})"
 
 
-def _nxdomain_cut(cache, name, qclass):
+def _nxdomain_cut(cache, name, qclass, require_validated=False):
     """The cached NXDOMAIN that denies *name*, or ``None`` (RFC 8020 §2¶1).
 
     Walks the name's ancestors from the closest down, the name itself included,
     and stops at the first denial.
+
+    ``require_validated`` is :attr:`NxdomainPolicy.VALIDATED`'s filter, and it is a
+    filter on the *entry*, not a re-check: RFC 8020 §2¶3 lets the cut stand only
+    "when the NXDOMAIN response has been validated with DNSSEC", and the answer to
+    that question was decided -- with the chain data still in hand -- when the
+    denial arrived. An entry without the flag is not disbelieved, merely unproved:
+    the walk continues as :attr:`NxdomainPolicy.NEVER` would, which is the stance
+    the policy promises when it cannot honour its own. ``getattr`` rather than an
+    attribute read because third-party cache backends may predate the flag, and a
+    backend that never stamped anything must not crash the cut -- it simply never
+    grants it.
 
     Including the name is not redundancy with :meth:`~namespy.cache.DnsCache.get`,
     and it took a failing test to see why. §2¶1 covers "all names and resource
@@ -2057,8 +2232,11 @@ def _nxdomain_cut(cache, name, qclass):
     """
     for ancestor in reversed(DomainName(name).hierarchy()):
         hit = cache.nxdomain_at(ancestor, qclass)
-        if hit is not None:
-            return hit, ancestor
+        if hit is None:
+            continue
+        if require_validated and not getattr(hit, "validated", False):
+            continue
+        return hit, ancestor
     return None
 
 
@@ -2132,13 +2310,15 @@ def _negative_ttl_seconds(soa_record):
     return max(0, ttl)
 
 
-def _write_cache(cache, sname, terminal_event, response):
+def _write_cache(cache, sname, terminal_event, response, validated=False):
     """Populate ``cache`` from a terminal classify event.
 
     ``terminal_event`` is the most recent of (Answer, Nodata, Nxdomain)
     yielded for this response; ``response`` is the corresponding wire
     packet (used for the AA flag and to dig the SOA out of the authority
-    section on NXDOMAIN).
+    section on NXDOMAIN). ``validated`` is the walk's SECURE verdict on this
+    denial under its trust anchors -- ``False`` whenever nothing was checked,
+    which is the only state a non-validating resolver may assert.
 
     A truncated response is never stored. RFC 1123 section 6.1.3.2 states it as
     a prohibition -- "Truncated responses MUST NOT be saved (cached) and later
@@ -2188,6 +2368,7 @@ def _write_cache(cache, sname, terminal_event, response):
                 terminal_event.soa,
                 now + ttl,
                 collect_proof_records(response.nameservers) if response is not None else (),
+                validated=validated,
             )
         )
         return
@@ -2210,6 +2391,7 @@ def _write_cache(cache, sname, terminal_event, response):
                 soa,
                 now + ttl,
                 collect_proof_records(response.nameservers) if response is not None else (),
+                validated=validated,
             )
         )
 
@@ -2357,6 +2539,7 @@ class RecursiveResolver(Resolver):
         glue_policy: GluePolicy = GluePolicy.STRICT,
         nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
         dnssec_ok: bool = False,
+        trust_anchors=(),
     ):
         """Build a resolver without touching the network.
 
@@ -2411,10 +2594,22 @@ class RecursiveResolver(Resolver):
             wrong for serving, because it throws away the reason the negative
             cache has a subtree-wide claim at all. :class:`NxdomainPolicy` says
             what each stance costs. Also accepted as the equivalent string.
+        :param trust_anchors: :class:`~namespy.anchors.TrustAnchor` objects to
+            validate negative answers against -- the trust point RFC 4035 §4.4
+            calls "configured" and §4.3 makes the origin of every Secure verdict.
+            With any present, every NXDOMAIN/NODATA this walk receives is judged by
+            :mod:`namespy.validate` (chain composed from the walk's own responses,
+            §5.2¶6 gaps fetched), the verdict is traced as a ``DnssecVerdict``, and
+            a SECURE denial is stamped ``validated`` into its cache entry. Empty,
+            the default, validates nothing -- and :attr:`NxdomainPolicy.VALIDATED`
+            refuses construction without it. Setting anchors turns on ``dnssec_ok``:
+            a security-aware resolver MUST ask for the records it means to validate
+            (RFC 4035 §4.1¶1), and DO-off proves nothing.
         :raises ValueError: if *glue_policy* or *nxdomain_cut* is not a
             :class:`GluePolicy` / :class:`NxdomainPolicy` (or its name/value), or
-            if *nxdomain_cut* is :attr:`NxdomainPolicy.VALIDATED` -- a policy that
-            silently failed to apply would be worse than one refused at the door.
+            if *nxdomain_cut* is :attr:`NxdomainPolicy.VALIDATED` without
+            *trust_anchors* -- a policy that silently failed to apply would be
+            worse than one refused at the door.
         :raises FileNotFoundError: if *root_hints_path* is named but missing.
         """
         self.queue: dict[tuple, tuple] = {}
@@ -2450,16 +2645,31 @@ class RecursiveResolver(Resolver):
         # and NxdomainPolicy.NEVER must arrive as one thing, and a typo must not
         # leave a resolver that thinks it has a policy.
         self.nxdomain_cut = NxdomainPolicy(nxdomain_cut)
-        if self.nxdomain_cut is NxdomainPolicy.VALIDATED:
-            # Refused rather than degraded. VALIDATED and NEVER produce identical
-            # packets today -- nothing here validates -- so a silent fallback
-            # would look like it worked while teaching the operator that DNSSEC
-            # proof is what stopped the cut, when in fact nothing was checked.
+        # Frozen like edns_options: the walk reads these per lookup, and an
+        # anchor list a caller mutates mid-flight would silently change what
+        # "validated" meant partway down a delegation chain.
+        self.trust_anchors = tuple(trust_anchors)
+        if self.trust_anchors:
+            # RFC 4035 §4.1¶1: a security-aware resolver MUST set DO when it
+            # means to validate. An operator who configured anchors but left
+            # --dnssec off asked for verification of records that would never
+            # arrive; turning DO on is honoring the request, refusing it would
+            # be honoring the flag over the intent.
+            self.dnssec_ok = True
+        if self.nxdomain_cut is NxdomainPolicy.VALIDATED and not self.trust_anchors:
+            # Refused rather than degraded, and for the reason the original
+            # door stated: VALIDATED without anchors marks every denial
+            # unvalidated, which emits exactly NEVER's packets while printing
+            # a policy name that promises DNSSEC proof was what stopped the
+            # cut. The gap that kept this door shut -- no fetching, no
+            # verdicts -- has closed; this one condition is left, and it is
+            # configuration, not capability.
             raise ValueError(
-                "NxdomainPolicy.VALIDATED needs DNSSEC validation wired into the "
-                "resolver walk; namespy.validate holds the four-state validator but the "
-                "walk does not yet fetch the DS and DNSKEY RRsets it would consume, so "
-                "use NxdomainPolicy.ALWAYS (RFC 8020 section 2) or NxdomainPolicy.NEVER"
+                "NxdomainPolicy.VALIDATED needs trust anchors to validate against: "
+                "pass trust_anchors=(...) (see namespy.anchors for reading the RFC "
+                "9718 root document); without any, no denial can ever be marked "
+                "validated and the policy would only ever behave like "
+                "NxdomainPolicy.NEVER"
             )
         if self.nxdomain_cut is NxdomainPolicy.NEVER:
             # Not a warning: unlike permissive glue this disables an efficiency,
@@ -2932,6 +3142,7 @@ class RecursiveResolver(Resolver):
                         nxdomain_cut=self.nxdomain_cut,
                         failures=self.failure_cache,
                         dnssec_ok=self.dnssec_ok,
+                        anchors=self.trust_anchors,
                     )
                     sub_response = await self._drive(sub_gen, child_trace, depth + 1)
                     if not isinstance(sub_response, Response):
@@ -3044,6 +3255,7 @@ class RecursiveResolver(Resolver):
             failures=self.failure_cache,
             extra_qtypes=tuple(extra_qtypes),
             dnssec_ok=self.dnssec_ok,
+            anchors=self.trust_anchors,
         )
         response = await self._drive(gen, self.last_trace)
         if isinstance(response, Response):

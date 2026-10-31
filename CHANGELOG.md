@@ -8,6 +8,8 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- The wiring that made `NxdomainPolicy.VALIDATED` real (RFC 4035 §5.2¶6, §4.1¶1, §4.5; RFC 8020 §2¶3) — the walk now validates the negatives it receives. `resolve_steps(..., anchors=...)` files every response into one `DnssecStore` per lookup with the responding zone as origin, so a referral's piggybacked DS (RFC 4035 §3.1.4) joins the chain for free; a terminal NXDOMAIN/NODATA is judged by `namespy.validate` before its cache write, and an Indeterminate born of a *missing record* names the cure on itself — the new `ValidationVerdict.fetch_hint`, `(name, rtype, from_zone)`, offered once per triple — which the walk pays for with its own `SendQuery` effect, mid-lookup, of the zone that holds it (§5.2¶6's "MUST query the name servers for the parent zone for the DS RRset", capped by `_MAX_SEC_FETCHES` besides). The verdict is traced as a `DnssecVerdict` event before the denial it judges (chain queries carry a `helper` flag; `--trace` marks them `(dnssec)`), and a SECURE one is stamped into the cached `NegativeEntry.validated` — persisted through SQLite by a column migration that reads every pre-existing row, honestly, as unvalidated. `NxdomainPolicy.VALIDATED` now cuts on that stamp and nothing else; its door refuses only what it always should have, the policy without trust anchors. `RecursiveResolver(trust_anchors=...)` turns DO on by itself (RFC 4035 §4.1¶1 — records never asked for are records never checked), and the CLI gains `--validate`, `--trust-anchor FILE` (RFC 9718 XML whose fully-expired contents end the run rather than silently validating nothing) and `--validated-cuts`. Stamp-at-write and filter-at-cut, never re-verify at cut: RFC 4035 §4.5 caches a response as one atomic entry for one TTL, and letting a DNSKEY's expiry decide a policy question from a walk whose purpose is *not* to query was refused on purpose. `test_dnssec_wiring.py` (12) scripts the three-zone descent end to end — secure denial stamped and cut with zero queries, forged proof re-walked instead of cut, both insecure-delegation shapes including the live §5.2¶6 DS query, deaf servers, the hint toward an unvisited zone that must not ask the wrong server — with fetch-hint, cache-flag, and CLI follow-on tests in the files they touch (+19) (`tests/test_dnssec_wiring.py`, `tests/test_dnssec_validate.py`, `tests/test_nsec_cache.py`, `tests/test_cli.py`).
+
 - The four states of RFC 4035 §4.3 as a layer (`namespy/validate.py`) — the shift from "does
   this signature hold" to "may this answer be believed". `DnssecStore` buckets records from
   any number of responses into RRsets that remember the zone they arrived in (RFC 4035
@@ -33,8 +35,9 @@ nothing has been tagged or published yet, so `master` is the only version.
   The tests build a three-level RSA-signed tree — real keys, real signing bytes, both NSEC
   and NSEC3 legs — and break it one octet at a time; the captured live root also validates
   end to end as an answer through the new layer (`test_dnssec_validate.py`, 45 tests).
-  Nothing in the resolver consumes it yet: `NxdomainPolicy.VALIDATED` still refuses at the
-  door, its message now naming the remaining gap — the walk's DS/DNSKEY fetching.
+  Nothing in the resolver consumed it at the time; the bullet above is the wiring that
+  changed that, and `NxdomainPolicy.VALIDATED`'s door now refuses only the missing
+  trust anchors.
 
 - Trust anchors and the first live chain (`namespy/anchors.py`, `verify.authenticate_dnskey_rrset`) —
   the trust point the verification stage kept deferring to. The root's anchors are read from their

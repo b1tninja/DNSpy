@@ -149,9 +149,19 @@ class NegativeEntry(CacheEntry):
     re-derived. Empty is legitimate -- an unsigned zone has none, and a signed zone's denial reaches
     a resolver that did not ask for DNSSEC data without them too -- and an empty value only costs the
     echo, never the denial itself.
+
+    ``validated`` records that *this resolver checked those proofs when the denial arrived* and the
+    chain under its configured anchors came back SECURE (RFC 4035 §4.3¶2). It is deliberately a
+    remembered verdict rather than a live re-check: RFC 4035 §4.5 builds caching on responses kept
+    "as a single atomic entry" and discarded together when they expire, and re-verifying at
+    cut time would couple the cut to whether a DNSKEY happens to still be cached -- a TTL
+    accident deciding a policy. A denial validated at write time cuts for exactly the lifetime of
+    the denial itself, which is what RFC 8020 §2¶2's "until the TTL of this cached data expires"
+    already governs. An unsigned, bogus, or unjudgeable denial carries ``False``, and
+    :attr:`NxdomainPolicy.VALIDATED` cuts on nothing else.
     """
 
-    def __init__(self, name, qtype, qclass, rcode, soa, expires_at, proofs=()):
+    def __init__(self, name, qtype, qclass, rcode, soa, expires_at, proofs=(), validated=False):
         super().__init__(name, qtype, qclass, expires_at)
         try:
             rcode = DnsResponseCode(int(rcode))
@@ -160,10 +170,13 @@ class NegativeEntry(CacheEntry):
         self.rcode = rcode
         self.soa = soa
         self.proofs = tuple(proofs)
+        self.validated = bool(validated)
 
     def __repr__(self):
+        flag = " validated" if self.validated else ""
         return (
-            f"<NegativeEntry {self.name}/{self.qtype} rcode={self.rcode} proofs={len(self.proofs)}>"
+            f"<NegativeEntry {self.name}/{self.qtype} rcode={self.rcode} "
+            f"proofs={len(self.proofs)}{flag}>"
         )
 
 

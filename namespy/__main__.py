@@ -8,6 +8,12 @@ import sys
 import time
 import traceback
 
+from .anchors import (
+    TrustAnchorFetchError,
+    active_anchors,
+    fetch_root_anchors,
+    parse_root_anchors,
+)
 from .bundle import BundleResult, BundleState
 from .edns import (
     extended_error_presentation,
@@ -484,10 +490,37 @@ def build_parser():
         help="ask every server for its DNSSEC records by setting EDNS(0)'s DO bit (RFC 6891 "
         "section 6.1.4), which is what dig +dnssec does: signatures arrive, are printed, and a "
         "denial answered from cache comes with the NSEC/NSEC3 records that prove it (RFC 8020 "
-        "section 2). Off by default, because nothing here verifies those signatures yet and the "
-        "extra records can push an answer over the 512-octet UDP ceiling into a TCP retry (RFC 3225 "
-        "section 2). When serving, a client that did not set DO still gets the records stripped "
-        "(RFC 4035 section 3.2.1)",
+        "section 2). Only --validate checks those signatures; this flag alone merely fetches "
+        "them, and the extra records can push an answer over the 512-octet UDP ceiling into a "
+        "TCP retry (RFC 3225 section 2). When serving, a client that did not set DO still gets "
+        "the records stripped (RFC 4035 section 3.2.1)",
+    )
+    p.add_argument(
+        "--validate",
+        action="store_true",
+        help="validate every negative answer this resolver receives against DNSSEC trust "
+        "anchors (RFC 4035 section 4.3): the chain is composed from the walk's own referrals, "
+        "gaps are fetched, and a SECURE denial is stamped into its cache entry. Fetches the "
+        "root anchors from IANA (RFC 9718 section 3.1) unless --trust-anchor names a file. "
+        "Implies --dnssec, because records never asked for are records never checked.",
+    )
+    p.add_argument(
+        "--trust-anchor",
+        dest="trust_anchor",
+        action="append",
+        metavar="FILE",
+        help="RFC 9718 root-anchors XML to validate against; repeatable; implies --validate "
+        "and skips the IANA fetch. Anchors outside their validity window are dropped, and a "
+        "file whose every anchor has expired is a refusal rather than a fallback.",
+    )
+    p.add_argument(
+        "--validated-cuts",
+        dest="validated_cuts",
+        action="store_true",
+        help="apply the RFC 8020 NXDOMAIN cut only to denials this resolver validated "
+        "(NxdomainPolicy.VALIDATED): unsigned, bogus, and unjudgeable denials are re-asked "
+        "from the name servers instead of answered from the ancestor's cached NXDOMAIN. "
+        "Requires --validate.",
     )
     p.add_argument(
         "--mqtype",
@@ -576,7 +609,48 @@ def _nxdomain_cut(args) -> NxdomainPolicy:
     still correct, merely fetched rather than remembered, and the extra queries
     it costs are already visible in --trace.
     """
+    if getattr(args, "validated_cuts", False):
+        return NxdomainPolicy.VALIDATED
     return NxdomainPolicy.NEVER if args.no_nxdomain_cut else NxdomainPolicy.ALWAYS
+
+
+def _trust_anchors(args):
+    """The trust anchors this run validates against, or ``()`` when it validates nothing.
+
+    Reading is trusting only within the validity window, so the parsed set goes
+    through :func:`~namespy.anchors.active_anchors` before anyone meets it, and a
+    file that yields nothing live ends the run with a sentence rather than
+    silently validating nothing -- the same refusal the resolver's constructor
+    makes at the same door. Fetching from IANA is the default when --validate
+    names no file: it is a blocking HTTPS GET at startup, which a CLI can afford
+    and a library cannot, and it is announced on stderr so a script watching
+    stdout sees only answers.
+    """
+    if not (getattr(args, "validate", False) or getattr(args, "trust_anchor", None)):
+        return ()
+    if args.trust_anchor:
+        anchors = []
+        for path in args.trust_anchor:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    anchors.extend(parse_root_anchors(handle.read()))
+            except OSError as exc:
+                raise SystemExit(f"namespy: cannot read trust anchor file {path}: {exc}") from None
+    else:
+        print(
+            "namespy: fetching root trust anchors from IANA (RFC 9718 section 3.1)", file=sys.stderr
+        )
+        try:
+            anchors = fetch_root_anchors()
+        except TrustAnchorFetchError as exc:
+            raise SystemExit(f"namespy: {exc}") from None
+    active = active_anchors(anchors)
+    if not active:
+        raise SystemExit(
+            "namespy: no trust anchor is inside its validity window -- refusing to "
+            "validate against anchors this file cannot vouch for (is it stale?)"
+        )
+    return active
 
 
 def _nxdomain_cut_of(response):
@@ -729,6 +803,9 @@ async def cli_query(args) -> int:
     # every hop rather than on one: an empty tuple here means the walk below never carries
     # an MQTYPE-Query option and no server is asked to do anything new.
     asked = _bundle_qtypes(args)
+    # Anchors are fetched before the endpoint is built, so a missing file or a dead
+    # IANA is a startup sentence, not a lookup that silently skipped validation.
+    anchors = _trust_anchors(args)
 
     _transport, resolver_protocol = await loop.create_datagram_endpoint(
         lambda: RecursiveResolver(
@@ -741,6 +818,7 @@ async def cli_query(args) -> int:
             glue_policy=_glue_policy(args),
             failure_cache=_failure_cache(args),
             nxdomain_cut=_nxdomain_cut(args),
+            trust_anchors=anchors,
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -818,6 +896,7 @@ async def serve(args) -> int:
     _server_transport = None
     try:
         loop = asyncio.get_running_loop()
+        anchors = _trust_anchors(args)
 
         _resolver_transport, resolver_protocol = await loop.create_datagram_endpoint(
             lambda: RecursiveResolver(
@@ -830,6 +909,7 @@ async def serve(args) -> int:
                 glue_policy=_glue_policy(args),
                 failure_cache=_failure_cache(args),
                 nxdomain_cut=_nxdomain_cut(args),
+                trust_anchors=anchors,
             ),
             local_addr=("0.0.0.0", 0),
         )

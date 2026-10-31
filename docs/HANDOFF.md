@@ -1049,11 +1049,53 @@ answer through the new layer. The crypto-free parity run (cryptography import bl
 a PYTHONPATH shim — how CI's matrix legs see it) lands at 1229 passed / 66 skipped / 0
 errors after the lazy-key fix; CI on the first commit proved this check worth scripting.
 
-**Next, in order**: (1) `NxdomainPolicy.VALIDATED` wiring — DS/DNSKEY fetching at each
-cut, an entry kind for the keys the walk learns, `Validator` consumed at cut time and
-before synthesis, and §5.2¶7/¶10 routing of insecure and unsupported children; (2) the
-header AD/CD bits (§9.2, 6895, 8145). The DS-strip question and the `serve --dnssec` DO
-question remain open.
+**Next, in order**: (1) the header AD/CD bits (§9.2, 6895, 8145) — the verdict now
+exists at the moment an answer leaves the resolver, and asserting it honestly is the
+next consumer; (2) the DS-strip question and the `serve --dnssec` DO question remain
+open. The wiring itself landed the round after this one — see the section below.
+
+### Follow-up: the wiring — `NxdomainPolicy.VALIDATED` honoured (RFC 4035 §5.2¶6, §4.1¶1, §4.5; RFC 8020 §2¶3)
+
+The door that had stood since the RFC 8020 round — "the walk cannot yet produce a
+verdict at cut time" — is gone, and the gap it described is what this round built:
+`resolve_steps(..., anchors=...)` validates the negatives it receives.
+
+**What shipped.** Every response of the walk — referrals included — is filed into one
+`DnssecStore` per lookup with the responding zone as origin, which is how §3.1.4's
+piggybacked DS arrives for free (two of the chain's three links cost no query at all).
+A terminal NXDOMAIN/NODATA is judged under the anchors before its cache write; whatever
+the chain lacks comes back as a `ValidationVerdict.fetch_hint` — `(name, rtype,
+from_zone)` — and the walk spends its own `SendQuery` effect on it, mid-lookup, asked of
+the zone that holds it (§5.2¶6's MUST-query is the named case; the loop is capped by
+both the Validator's once-per-triple ledger and `_MAX_SEC_FETCHES`). The verdict yields
+a `DnssecVerdict` event — rendered by `--trace` beside its zone, chain queries marked
+`(dnssec)` — and a SECURE one is stamped into the cached `NegativeEntry.validated`,
+persisted through SQLite by a column migration that reads old rows, honestly, as
+unvalidated. `NxdomainPolicy.VALIDATED` reads that stamp at the cut; the door now
+refuses only the configuration error it always should have — VALIDATED without anchors.
+`RecursiveResolver(trust_anchors=...)` forces DO (RFC 4035 §4.1¶1: records never asked
+for are records never checked), and the CLI gets `--validate`, `--trust-anchor FILE`
+(RFC 9718 XML; an all-expired file is a refusal, not a fallback) and `--validated-cuts`.
+
+**The decision worth keeping**: stamp at write, filter at cut, never re-verify at cut.
+A remembered verdict matches RFC 4035 §4.5's atomic-entry model — the denial and its
+proof live and die on one TTL — while re-checking at cut time would let a DNSKEY's
+expiry accident decide a policy question, and would need the chain re-fetched by a walk
+whose whole point is not to query. The `validated` flag is a record of a check this
+resolver performed, which is also exactly what it means across a restart or an old
+database: nobody checked, so no cut.
+
+**Verified**: 1325 passed (+31: 12 `tests/test_dnssec_wiring.py` — the scripted
+three-zone descent pins secure/stamp/zero-network-cut, forged-proof bogus that re-walks
+instead of cutting, both insecure-delegation shapes including the live §5.2¶6 DS query,
+indeterminate-on-deaf-servers, the unvisited-zone hint that must not query the wrong
+server, and NODATA stamping; 7 validator fetch-hint tests; 5 cache-flag tests; 7 CLI
+flag tests; the door test rewritten), `ruff check`/`format` clean, `mypy namespy` exits
+0, coverage 92% total.
+
+**Next, in order**: (1) the header AD/CD bits (§9.2, 6895, 8145) — with them, positive
+answers get judged for the answer's own `AD`, and the serve path can assert or strip
+honestly; (2) the DS-strip question and the `serve --dnssec` DO question remain open.
 
 ## Previous round: MQTYPE (RFC 10029)
 

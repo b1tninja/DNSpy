@@ -169,8 +169,12 @@ def test_a_response_of_nsec3_records_feeds_the_encloser_algorithm():
 # --------------------------------------------------------------------- proofs across the cache
 
 
-def _denial(proofs=(), rcode=DnsResponseCode.NAME_ERROR, name="missing.example.com."):
-    return NegativeEntry(name, A, int(DnsRClass.IN), rcode, _soa(), NOW + 300, proofs)
+def _denial(
+    proofs=(), rcode=DnsResponseCode.NAME_ERROR, name="missing.example.com.", validated=False
+):
+    return NegativeEntry(
+        name, A, int(DnsRClass.IN), rcode, _soa(), NOW + 300, proofs, validated=validated
+    )
 
 
 def _bundle():
@@ -282,6 +286,78 @@ def test_an_unreadable_proof_blob_costs_the_proofs_not_the_denial(sqlite_cache):
     assert hit is not None
     assert hit.proofs == ()
     assert hit.rcode == DnsResponseCode.NAME_ERROR
+
+
+# ---------------------------------------------------------------- the validated flag
+
+
+def test_the_validated_flag_survives_both_memory_reads():
+    """The cut consults ``nxdomain_at``; a verdict that lived only in ``get`` would be useless."""
+    cache = MemoryDnsCache(time_fn=lambda: NOW)
+    cache.put(_denial(_bundle(), validated=True))
+    assert cache.get("missing.example.com.", A, int(DnsRClass.IN)).validated is True
+    assert cache.nxdomain_at("missing.example.com.", int(DnsRClass.IN)).validated is True
+
+
+def test_the_sqlite_round_trip_preserves_the_verdict(sqlite_cache):
+    """``validated`` is a *remembered* check (RFC 4035 §4.5's atomic entry), so it persists.
+
+    Both reads must agree, because the two backends' cut paths differ: memory
+    keeps the stamped object, sqlite rebuilds it from the column.
+    """
+    sqlite_cache.put(_denial(_bundle(), validated=True))
+    for hit in (
+        sqlite_cache.get("missing.example.com.", A, int(DnsRClass.IN)),
+        sqlite_cache.nxdomain_at("missing.example.com.", int(DnsRClass.IN)),
+    ):
+        assert hit.validated is True
+
+
+def test_unvalidated_is_the_default_across_the_sqlite_trip(sqlite_cache):
+    sqlite_cache.put(_denial())
+    assert sqlite_cache.nxdomain_at("missing.example.com.", int(DnsRClass.IN)).validated is False
+
+
+def test_a_database_from_before_the_verdict_flag_reads_unvalidated(tmp_path):
+    """The migration's honesty: a row nobody ever checked has no verdict to restore.
+
+    Same script as the proofs migration -- an old table with neither column --
+    because the build that wrote this database predates both fields, and old rows
+    must read as unvalidated rather than crash or, worse, guess true: a verdict is
+    a record of a check this build performed, and nothing here performed one.
+    """
+    path = str(tmp_path / "older.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE rrset_cache (
+            name TEXT NOT NULL, qtype INTEGER NOT NULL, qclass INTEGER NOT NULL,
+            kind INTEGER NOT NULL, rcode INTEGER NOT NULL, expires_at REAL NOT NULL,
+            authoritative INTEGER NOT NULL DEFAULT 0, payload BLOB NOT NULL,
+            PRIMARY KEY (name, qtype, qclass));
+        """
+    )
+    conn.execute(
+        "INSERT INTO rrset_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (_name_text(DomainName("missing.example.com.")), 1, 1, 1, 3, 9999999999.0, 0, b""),
+    )
+    conn.commit()
+    conn.close()
+
+    cache = SqliteDnsCache(path, time_fn=lambda: NOW)
+    try:
+        hit = cache.nxdomain_at("missing.example.com.", int(DnsRClass.IN))
+        assert hit is not None
+        assert hit.validated is False
+        cache.put(_denial(validated=True))
+        assert cache.nxdomain_at("missing.example.com.", int(DnsRClass.IN)).validated is True
+    finally:
+        cache.close()
+
+
+def test_the_repr_shows_the_verdict_and_only_when_it_is_there():
+    assert " validated" in repr(_denial(validated=True))
+    assert " validated" not in repr(_denial())
 
 
 # --------------------------------------------------- the resolver's own cache-write path

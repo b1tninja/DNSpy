@@ -382,18 +382,34 @@ def test_a_cached_denial_beats_a_failure_note():
     assert not any(isinstance(event, Fail) for event in events)
 
 
-def test_validated_policy_is_refused_at_the_door():
-    """RFC 8020 §2¶3 is a stance the resolver cannot honour yet, and says so.
+def test_validated_policy_still_refuses_without_anchors():
+    """RFC 8020 §2¶3 is now honoured, but only against something to honour it with.
 
-    The validator of :mod:`namespy.validate` arrived, but the walk still never
-    fetches the DS and DNSKEY RRsets that would make its verdict available at cut
-    time -- and VALIDATED and NEVER emit the same packets without it, so a silent
-    fallback would leave an operator believing DNSSEC proof was what stopped the
-    cut. Refusing stays the honest option until the wiring lands, and this test is
-    the thing that has to change when it does.
+    The walking-and-fetching half has landed -- resolve_steps composes the chain
+    under its ``anchors`` and stamps verdicts into negative entries -- so the door
+    is what it always said it should be once that existed: configuration, not
+    capability. A VALIDATED with no trust point still marks every denial
+    unvalidated, still emits NEVER's packets, and still prints a policy name that
+    promises DNSSEC proof was what stopped the cut.
     """
-    with pytest.raises(ValueError, match="DNSSEC"):
+    with pytest.raises(ValueError, match="trust anchors"):
         RecursiveResolver(nxdomain_cut=NxdomainPolicy.VALIDATED)
+
+
+def test_validated_policy_constructs_with_anchors_and_turns_on_do():
+    """Anchors make the policy real -- and force the DO bit it depends on.
+
+    RFC 4035 §4.1¶1 makes asking for the records a precondition of checking them,
+    so an operator who configures anchors but leaves dnssec_ok off gets DO on:
+    the flag they set cannot be honored without it.
+    """
+    resolver = RecursiveResolver(
+        nxdomain_cut=NxdomainPolicy.VALIDATED,
+        dnssec_ok=False,
+        trust_anchors=(object(),),  # the constructor only stores; nothing is parsed
+    )
+    assert resolver.dnssec_ok is True
+    assert resolver.nxdomain_cut is NxdomainPolicy.VALIDATED
 
 
 def test_policy_arrives_as_a_string_too():

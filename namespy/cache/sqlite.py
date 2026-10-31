@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS rrset_cache (
     authoritative INTEGER NOT NULL DEFAULT 0,
     payload     BLOB    NOT NULL,
     proofs      BLOB    NOT NULL DEFAULT x'',
+    validated   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (name, qtype, qclass)
 );
 CREATE INDEX IF NOT EXISTS idx_rrset_expires ON rrset_cache(expires_at);
@@ -135,10 +136,11 @@ class SqliteDnsCache(DnsCache):
         self._conn = sqlite3.connect(path)
         self._conn.executescript(_SCHEMA)
         self._add_proofs_column()
+        self._add_validated_column()
         self._conn.commit()
 
-    def _add_proofs_column(self):
-        """Add ``proofs`` to a database written before cached denials carried proof records.
+    def _migrate_column(self, column: str, ddl: str) -> None:
+        """Add *column* to a database written before it existed.
 
         ``CREATE TABLE IF NOT EXISTS`` in :data:`_SCHEMA` does nothing at all against an existing
         file, so a column added to the schema text is invisible to every database on disk until
@@ -147,10 +149,26 @@ class SqliteDnsCache(DnsCache):
         script for one blob column.
         """
         columns = [row[1] for row in self._conn.execute("PRAGMA table_info(rrset_cache)")]
-        if "proofs" not in columns:
-            self._conn.execute(
-                "ALTER TABLE rrset_cache ADD COLUMN proofs BLOB NOT NULL DEFAULT x''"
-            )
+        if column not in columns:
+            self._conn.execute(ddl)
+
+    def _add_proofs_column(self):
+        """Add ``proofs`` to a database written before cached denials carried proof records."""
+        self._migrate_column(
+            "proofs", "ALTER TABLE rrset_cache ADD COLUMN proofs BLOB NOT NULL DEFAULT x''"
+        )
+
+    def _add_validated_column(self):
+        """Add ``validated`` to a database written before the RFC 8020 §2¶3 verdict flag.
+
+        Rows from that era read as unvalidated, which is the only honest default: the verdict
+        is a record of a check *this* build performed, and an old row proves only that nobody
+        checked. A database written after this column joined :data:`_SCHEMA` but before some
+        future one needs no special handling either -- the ALTER sees the column present.
+        """
+        self._migrate_column(
+            "validated", "ALTER TABLE rrset_cache ADD COLUMN validated INTEGER NOT NULL DEFAULT 0"
+        )
 
     def close(self):
         """Close the connection, tolerating one that is already gone.
@@ -191,13 +209,13 @@ class SqliteDnsCache(DnsCache):
         qc = int(qclass)
         now = self.time_fn()
         row = self._conn.execute(
-            "SELECT kind, rcode, expires_at, authoritative, payload, proofs "
+            "SELECT kind, rcode, expires_at, authoritative, payload, proofs, validated "
             "FROM rrset_cache WHERE name=? AND qtype=? AND qclass=? LIMIT 1",
             (key_name, qt, qc),
         ).fetchone()
         if row is None:
             return None
-        (kind, rcode, expires_at, authoritative, payload, proofs) = row
+        (kind, rcode, expires_at, authoritative, payload, proofs, validated) = row
         if expires_at <= now:
             self._conn.execute(
                 "DELETE FROM rrset_cache WHERE name=? AND qtype=? AND qclass=?",
@@ -215,7 +233,14 @@ class SqliteDnsCache(DnsCache):
                 bool(authoritative),
             )
         return NegativeEntry(
-            name, qtype, qclass, rcode, _decode_soa(payload), expires_at, _unpack_proofs(proofs)
+            name,
+            qtype,
+            qclass,
+            rcode,
+            _decode_soa(payload),
+            expires_at,
+            _unpack_proofs(proofs),
+            validated=bool(validated),
         )
 
     def nxdomain_at(self, name, qclass):
@@ -230,15 +255,22 @@ class SqliteDnsCache(DnsCache):
         # key, so the ancestor walk this method feeds costs one indexed read per
         # label rather than a scan.
         row = self._conn.execute(
-            "SELECT qtype, rcode, expires_at, payload, proofs FROM rrset_cache "
+            "SELECT qtype, rcode, expires_at, payload, proofs, validated FROM rrset_cache "
             "WHERE name=? AND qclass=? AND kind=? AND expires_at>? LIMIT 1",
             (key_name, qc, _KIND_NXDOMAIN, now),
         ).fetchone()
         if row is None:
             return None
-        row_qtype, rcode, expires_at, payload, proofs = row
+        row_qtype, rcode, expires_at, payload, proofs, validated = row
         return NegativeEntry(
-            name, row_qtype, qc, rcode, _decode_soa(payload), expires_at, _unpack_proofs(proofs)
+            name,
+            row_qtype,
+            qc,
+            rcode,
+            _decode_soa(payload),
+            expires_at,
+            _unpack_proofs(proofs),
+            validated=bool(validated),
         )
 
     def put(self, entry):
@@ -254,6 +286,7 @@ class SqliteDnsCache(DnsCache):
             # how an answer and its signatures stay together. The column exists so the row shape is
             # uniform, not because an answer has proofs to carry.
             proofs = b""
+            validated = 0
         elif isinstance(entry, NegativeEntry):
             rcode_int = int(entry.rcode)
             kind = _KIND_NXDOMAIN if rcode_int == int(DnsResponseCode.NAME_ERROR) else _KIND_NODATA
@@ -261,12 +294,13 @@ class SqliteDnsCache(DnsCache):
             authoritative = 0
             payload = bytes(entry.soa) if entry.soa is not None else b""
             proofs = _pack_records(getattr(entry, "proofs", ()))
+            validated = 1 if getattr(entry, "validated", False) else 0
         else:
             raise TypeError(f"unsupported cache entry: {type(entry).__name__}")
         self._conn.execute(
             "INSERT OR REPLACE INTO rrset_cache "
-            "(name, qtype, qclass, kind, rcode, expires_at, authoritative, payload, proofs) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(name, qtype, qclass, kind, rcode, expires_at, authoritative, payload, proofs, "
+            "validated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key_name,
                 qt,
@@ -277,6 +311,7 @@ class SqliteDnsCache(DnsCache):
                 authoritative,
                 payload,
                 proofs,
+                validated,
             ),
         )
         self._conn.commit()

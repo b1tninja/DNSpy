@@ -32,9 +32,11 @@ walk up from a zone stops at a trust anchor (DS or DNSKEY form, RFC 4033 §2), a
 authenticated parent's DS, or at a signed proof that no DS exists; the walk down --
 answers and denials -- then needs only names.
 
-Not here yet: the fetching. This module decides from records handed to it; the resolver
-that goes and gets the missing DNSKEYs and DS RRsets is the wiring still ahead, and
-`NxdomainPolicy.VALIDATED` still refuses at the door for that reason.
+The fetching itself lives in the caller, and this module's half of that contract is the
+:attr:`ValidationVerdict.fetch_hint`: an Indeterminate born of a *missing record* names
+the one query (RFC 4035 §5.2¶6's MUST-query for a DS is the canonical case), offered
+once per triple so the loop above terminates. `namespy.resolver` is that caller for the
+walk; anything that can send a query can be one too.
 """
 
 from __future__ import annotations
@@ -98,6 +100,15 @@ class ValidationVerdict:
     reason: str
     zone: DomainName | None = None
     matched_key_tag: int | None = None
+    #: ``(name, rtype, from_zone)`` -- the one authoritative query that could turn this
+    #: Indeterminate into a decision, or ``None`` when no query can: a trust point that
+    #: contradicted the data (Bogus), a zone with no anchor configured, or a question
+    #: this :class:`Validator` has already asked once (hints are offered once per triple,
+    #: so a resolver loop cannot spin on a server that keeps not answering). RFC 4035
+    #: §5.2¶6 is the named case: a referral carrying neither a DS nor a proof of none
+    #: means the resolver MUST query the parent, and this field says so in terms a
+    #: caller can act on rather than only in prose.
+    fetch_hint: tuple | None = None
 
     @property
     def secure(self) -> bool:
@@ -331,6 +342,32 @@ class Validator:
         for anchor in anchors:
             self._anchors.setdefault(str(DomainName(anchor.zone)), []).append(anchor)
         self._memo: dict[str, ZoneVerdict] = {}
+        self._asked: set[tuple] = set()
+
+    def invalidate(self) -> None:
+        """Drop the memo, keep the questions already asked.
+
+        A caller that has just added records to the store -- a resolver acting on a
+        :attr:`ValidationVerdict.fetch_hint` -- must re-run the climb before trusting
+        a verdict again, or the fresh DS in the store buys nothing. ``_asked``
+        survives deliberately: this reopens the *conclusions*, not the *requests*,
+        so a fetch loop still terminates after one query per (name, type, zone).
+        """
+        self._memo.clear()
+
+    def _need(self, name, rtype: int, from_zone) -> tuple | None:
+        """One offer per missing record: the hint a fetch loop should act on, or None.
+
+        The deduplication key is the query, not the conclusion -- after
+        :meth:`invalidate` the same absence re-raises, and the second verdict must
+        say "Indeterminate, and nothing left to ask" rather than queue the same
+        query again against a server that already failed to answer it.
+        """
+        triple = (str(DomainName(name)), int(rtype), str(DomainName(from_zone)))
+        if triple in self._asked:
+            return None
+        self._asked.add(triple)
+        return (DomainName(name), int(rtype), DomainName(from_zone))
 
     def _trusted_for(self, zone):
         """The zone's configured anchors as the two trust shapes RFC 4033 §2 allows."""
@@ -434,6 +471,7 @@ class Validator:
                         SecurityStatus.INDETERMINATE,
                         "no DNSKEY RRset for the root was supplied to authenticate against",
                         zone=zone,
+                        fetch_hint=self._need(zone, apex, zone),
                     )
                 else:
                     verdict = ZoneVerdict(
@@ -473,6 +511,7 @@ class Validator:
                             f"the parent {parent} authenticates a child key set for {zone} "
                             f"that was not supplied -- the DNSKEY RRset must be asked for",
                             zone=zone,
+                            fetch_hint=self._need(zone, apex, zone),
                         )
                     )
                 else:
@@ -493,6 +532,7 @@ class Validator:
                     above.status,
                     f"the walk stops at the parent {parent}: {above.reason}",
                     zone=parent,
+                    fetch_hint=above.fetch_hint,
                 )
             )
 
@@ -504,6 +544,7 @@ class Validator:
                 f"no DNSKEY RRset for {zone} was supplied, and no anchor or parent DS "
                 f"reaches it (RFC 4035 §4.3¶5)",
                 zone=zone,
+                fetch_hint=self._need(zone, apex, zone),
             )
         )
         self._memo[key] = verdict
@@ -552,6 +593,7 @@ class Validator:
                 f"records proving none exists -- RFC 4035 §5.2¶6 makes going and asking "
                 f"for the DS the resolver's next move",
                 zone=parent,
+                fetch_hint=self._need(zone, int(DnsRType.DS), parent),
             )
         try:
             if entries3:
@@ -625,7 +667,11 @@ class Validator:
                     zone=zv.zone,
                 )
             return ValidationVerdict(
-                zv.status, zv.reason, zone=zv.zone, matched_key_tag=zv.matched_key_tag
+                zv.status,
+                zv.reason,
+                zone=zv.zone,
+                matched_key_tag=zv.matched_key_tag,
+                fetch_hint=zv.fetch_hint,
             )
 
         by_signer: dict[str, list] = {}
@@ -645,7 +691,14 @@ class Validator:
         """One signer's share of :meth:`validate_rrset`: chain, then arithmetic."""
         zv = self.authenticate_zone(signer)
         if zv.status is not SecurityStatus.SECURE:
-            return [ValidationVerdict(zv.status, f"signer {signer}: {zv.reason}", zone=zv.zone)]
+            return [
+                ValidationVerdict(
+                    zv.status,
+                    f"signer {signer}: {zv.reason}",
+                    zone=zv.zone,
+                    fetch_hint=zv.fetch_hint,
+                )
+            ]
         rrset = self.store.rdatas(name, rtype, origin=signer) or rdatas_all
         results: list[ValidationVerdict] = []
         bogus_reason: str | None = None
@@ -758,6 +811,7 @@ class Validator:
                 zv.status,
                 f"the denial from {zone} rests on unauthenticated keys: {zv.reason}",
                 zone=zone,
+                fetch_hint=zv.fetch_hint,
             )
         records = self.store.proof_records(zone)
         entries3 = proof_entries(records, rtype=int(DnsRType.NSEC3))

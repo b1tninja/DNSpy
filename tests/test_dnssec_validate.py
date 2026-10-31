@@ -930,3 +930,91 @@ def test_the_live_root_validates_as_an_answer_too():
     assert verdict.secure
     assert verdict.matched_key_tag == 38696
     assert str(verdict.zone) == "."
+
+
+# ----------------------------------------------------------------------- the fetch hints
+#
+# RFC 4035 §5.2¶6 makes going after a missing DS the *resolver's* duty; the
+# Validator's half of that contract is naming the one query that would close the
+# gap, once, so the loop above it can spend queries without spinning.
+
+
+def test_a_missing_key_set_names_the_query_that_would_supply_it():
+    _needs_backend()
+    validator = build_validator(drop="zone.test./48")
+    verdict = validator.authenticate_zone("zone.test.")
+    assert verdict.status is SecurityStatus.INDETERMINATE
+    assert verdict.fetch_hint is not None
+    name, rtype, from_zone = verdict.fetch_hint
+    assert (str(name), int(rtype), str(from_zone)) == ("zone.test.", 48, "zone.test.")
+
+
+def test_an_unanswered_hint_is_not_offered_twice():
+    """After a failed fetch the second verdict says "nothing left to ask"."""
+    _needs_backend()
+    validator = build_validator(drop="zone.test./48")
+    assert validator.authenticate_zone("zone.test.").fetch_hint is not None
+    validator.invalidate()  # what the resolver does after a fetch returns nothing
+    second = validator.authenticate_zone("zone.test.")
+    assert second.status is SecurityStatus.INDETERMINATE
+    assert second.fetch_hint is None
+
+
+def test_a_fetched_key_set_completes_the_chain_after_invalidate():
+    """The hint loop's success path: offer, invalidate, re-climb -- Secure."""
+    _needs_backend()
+    validator = build_validator(drop="zone.test./48")
+    assert validator.authenticate_zone("zone.test.").fetch_hint is not None
+    dnskey = _pub("zone")
+    validator.store.add(
+        [
+            R("zone.test.", int(DnsRType.DNSKEY), dnskey),
+            R(
+                "zone.test.",
+                int(DnsRType.RRSIG),
+                _sign(_pk("zone"), "zone.test.", "zone.test.", int(DnsRType.DNSKEY), [dnskey]),
+            ),
+        ],
+        zone="zone.test.",
+    )
+    validator.invalidate()
+    assert validator.authenticate_zone("zone.test.").status is SecurityStatus.SECURE
+
+
+def test_an_unproved_absent_ds_asks_for_the_ds_of_the_parent():
+    """§5.2¶6's exact sentence, as data: query the parent for the DS."""
+    _needs_backend()
+    verdict = build_validator().authenticate_zone("nowhere.test.")
+    assert verdict.status is SecurityStatus.INDETERMINATE
+    assert verdict.fetch_hint is not None
+    name, rtype, from_zone = verdict.fetch_hint
+    assert (str(name), int(rtype), str(from_zone)) == ("nowhere.test.", 43, "test.")
+
+
+def test_a_denial_inherits_the_hint_its_zone_could_not_resolve():
+    """The fetch loop drives validate_denial, so the hint must survive propagation."""
+    _needs_backend()
+    verdict = build_validator(drop="zone.test./48").validate_denial(
+        "missing.zone.test.",
+        int(DnsRType.A),
+        rcode=DnsResponseCode.NAME_ERROR,
+        zone="zone.test.",
+    )
+    assert verdict.status is SecurityStatus.INDETERMINATE
+    assert verdict.fetch_hint is not None
+    assert str(verdict.fetch_hint[0]) == "zone.test."
+
+
+def test_invalidate_reopens_conclusions_but_not_requests():
+    """One method clears the memo; the asked-question ledger deliberately survives."""
+    _needs_backend()
+    validator = build_validator()
+    assert validator.authenticate_zone("zone.test.").secure
+    validator.invalidate()
+    # The memo is gone but the data remains, so the conclusion re-derives the same.
+    assert validator.authenticate_zone("zone.test.").secure
+    # And a hint spent before the invalidate stays spent.
+    other = build_validator(drop="zone.test./48")
+    assert other.authenticate_zone("zone.test.").fetch_hint is not None
+    other.invalidate()
+    assert other.authenticate_zone("zone.test.").fetch_hint is None

@@ -1092,3 +1092,96 @@ def test_the_cut_is_found_in_a_child_trace_too():
     assert found.denied_by == "foo.example.com."
 
     assert cli._nxdomain_cut_of(_explained((3, b""))) is None
+
+
+# ---------------------------------------------------------------- DNSSEC validation flags
+
+
+def _fake_fetch(monkeypatch, anchors):
+    """No test of a CLI flag should reach IANA; the fetch is a function, so swap it."""
+    monkeypatch.setattr(cli, "fetch_root_anchors", lambda: list(anchors))
+
+
+def test_the_nxdomain_cut_mapping_honours_validated_cuts():
+    from namespy.__main__ import _nxdomain_cut
+
+    base = argparse.Namespace(no_nxdomain_cut=False, validated_cuts=False)
+    assert _nxdomain_cut(base) is NxdomainPolicy.ALWAYS
+    base.validated_cuts = True
+    assert _nxdomain_cut(base) is NxdomainPolicy.VALIDATED
+    base.validated_cuts = False
+    base.no_nxdomain_cut = True
+    assert _nxdomain_cut(base) is NxdomainPolicy.NEVER
+
+
+def test_the_validate_flag_loads_a_trust_anchor_file(tmp_path):
+    import test_dnssec_anchors as live
+
+    path = tmp_path / "root-anchors.xml"
+    path.write_text(live.IANA_ANCHORS_XML, encoding="utf-8")
+    from namespy.__main__ import _trust_anchors
+
+    args = argparse.Namespace(validate=True, trust_anchor=[str(path)])
+    anchors = _trust_anchors(args)
+    assert anchors
+    assert all(anchor.zone == "." for anchor in anchors)
+
+
+def test_anchors_outside_their_window_end_the_run_rather_than_validate_nothing(monkeypatch):
+    """A file of expired anchors is a stale file, and a stale trust point is the failure.
+
+    The published fixture deliberately contains one withdrawn, now-expired key:
+    fetching a document whose every anchor has aged out must stop the run with a
+    sentence, because a validator that trusts nothing stamps nothing, which the
+    --validated-cuts door already refuses to pretend otherwise about.
+    """
+    import test_dnssec_anchors as live
+
+    from namespy.__main__ import _trust_anchors
+
+    withdrawn = [a for a in live._ANCHORS if not a.active()]
+    assert withdrawn, "the published fixture is meant to include a withdrawn key"
+    _fake_fetch(monkeypatch, withdrawn)
+    args = argparse.Namespace(validate=True, trust_anchor=None)
+    with pytest.raises(SystemExit, match="validity window"):
+        _trust_anchors(args)
+
+
+def test_a_missing_anchor_file_is_a_sentence_not_a_traceback(tmp_path):
+    from namespy.__main__ import _trust_anchors
+
+    args = argparse.Namespace(validate=True, trust_anchor=[str(tmp_path / "gone.xml")])
+    with pytest.raises(SystemExit, match="cannot read"):
+        _trust_anchors(args)
+
+
+async def test_validate_wires_anchors_do_and_policy_into_the_resolver(monkeypatch, tmp_path):
+    import test_dnssec_anchors as live
+
+    _fake_fetch(monkeypatch, live._ANCHORS)
+    made = _stub_endpoints(monkeypatch, _answered)
+    assert await cli.cli_query(_args(["--validate", "example.com"])) == 0
+    resolver = made[0][1]
+    assert resolver.trust_anchors  # RFC 4035 section 4.4's configured trust point
+    assert resolver.dnssec_ok is True  # RFC 4035 section 4.1: validate means ask (DO)
+    assert (
+        resolver.nxdomain_cut is NxdomainPolicy.ALWAYS
+    )  # --validate alone does not change the cut
+
+    made2 = _stub_endpoints(monkeypatch, _answered)
+    assert await cli.cli_query(_args(["--validate", "--validated-cuts", "example.com"])) == 0
+    assert made2[0][1].nxdomain_cut is NxdomainPolicy.VALIDATED
+
+
+async def test_validated_cuts_without_anchors_refuses_at_the_door(monkeypatch):
+    """The CLI surfaces the constructor's refusal -- no silently-NEVER resolver."""
+    _stub_endpoints(monkeypatch, _answered)
+    with pytest.raises(ValueError, match="trust anchors"):
+        await cli.cli_query(_args(["--validated-cuts", "example.com"]))
+
+
+async def test_an_ordinary_lookup_still_validates_nothing(monkeypatch):
+    made = _stub_endpoints(monkeypatch, _answered)
+    assert await cli.cli_query(_args(["example.com"])) == 0
+    assert made[0][1].trust_anchors == ()
+    assert made[0][1].dnssec_ok is False
