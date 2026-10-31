@@ -1607,6 +1607,64 @@ Roadmap: the 8767 row to done.
 (7) 5891/3492 IDNA (P2 -- the largest); (8) 9471 §3 referral TC; (9) 8145 §5
 #kt (optional); the P4 rows await a decline decision.
 
+### Follow-up: the stub resolver — the forwarding mode the encrypted transports were waiting for (RFC 1034 §5.3.1, RFC 1035 §4.1.1)
+
+A scope decision, from the user, reorders this roadmap: the DoT/DoH row was
+parked as "P4, no forwarding mode to put them behind" -- and the answer given
+when the loop reached that fork was that the parking was always temporary:
+"we most certainly do want to implement Stub Resolvers for DoH/DoT." So the
+prerequisite lands first, and the encrypted transports become the head of the
+list.
+
+Shipped (increment A of that track -- Do53 forwarding): `namespy/stub.py`,
+two objects. `Upstream(host, port, transport)`: an address literal (the stub
+resolves nothing, its bootstrap servers least of all), `parse` reading the
+configuration-text forms (`1.0.0.1`, `1.0.0.1:5353`,
+`[2606:4700:4700::1001]:853`), transport validated against `TRANSPORTS` at
+the door so a typo is a startup sentence. `StubResolver(Resolver)`: drives
+the walk's *own* send path at the configured server -- RD set (§4.1.1's "di-
+rects the name server to pursue the query recursively"), answer returned
+exactly as it arrived. The semantics the texts leave to be taken: **REFUSED
+is this upstream declining the arrangement** (§4.1.1's "Recursive query
+support is optional", §5.3.1¶2's warning to verify the servers will do the
+service) -- the next is asked, an all-refused list returns the refusal;
+**SERVFAIL is an answer** -- the upstream did the work, fanning out buys
+delay not news; **CD copies** (§3.2.2's arrangement) via `client_cd`.
+
+The enabling refactor, and the one risk taken: `Resolver.query` already
+carried UDP-with-TCP-fallback and answer matching, but the *receive* plumbing
+it assumes (`connection_made`, `datagram_received`, the v6 bring-up) lived on
+`RecursiveResolver`. Those four methods moved to the base -- behavior-
+identical for the walk (1400-odd tests, one `TcpStub` signature updated for
+the new `port` kwarg), inherited by the stub -- and `query()` gained `port`
+(default 53, the walk untouched) and `force_tcp` (the caller's transport
+choice, not an inferred fallback). One socket engine, whoever is asking.
+
+CLI: `--forward UPSTREAM` (repeatable, tried in order), `--stub-transport
+udp|tcp`, composed SERVFAIL (RA set) when nobody speaks, `--serve` and
+`--mqtype` conflicts said plainly; `+forward` is not a dig token and none was
+invented.
+
+**Verified**: 1457 passed, 1 skipped (+18 net: `tests/test_stub_resolver.py`
+13 -- parse/validate/normalize, RD-on-wire, answer-intact passthrough, custom
+port, CD copy, rd=False, REFUSED-failover in order, all-refused, SERVFAIL
+passthrough with no fan-out, silence to None, tcp-transport-first without
+touching UDP; `test_cli.py` +5 -- timeout said not thrown, forwarded answer
+printed with the configured port, hostname-upstream refusal before any
+socket, two conflict errors). `ruff`/`format`/`mypy` clean.
+
+**Next, in order** (the transports, as requested): (1) **DoT** (RFC 7858) --
+`transport="dot"`, default port 853, stdlib `ssl` (`asyncio.open_connection
+(ssl=...)`), §5's server-name authentication (the `Upstream` needs a
+`server_name` once hostnames re-enter at the TLS layer), the 2-octet framing
+`_query_tcp` already speaks, and 7828's idle timeout while at it; (2) **DoH**
+(RFC 8484) -- `application/dns-message` POST/GET, HTTP/2 decided honestly
+(stdlib socket work or an optional extra in the `cryptography` pattern);
+(3) the rows from the earlier list as they fit -- 7828/9210 TCP reuse is now
+part of (1), then 6841, 9824, 10001, 8509/9535, 9364/9904/9905/9906, IDNA,
+9471, 8145 §5; 9539 §4 opportunistic encryption reuses the same transports
+pointed at the authority leg, later than the stub's use of them.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

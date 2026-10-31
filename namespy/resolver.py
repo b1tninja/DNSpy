@@ -41,6 +41,10 @@ hints from the network is now the explicit, awaited
   :mod:`namespy.minimis` for the probe schedule)
 * RFC 8198 / RFC 9077 (aggressive use of validated cached denials -- opt-in via
   ``aggressive_nsec``; see :mod:`namespy.aggressive` for the gates)
+* RFC 1034 section 5.3.1 / RFC 1035 section 4.1.1 (the stub resolver: RD and the
+  recursive arrangement) -- :class:`Resolver` here is the shared transport the
+  walk and :class:`namespy.stub.StubResolver` both drive, so the forwarding
+  answer matching and the UDP-to-TCP retry are one implementation, not two
 """
 
 import asyncio
@@ -59,7 +63,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import resources
 from socket import gaierror
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from . import enable_path_mtu_discovery
 from .aggressive import synthesize
@@ -310,8 +314,30 @@ class Resolver(asyncio.Protocol):
     #: relative names are simply anchored at the root.
     dns_suffix = None
 
+    #: The datagram plumbing :meth:`query` and the receive methods write.
+    #: Declared bare (no values): the instances that use them --
+    #: :class:`RecursiveResolver` and :class:`~namespy.stub.StubResolver` --
+    #: bind their own in ``__init__``; these lines are only the contract the
+    #: shared send and receive paths can rely on. ``Any`` is the honest type:
+    #: the transport is asyncio's at runtime and a recording stand-in in the
+    #: tests that drive these methods without a socket, exactly as the class
+    #: docstring has always promised.
+    transport: Any
+    transport_v6: Any
+    queue: dict
+    queue_v6: dict
+    _v6_ready: Any
+
     async def query(
-        self, questions, nameserver_record, address_record, *, extra_edns_options=(), **kwargs
+        self,
+        questions,
+        nameserver_record,
+        address_record,
+        *,
+        extra_edns_options=(),
+        port: int = 53,
+        force_tcp: bool = False,
+        **kwargs,
     ):
         for label, value in (
             ("nameserver_record", nameserver_record),
@@ -353,9 +379,15 @@ class Resolver(asyncio.Protocol):
         # attempt would be answered with a truncated or refused reply rather
         # than a zone transfer.
         q0 = questions[0] if questions else None
+        if force_tcp:
+            # The caller chose the transport rather than leaving the choice to
+            # this resolver's fallbacks: a stub pointed at a server whose
+            # ``transport`` is "tcp" asks over TCP first because that is the
+            # configuration it was given, not because UDP failed.
+            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet, port=port)
         if q0 is not None and getattr(q0, "qtype", None) == DnsQType.AXFR:
             self.log.debug("resolver_force_tcp_axfr(dst=%s id=%s)", ip.exploded, dns_packet.ID)
-            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
+            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet, port=port)
 
         key = _pending_key(ip.exploded, dns_packet)
         self.log.debug(
@@ -381,10 +413,11 @@ class Resolver(asyncio.Protocol):
             if transport_v6 is None or queue_v6 is None:
                 future.cancel()
                 return None
+            sendto_addr: tuple
             # On Windows, IPv6 sendto expects the full 4-tuple (host, port, flowinfo, scopeid).
-            transport, queue, sendto_addr = transport_v6, queue_v6, (ip.exploded, 53, 0, 0)
+            transport, queue, sendto_addr = transport_v6, queue_v6, (ip.exploded, port, 0, 0)
         elif isinstance(ip, ipaddress.IPv4Address):
-            transport, queue, sendto_addr = self.transport, self.queue, (ip.exploded, 53)
+            transport, queue, sendto_addr = self.transport, self.queue, (ip.exploded, port)
         else:
             future.cancel()
             return None
@@ -422,7 +455,7 @@ class Resolver(asyncio.Protocol):
                 future = asyncio.get_running_loop().create_future()
             queue[key] = (dns_packet, future)
             transport.sendto(bytes(dns_packet), sendto_addr)
-            response = await self._await_udp(future, key, dns_packet, ip, queue=queue)
+            response = await self._await_udp(future, key, dns_packet, ip, queue=queue, port=port)
             if response is not None:
                 self._note_server(ip, response)
             if response is None or attempt == 3:
@@ -596,7 +629,7 @@ class Resolver(asyncio.Protocol):
             return True
         return rcode == int(DnsResponseCode.FORMAT_ERROR) and response.opt() is None
 
-    async def _await_udp(self, future, key, dns_packet, ip, *, queue=None):
+    async def _await_udp(self, future, key, dns_packet, ip, *, queue=None, port: int = 53):
         """Await one UDP response, retrying over TCP when UDP could not carry it.
 
         Two outcomes force a TCP retry, and neither is a matter of taste:
@@ -644,7 +677,7 @@ class Resolver(asyncio.Protocol):
                 dns_packet.ID,
                 version,
             )
-            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
+            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet, port=port)
         except asyncio.CancelledError:
             # The docstring above promised the slot cannot leak; timeout was
             # covered but cancellation was not, and cancellation is the common
@@ -661,10 +694,10 @@ class Resolver(asyncio.Protocol):
                 dns_packet.ID,
                 version,
             )
-            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet)
+            return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet, port=port)
         return response
 
-    async def _query_tcp(self, host, wire, query_packet):
+    async def _query_tcp(self, host, wire, query_packet, port: int = 53):
         """Query over TCP, with the 2-octet length prefix RFC 1035 section 4.2.2.
 
         TCP is reached from three places: a UDP attempt that timed out, a UDP
@@ -689,7 +722,7 @@ class Resolver(asyncio.Protocol):
         self.log.debug("resolver_tcp_try(dst=%s id=%s)", host, query_packet.ID)
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, 53), timeout=self.query_timeout
+                asyncio.open_connection(host, port), timeout=self.query_timeout
             )
         except Exception as e:
             self.log.debug(
@@ -732,6 +765,119 @@ class Resolver(asyncio.Protocol):
                 # connection down (a server that RSTs instead of finishing the
                 # close) must not turn a good response into an error.
                 self.log.debug("resolver_tcp_close_failed(err=%s)", type(exc).__name__)
+
+    # -- the UDP receive plumbing. On the base, not on :class:`RecursiveResolver`,
+    # because :meth:`query` above is written against it and a stub resolver (see
+    # :mod:`namespy.stub`) drives the very same send path: one socket, one
+    # pending-question table, one answer-matching rule, whoever is asking.
+
+    def connection_made(self, transport):
+        self.transport = transport
+        enable_path_mtu_discovery(transport, self.log)
+        # Start bringing up an IPv6 UDP transport in the background so IPv6
+        # destinations can be used when the IPv4 path is what is unreachable
+        # (for the walk, AAAA glue; for a stub, an upstream that is v6-only).
+        try:
+            loop = asyncio.get_running_loop()
+            if self._v6_ready is None:
+                self._v6_ready = loop.create_task(self._ensure_v6_transport())
+        except RuntimeError:
+            # No running loop (should not happen in normal asyncio usage).
+            pass
+
+    async def _ensure_v6_transport(self):
+        if self.transport_v6 is not None:
+            return self.transport_v6
+
+        parent = self
+
+        class _V6Shim(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                parent.transport_v6 = transport
+
+            def datagram_received(self, data, addr):
+                parent._datagram_received_v6(data, addr)
+
+            def error_received(self, exc):
+                parent.error_received(exc)
+
+        loop = asyncio.get_running_loop()
+        try:
+            transport, _proto = await loop.create_datagram_endpoint(
+                lambda: _V6Shim(),
+                local_addr=("::", 0),
+                family=socket.AF_INET6,
+            )
+            self.transport_v6 = transport
+            self.log.debug("resolver_v6_ready(sockname=%s)", transport.get_extra_info("sockname"))
+            return transport
+        except Exception as e:
+            self.log.debug("resolver_v6_failed(err=%s)", type(e).__name__)
+            self.transport_v6 = None
+            return None
+
+    def _datagram_received_v6(self, data, addr):
+        try:
+            dns_packet, _offset = DnsPacket.parse(data)
+        except DnsPacketParseError:
+            # Same policy as the IPv4 path: a malformed datagram is discarded
+            # quietly at debug level, since an attacker who can send us garbage
+            # should not be able to use our log as an amplifier.
+            self.log.debug("resolver_v6_parse_failed(len=%d)", len(data))
+            return
+
+        host = addr[0]
+        key = _pending_key(host, dns_packet)
+        entry = self.queue_v6.get(key)
+        if entry is None:
+            self.log.debug("resolver_v6_unexpected_packet(src=%s id=%s)", host, dns_packet.ID)
+            return
+
+        query_packet, future = entry
+        del self.queue_v6[key]
+        if not _is_expected_response(query_packet, dns_packet, host):
+            self.log.warning("resolver_v6_response_mismatch(src=%s id=%s)", host, dns_packet.ID)
+            return
+        if not future.done():
+            future.set_result(dns_packet)
+
+    def datagram_received(self, data, addr):
+        try:
+            (dns_packet, _offset) = DnsPacket.parse(data)
+        except DnsPacketParseError as e:
+            # Debug, not warning: this is the attacker-controlled path, and a
+            # warning with a hex dump per datagram is a free log-flood
+            # primitive. The v6 path and server.py already stay quiet; this
+            # was the last loud one.
+            self.log.debug(
+                "resolver_parse_failed(err=%s offset=%s len=%d hex=%s)",
+                e,
+                e.offset,
+                len(e.data),
+                e.wire_hex(),
+            )
+            return
+
+        self.log.debug("resolver_datagram_received(packet=%s, addr=%s)", dns_packet, addr)
+        host = addr[0]
+        entry = self.queue.get(_pending_key(host, dns_packet))
+        if entry is None:
+            # Nothing asked this server for this (name, type, class) under this
+            # ID. Either it is late, duplicated, or forged; all three are handled
+            # the same way -- discard.
+            self.log.debug("resolver_unexpected_packet(src=%s id=%s)", host, dns_packet.ID)
+            return
+
+        query_packet, future = entry
+        del self.queue[_pending_key(host, dns_packet)]
+        if not _is_expected_response(query_packet, dns_packet, host):
+            self.log.warning("resolver_response_mismatch(src=%s id=%s)", host, dns_packet.ID)
+            return
+        # The future may already be cancelled if the per-query timeout fired
+        # before this late response arrived; ignore that race rather than
+        # propagating InvalidStateError out of the protocol callback.
+        if not future.done():
+            future.set_result(dns_packet)
 
 
 # RFC 1034 §5.3.2 resolver state.
@@ -3619,113 +3765,6 @@ class RecursiveResolver(Resolver):
         await self.aclose()
         # Do not swallow: an exception raised inside the block is the caller's
         # business, not this method's.
-
-    def connection_made(self, transport):
-        self.transport = transport
-        enable_path_mtu_discovery(transport, self.log)
-        # Start bringing up an IPv6 UDP transport in the background so AAAA glue
-        # can be used when IPv4 anycast is unreachable.
-        try:
-            loop = asyncio.get_running_loop()
-            if self._v6_ready is None:
-                self._v6_ready = loop.create_task(self._ensure_v6_transport())
-        except RuntimeError:
-            # No running loop (should not happen in normal asyncio usage).
-            pass
-
-    async def _ensure_v6_transport(self):
-        if self.transport_v6 is not None:
-            return self.transport_v6
-
-        parent = self
-
-        class _V6Shim(asyncio.DatagramProtocol):
-            def connection_made(self, transport):
-                parent.transport_v6 = transport
-
-            def datagram_received(self, data, addr):
-                parent._datagram_received_v6(data, addr)
-
-            def error_received(self, exc):
-                parent.error_received(exc)
-
-        loop = asyncio.get_running_loop()
-        try:
-            transport, _proto = await loop.create_datagram_endpoint(
-                lambda: _V6Shim(),
-                local_addr=("::", 0),
-                family=socket.AF_INET6,
-            )
-            self.transport_v6 = transport
-            self.log.debug("resolver_v6_ready(sockname=%s)", transport.get_extra_info("sockname"))
-            return transport
-        except Exception as e:
-            self.log.debug("resolver_v6_failed(err=%s)", type(e).__name__)
-            self.transport_v6 = None
-            return None
-
-    def _datagram_received_v6(self, data, addr):
-        try:
-            dns_packet, _offset = DnsPacket.parse(data)
-        except DnsPacketParseError:
-            # Same policy as the IPv4 path: a malformed datagram is discarded
-            # quietly at debug level, since an attacker who can send us garbage
-            # should not be able to use our log as an amplifier.
-            self.log.debug("resolver_v6_parse_failed(len=%d)", len(data))
-            return
-
-        host = addr[0]
-        key = _pending_key(host, dns_packet)
-        entry = self.queue_v6.get(key)
-        if entry is None:
-            self.log.debug("resolver_v6_unexpected_packet(src=%s id=%s)", host, dns_packet.ID)
-            return
-
-        query_packet, future = entry
-        del self.queue_v6[key]
-        if not _is_expected_response(query_packet, dns_packet, host):
-            self.log.warning("resolver_v6_response_mismatch(src=%s id=%s)", host, dns_packet.ID)
-            return
-        if not future.done():
-            future.set_result(dns_packet)
-
-    def datagram_received(self, data, addr):
-        try:
-            (dns_packet, _offset) = DnsPacket.parse(data)
-        except DnsPacketParseError as e:
-            # Debug, not warning: this is the attacker-controlled path, and a
-            # warning with a hex dump per datagram is a free log-flood
-            # primitive. The v6 path and server.py already stay quiet; this
-            # was the last loud one.
-            self.log.debug(
-                "resolver_parse_failed(err=%s offset=%s len=%d hex=%s)",
-                e,
-                e.offset,
-                len(e.data),
-                e.wire_hex(),
-            )
-            return
-
-        self.log.debug("resolver_datagram_received(packet=%s, addr=%s)", dns_packet, addr)
-        host = addr[0]
-        entry = self.queue.get(_pending_key(host, dns_packet))
-        if entry is None:
-            # Nothing asked this server for this (name, type, class) under this
-            # ID. Either it is late, duplicated, or forged; all three are handled
-            # the same way -- discard.
-            self.log.debug("resolver_unexpected_packet(src=%s id=%s)", host, dns_packet.ID)
-            return
-
-        query_packet, future = entry
-        del self.queue[_pending_key(host, dns_packet)]
-        if not _is_expected_response(query_packet, dns_packet, host):
-            self.log.warning("resolver_response_mismatch(src=%s id=%s)", host, dns_packet.ID)
-            return
-        # The future may already be cancelled if the per-query timeout fired
-        # before this late response arrived; ignore that race rather than
-        # propagating InvalidStateError out of the protocol callback.
-        if not future.done():
-            future.set_result(dns_packet)
 
     @staticmethod
     def packaged_root_hints():

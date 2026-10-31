@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import sys
 import time
@@ -31,7 +32,7 @@ from .enums import (
     is_data_rrtype,
 )
 from .names import DomainName
-from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query
+from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query, Response
 from .rdata import generic_presentation, type_name_of
 from .resolver import (
     EDNS_PAYLOAD_SIZE,
@@ -41,6 +42,7 @@ from .resolver import (
     RecursiveResolver,
 )
 from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer
+from .stub import TRANSPORTS, StubResolver, Upstream
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
 EXAMPLE_NAME = "example.org"
@@ -401,6 +403,7 @@ def build_parser():
         "  namespy example.com MX\n"
         "  namespy +short example.com\n"
         "  namespy +trace example.com A\n"
+        "  namespy --forward 10.1.1.1 example.com\n"
         "  namespy --serve\n"
         "  python -m namespy example.com   (same thing, without installing)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -574,6 +577,28 @@ def build_parser():
         " RFC 8914's Stale Answer EDE. Off by default: serving stale trades"
         " correctness for reachability, and that trade belongs to the operator, not"
         " to the library.",
+    )
+    p.add_argument(
+        "--forward",
+        action="append",
+        metavar="UPSTREAM",
+        default=[],
+        help="forward the query to a recursive server instead of walking from the "
+        "root (RFC 1034 section 5.3.1, the stub resolver): UPSTREAM is an address "
+        "literal, optionally with :port; repeat the flag for backups, which are "
+        "asked in order. A REFUSED answer means this upstream declined the "
+        "recursive arrangement, so the next is asked; every other answer comes "
+        "back exactly as it arrived. Requires --serve to be absent.",
+    )
+    p.add_argument(
+        "--stub-transport",
+        choices=list(TRANSPORTS),
+        default=None,
+        metavar="TRANSPORT",
+        help="transport for --forward upstreams (default: udp). udp retries the "
+        "way every DNS answer is retried -- a timeout or a truncated answer is "
+        "asked again over TCP (RFC 1035 section 4.2.2, RFC 7766); tcp asks over "
+        "TCP first. Only meaningful with --forward.",
     )
     p.add_argument(
         "--mqtype",
@@ -945,6 +970,76 @@ async def cli_query(args) -> int:
         await resolver_protocol.aclose()
 
 
+async def cli_stub(args) -> int:
+    """Forward one query to the configured upstreams and print the answer.
+
+    The forwarding mode of RFC 1034 §5.3.1 -- the stub: no walk, no cache of
+    one's own claims, no verdict. The upstream's response is printed as it
+    arrived, header flags and TTLs included; if it refused recursion the
+    caller sees that refusal (or the backup's answer, once
+    :class:`~namespy.stub.StubResolver` has asked down the list).
+    """
+    loop = asyncio.get_running_loop()
+    qname = DomainName(args.name)
+    try:
+        parsed = [Upstream.parse(text) for text in args.forward]
+        upstreams = (
+            [dataclasses.replace(u, transport=args.stub_transport) for u in parsed]
+            if args.stub_transport
+            else parsed
+        )
+    except ValueError as exc:
+        raise SystemExit(f"namespy: --forward: {exc}") from None
+    if args.mqtype:
+        raise SystemExit(
+            "namespy: --mqtype asks the authorities a combination; --forward asks "
+            "one recursive server a question, and that pairing is not built yet"
+        )
+
+    # The stub is a UDP protocol for the udp transport and needs no socket at
+    # all for a pure-tcp list, but binding is uniform and cheap; the recursive
+    # path binds the same way, and one shape of ``main`` is worth the socket.
+    _transport, stub = await loop.create_datagram_endpoint(
+        lambda: StubResolver(
+            upstreams,
+            dnssec_ok=args.dnssec,
+            edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
+        ),
+        local_addr=("0.0.0.0", 0),
+    )
+    try:
+        question = DnsQuestion(qname, args.type, args.qclass)
+        query = Query(questions=[question], RD=True)
+        start = time.monotonic()
+        try:
+            response = await asyncio.wait_for(stub.forward(query.questions), timeout=args.timeout)
+        except TimeoutError:
+            print(f";; query timed out after {args.timeout:.1f} s", file=sys.stderr)
+            return 2
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        if response is None:
+            # No upstream spoke. The honest packet is the one a recursive
+            # server with nobody left to ask composes: SERVFAIL, RA set (this
+            # host *would* have recursed), and the question echoed back.
+            response = Response(
+                QR=DnsQR.RESPONSE,
+                RD=True,
+                RA=True,
+                RCODE=DnsResponseCode.SERVER_FAILURE,
+                questions=list(query.questions),
+            )
+        if args.short:
+            text = _format_short(response, None)
+            if text:
+                print(text)
+        else:
+            print(_format_response(response, args, elapsed_ms, None, cut=None))
+        return 0
+    finally:
+        _transport.close()
+        await stub.aclose()
+
+
 async def serve(args) -> int:
     resolver_protocol = None
     _resolver_transport = None
@@ -1043,9 +1138,18 @@ def main(argv=None) -> int:
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
     if args.serve:
+        if args.forward:
+            parser.error("--serve and --forward do not combine")
         return asyncio.run(serve(args))
     if args.name is None:
         parser.error("name is required (or use --serve to run the demo server)")
+    if args.stub_transport and not args.forward:
+        parser.error(
+            "--stub-transport names the transport of a --forward upstream; "
+            "give it an upstream with --forward"
+        )
+    if args.forward:
+        return asyncio.run(cli_stub(args))
     return asyncio.run(cli_query(args))
 
 

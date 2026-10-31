@@ -104,8 +104,8 @@ class TcpStub:
         self.result = result
         self.calls = []
 
-    async def __call__(self, host, wire, query_packet):
-        self.calls.append((host, bytes(wire), query_packet))
+    async def __call__(self, host, wire, query_packet, port=53):
+        self.calls.append((host, bytes(wire), query_packet, port))
         return self.result
 
 
@@ -125,7 +125,8 @@ async def test_truncated_udp_answer_is_retried_over_tcp():
     future.set_result(answer_for(sent_query, tc=True))
 
     assert await task is tcp_answer
-    assert [host for host, _wire, _pkt in tcp.calls] == [NS_IP.exploded]
+    assert [host for host, _wire, _pkt, _port in tcp.calls] == [NS_IP.exploded]
+    assert [port for _host, _wire, _pkt, port in tcp.calls] == [53]
 
 
 @pytest.mark.asyncio
@@ -143,7 +144,7 @@ async def test_tcp_retry_asks_the_same_question():
     future.set_result(answer_for(sent_query, tc=True))
     await task
 
-    _host, wire, query_packet = tcp.calls[0]
+    _host, wire, query_packet, _port = tcp.calls[0]
     assert len(wire) > 12, "TCP carries a length prefix plus the whole query"
     assert query_packet is sent_query
     assert query_packet.questions == sent_query.questions

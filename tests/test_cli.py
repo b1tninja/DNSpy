@@ -1201,3 +1201,88 @@ async def test_an_ordinary_lookup_still_validates_nothing(monkeypatch):
     assert await cli.cli_query(_args(["example.com"])) == 0
     assert made[0][1].trust_anchors == ()
     assert made[0][1].dnssec_ok is False
+
+
+# ---------------------------------------------------------------- forwarding mode
+
+
+class _SilentTransport:
+    """Records sends and swallows them: the configured upstream never speaks."""
+
+    def __init__(self):
+        self.sent = []
+
+    def sendto(self, data, addr):
+        self.sent.append((bytes(data), addr))
+
+    def get_extra_info(self, key, default=None):
+        return default
+
+    def close(self):
+        pass
+
+
+def _silent_endpoints(monkeypatch):
+    made = []
+
+    async def endpoint(factory, **_kwargs):
+        transport = _SilentTransport()
+        protocol = factory()
+        # the real binder calls connection_made before returning; the stub's
+        # send path reads the transport it stores there
+        protocol.connection_made(transport)
+        made.append((transport, protocol))
+        return transport, protocol
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "create_datagram_endpoint", endpoint, raising=False
+    )
+    return made
+
+
+async def test_forwarding_with_no_answer_is_said_not_thrown(monkeypatch, capsys):
+    _silent_endpoints(monkeypatch)
+    code = await cli.cli_stub(_args(["--forward", "10.1.1.1", "--timeout", "0.05", "example.com"]))
+    assert code == 2
+    assert "timed out" in capsys.readouterr().err
+
+
+async def test_forward_prints_the_upstream_answer_as_it_arrived(monkeypatch, capsys):
+    made = _silent_endpoints(monkeypatch)
+    task = asyncio.ensure_future(
+        cli.cli_stub(_args(["--forward", "10.1.1.1:5353", "--timeout", "5", "example.com"]))
+    )
+    for _ in range(100):
+        await asyncio.sleep(0)
+        transport, stub = made[0]
+        if stub.queue:
+            break
+    key = next(iter(stub.queue))
+    sent_query, future = stub.queue.pop(key)
+    assert sent_query.RD is True  # a forwarded query asks for recursion
+    future.set_result(
+        Response(ID=sent_query.ID, QR=1, RA=True, questions=list(sent_query.questions))
+    )
+    assert await task == 0
+    out = capsys.readouterr().out
+    assert "status: NO_ERROR" in out
+    # the captured transport, not ``stub.transport``: ``aclose`` releases it
+    assert transport.sent[0][1] == ("10.1.1.1", 5353)
+
+
+def test_forward_rejects_a_hostname_upstream():
+    # the stub resolves nothing, its own bootstrap servers included -- parsed
+    # before any socket opens, so this test needs no endpoint stand-in at all
+    with pytest.raises(SystemExit) as excinfo:
+        asyncio.run(cli.cli_stub(_args(["--forward", "ns.example.net", "example.com"])))
+    assert "--forward" in str(excinfo.value)
+
+
+def test_forward_and_serve_do_not_combine():
+    with pytest.raises(SystemExit):
+        cli.main(["--serve", "--forward", "10.1.1.1"])
+
+
+def test_stub_transport_without_forward_is_said_so():
+    with pytest.raises(SystemExit):
+        cli.main(["--stub-transport", "tcp", "example.com"])
