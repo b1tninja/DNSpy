@@ -33,7 +33,7 @@ Three outcomes, not two, because the resolver's next step differs between them:
   is bogus-material territory: retrying will not help.
 * **UNSUPPORTED** -- nothing could be tried: RFC 9904's MAY-tier or an unregistered
   algorithm, an install without `namespy[crypto]`, or matching keys whose bytes the
-  backend cannot build a key from. RFC 9080 §3.1 named the state Indeterminate for
+  backend cannot build a key from. RFC 4035 §4.3 named that state Indeterminate for
   exactly this reason -- "we could not check" must not be laundered into "it is forged",
   because the difference is whether the resolver drops the answer or keeps walking.
 
@@ -82,7 +82,7 @@ __all__ = [
 
 
 class SignatureOutcome(Enum):
-    """The three answers §5.3.1 can leave a validator with, read through RFC 9080 §3.1."""
+    """The three answers §5.3.1 can leave a validator with, read through RFC 4035 §4.3."""
 
     VALID = "valid"
     INVALID = "invalid"
@@ -268,7 +268,7 @@ class ChainOutcome(Enum):
 
     SECURE: the anchor's key signed the apex RRset. BOGUS: the link exists and is wrong
     -- no key matches the trusted digest, or the matching key's signature does not
-    verify. INDETERMINATE: the link could not be examined (RFC 9080 §3.1's state), which
+    verify. INDETERMINATE: the link could not be examined (RFC 4035 §4.3¶5's state), which
     a validator must not report as either of the others.
     """
 
@@ -299,6 +299,7 @@ def authenticate_dnskey_rrset(
     *,
     now: float | None = None,
     rclass: int = 1,
+    trusted_dnskeys: Iterable[RData_DNSKEY] = (),
 ) -> ChainVerdict:
     """Answer RFC 4035 §5.2¶2 for one zone: does a trusted DS introduce these keys?
 
@@ -316,6 +317,12 @@ def authenticate_dnskey_rrset(
     so. A function that re-checked its own trust point could only check it against
     itself.
 
+    ``trusted_dnskeys`` covers the other anchor shape RFC 4033 §2 allows -- "*a
+    configured DNSKEY RR* or DS RR hash of a DNSKEY RR": a record byte-identical to a
+    configured key matches without any digest arithmetic (this is how RFC 9718 §2.2¶12's
+    optional PublicKey element is consumed), and it earns nothing beyond what a DS match
+    earns -- ¶5 still demands that this very key signed the RRset.
+
     The failure taxonomy is where the care went: digest types this package cannot
     compute yield INDETERMINATE, not BOGUS (§5.2¶8 and §5.2¶10 route the
     no-supported-algorithm case to "treat the child as unsigned", a different
@@ -326,7 +333,8 @@ def authenticate_dnskey_rrset(
     if not records:
         raise ValueError("authenticate_dnskey_rrset needs the apex DNSKEY RRset: dnskeys is empty")
     trust_points = list(trusted)
-    if not trust_points:
+    direct_keys = list(trusted_dnskeys)
+    if not trust_points and not direct_keys:
         raise ValueError(
             "authenticate_dnskey_rrset needs at least one trust point: trusted is empty"
         )
@@ -335,6 +343,9 @@ def authenticate_dnskey_rrset(
     pairs: list[RData_DNSKEY] = []
     incomparable = 0
     disqualified = False
+    for key in records:
+        if any(bytes(key) == bytes(anchor) for anchor in direct_keys):
+            pairs.append(key)
     for ds in trust_points:
         if known_digest_octets(int(ds.digest_type)) is None:
             incomparable += 1
@@ -352,7 +363,7 @@ def authenticate_dnskey_rrset(
                 continue
             pairs.append(key)
     if not pairs:
-        if incomparable == len(trust_points):
+        if incomparable and incomparable == len(trust_points):
             return ChainVerdict(
                 ChainOutcome.INDETERMINATE,
                 "no trust point carries a digest type this package can compute; RFC "

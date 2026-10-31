@@ -195,9 +195,11 @@ class NxdomainPolicy(enum.Enum):
 
     :attr:`VALIDATED` is §2¶3: "a validating resolver MAY decide to implement the
     'NXDOMAIN cut' behavior (described in the first paragraph of this section)
-    only when the NXDOMAIN response has been validated with DNSSEC". It cannot be
-    honoured yet, because nothing here validates, so constructing it raises
-    instead of quietly behaving like :attr:`NEVER`. The two emit the same
+    only when the NXDOMAIN response has been validated with DNSSEC". The validator
+    that answers that question exists (:class:`namespy.validate.Validator` -- the four
+    states of RFC 4035 §4.3), but the resolver walk does not yet fetch the DS and
+    DNSKEY RRsets it would need to answer it at cut time, so constructing this policy
+    raises instead of quietly behaving like :attr:`NEVER`. The two emit the same
     packets, and a caller who asked for validated-only would have no way to tell
     "the proofs did not check out" from "there is no verification at all".
 
@@ -219,8 +221,8 @@ class NxdomainPolicy(enum.Enum):
     #: Deny only the exact name cached; walk below it. Diagnostics only.
     NEVER = "never"
 
-    #: Cut only on DNSSEC-validated denials (RFC 8020 §2¶3). Not representable
-    #: without validation, and refuses to be constructed.
+    #: Cut only on DNSSEC-validated denials (RFC 8020 §2¶3). The walk cannot yet
+    #: produce a verdict at cut time, and refuses to be constructed until it can.
     VALIDATED = "validated"
 
 
@@ -2454,9 +2456,10 @@ class RecursiveResolver(Resolver):
             # would look like it worked while teaching the operator that DNSSEC
             # proof is what stopped the cut, when in fact nothing was checked.
             raise ValueError(
-                "NxdomainPolicy.VALIDATED needs DNSSEC validation, which namespy "
-                "does not perform yet; use NxdomainPolicy.ALWAYS (RFC 8020 section 2) "
-                "or NxdomainPolicy.NEVER"
+                "NxdomainPolicy.VALIDATED needs DNSSEC validation wired into the "
+                "resolver walk; namespy.validate holds the four-state validator but the "
+                "walk does not yet fetch the DS and DNSKEY RRsets it would consume, so "
+                "use NxdomainPolicy.ALWAYS (RFC 8020 section 2) or NxdomainPolicy.NEVER"
             )
         if self.nxdomain_cut is NxdomainPolicy.NEVER:
             # Not a warning: unlike permissive glue this disables an efficiency,

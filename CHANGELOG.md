@@ -8,6 +8,34 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- The four states of RFC 4035 §4.3 as a layer (`namespy/validate.py`) — the shift from "does
+  this signature hold" to "may this answer be believed". `DnssecStore` buckets records from
+  any number of responses into RRsets that remember the zone they arrived in (RFC 4035
+  §5.3.2¶18: parent and child can each hold an NSEC at the same delegated name, the two
+  "MUST NOT be combined", and a merged bucket matches neither signature — every signed
+  delegation a self-inflicted bogus without this), `Validator.authenticate_zone` climbs
+  from any zone to a trust point — a DS- *or* DNSKEY-shaped anchor (RFC 4033 §2 allows
+  either, and `authenticate_dnskey_rrset` gained `trusted_dnskeys` to consume RFC 9718
+  §2.2¶12's optional PublicKey element), an authenticated parent's DS, or the parent's
+  signed proof that no DS exists — and `validate_rrset` / `validate_denial` decide answers,
+  wildcard-expanded answers (RFC 4035 §5.3.4¶1's closer-match proof, demanded and
+  verified), and Name Error / No Data denials under keys the chain has already vouched
+  for. The states refuse to launder into one another: an unsigned child nobody proved
+  unsigned is Indeterminate, not Insecure (the distinction RFC 8020 §2¶3's cut rule hangs
+  on); a *missing* signature is Bogus, because RFC 4033 §5 lists it there literally and
+  §4.3¶5's "not able to obtain" means absent records, not unsigned present ones; a forged
+  no-DS proof makes the child Bogus rather than Insecure (strip-a-DS-sign-the-lie is the
+  attack "signed proof" exists to close); a missing backend is Indeterminate top to
+  bottom; an expired window is Bogus, being a check that ran and refused. A directly
+  anchored island stays SECURE below a broken parent (RFC 4035 §5.1, §5.2¶7 — the parent's
+  verdict is a result, never a veto), and every proof record in a bundle is verified, not
+  just the one the geometry consulted ("all the signatures in the response", RFC 4033 §5).
+  The tests build a three-level RSA-signed tree — real keys, real signing bytes, both NSEC
+  and NSEC3 legs — and break it one octet at a time; the captured live root also validates
+  end to end as an answer through the new layer (`test_dnssec_validate.py`, 45 tests).
+  Nothing in the resolver consumes it yet: `NxdomainPolicy.VALIDATED` still refuses at the
+  door, its message now naming the remaining gap — the walk's DS/DNSKEY fetching.
+
 - Trust anchors and the first live chain (`namespy/anchors.py`, `verify.authenticate_dnskey_rrset`) —
   the trust point the verification stage kept deferring to. The root's anchors are read from their
   live publication rather than embedded from memory: `parse_root_anchors` enforces the RFC 9718 §2.1
@@ -38,7 +66,7 @@ nothing has been tagged or published yet, so `master` is the only version.
   reaches a verification call. The answer is three-way — VALID, INVALID, UNSUPPORTED — because the
   resolver's next step differs: RFC 9904's MUST NOT algorithms (RSAMD5, DSA) are INVALID even in an
   install with no backend at all, while an absent extra, an unregistered algorithm, or a candidate
-  the backend cannot build a key from are UNSUPPORTED, the state RFC 9080 §3.1 created
+  the backend cannot build a key from are UNSUPPORTED, the state RFC 4035 §4.3¶5 names
   Indeterminate to name — "we could not check" must never launder into "it is forged". The four
   published vectors authenticate end to end (RFC 6605 §6 ×2, RFC 8080 §6 per **erratum 4935** ×2);
   RSA has no published RRSIG in any RFC, so its paths are pinned by deterministic PKCS#1 v1.5
@@ -790,6 +818,15 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 
 ### Fixed
+
+- **The Indeterminate state was cited to the wrong RFC.** Documentation written while
+  building `namespy/verify.py` and `namespy/crypto.py` credited the four validation states
+  to "RFC 9080 §3.1" — but RFC 9080 is the Homenet profile of the Babel routing protocol,
+  and the citation survived two rounds of review because nobody opened the document.
+  Re-checked against the source: the states are RFC 4035 §4.3's, with the variant wording
+  in RFC 4033 §5 and both reprinted side by side in RFC 9499 §11. All eight occurrences
+  (module docstrings, two enums, one test, the changelog, the handoff, the roadmap) now
+  cite §4.3, and rule 8 acquired its scar tissue.
 
 - **The name round-trip fuzzer could raise instead of skipping.**
   `test_names_survive_encode_parse_and_back` assumed the 255-octet limit away *after*

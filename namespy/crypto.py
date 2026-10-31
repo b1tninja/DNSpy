@@ -367,7 +367,7 @@ class SignatureMaterialError(ValueError):
     cannot be constructed (RFC 3110 packing that does not parse, a point off the named
     curve, a modulus outside the window its algorithm is given) is evidence about the
     record, and reporting it as a failed signature would launder "we could not check"
-    into "it is forged" -- the exact confusion RFC 9080 §3.1's Indeterminate exists to
+    into "it is forged" -- the exact confusion RFC 4035 §4.3¶5's Indeterminate exists to
     prevent upstream.
     """
 

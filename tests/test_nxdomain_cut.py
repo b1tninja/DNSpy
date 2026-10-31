@@ -383,12 +383,14 @@ def test_a_cached_denial_beats_a_failure_note():
 
 
 def test_validated_policy_is_refused_at_the_door():
-    """RFC 8020 §2¶3 is a stance this package cannot honour, and says so.
+    """RFC 8020 §2¶3 is a stance the resolver cannot honour yet, and says so.
 
-    VALIDATED and NEVER emit the same packets while nothing validates, so a silent
+    The validator of :mod:`namespy.validate` arrived, but the walk still never
+    fetches the DS and DNSKEY RRsets that would make its verdict available at cut
+    time -- and VALIDATED and NEVER emit the same packets without it, so a silent
     fallback would leave an operator believing DNSSEC proof was what stopped the
-    cut. Refusing is the only honest option until there is validation -- and this
-    test is the thing that has to change when it arrives.
+    cut. Refusing stays the honest option until the wiring lands, and this test is
+    the thing that has to change when it does.
     """
     with pytest.raises(ValueError, match="DNSSEC"):
         RecursiveResolver(nxdomain_cut=NxdomainPolicy.VALIDATED)

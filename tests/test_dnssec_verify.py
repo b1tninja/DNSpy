@@ -159,7 +159,7 @@ def test_must_not_algorithms_are_invalid_not_unsupported(algorithm: int):
 def test_algorithms_this_package_cannot_attempt_are_unsupported(algorithm: int, status: str):
     """GOST is registered at MAY and unregistered numbers carry no pairing at all.
 
-    Neither is bogus material -- they are checks that cannot run, RFC 9080 §3.1's
+    Neither is bogus material -- they are checks that cannot run, RFC 4035 §4.3¶5's
     Indeterminate -- and the reason quotes the RFC 9904 status so the operator learns
     which of the two situations they are in.
     """

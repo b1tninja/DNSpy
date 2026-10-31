@@ -875,7 +875,7 @@ marks RSAMD5/DSA MUST NOT "so that recursive resolvers can remove support for va
 it" — which maps to INVALID, and deliberately *ahead of the backend probe*, so the answer
 cannot vary by install (a test drives it with the backend monkeypatched away). Unreadable
 material, an absent extra, an unregistered algorithm map to UNSUPPORTED instead: RFC
-9080 §3.1 invented Indeterminate because "we could not check" reported as "it is forged"
+4035 §4.3¶5's Indeterminate exists because "we could not check" reported as "it is forged"
 is the failure mode that turns a broken path into a denial. (2) *The key tag is a
 weighted checksum, and my own test tripped on it*: constructing a tag-preserving twin by
 trading +1/-1 across *adjacent* key bytes moves the tag by exactly 255 — Appendix B
@@ -977,6 +977,74 @@ at each cut, `authenticate_dnskey_rrset` composing them root-down, §5.2¶7/¶10
 insecure and unsupported children, and `NegativeEntry` proofs whose records verify through
 `verify_rrsig`; (2) the header AD/CD bits (§9.2, 6895, 8145). The DS-strip question and the
 `serve --dnssec` DO question remain open.
+
+### Follow-up: the four-state layer — `namespy/validate.py` (RFC 4035 §4.3, §5.1, §5.2¶6-¶7, §5.3.4; RFC 4033 §5)
+
+The fifth stage: the layer that answers the question the previous four stages were all
+local about. Not "does this signature hold" but "may this answer be believed" — the
+four states RFC 4035 §4.3 requires a security-aware resolver to name, now decided from
+whatever records a walk has accumulated, across as many responses as the chain needs.
+
+**What shipped.** `namespy/validate.py` — `DnssecStore` buckets records into RRsets that
+remember which zone's data they arrived in (RFC 4035 §5.3.2¶18: at a delegation the parent
+and the child each hold an NSEC at the same name, and the two "MUST NOT be combined");
+`Validator.authenticate_zone` climbs from any zone to a trust point — a DS- or
+DNSKEY-shaped anchor (RFC 4033 §2 allows either; `authenticate_dnskey_rrset` gained the
+`trusted_dnskeys` parameter that consumes RFC 9718 §2.2¶12's optional PublicKey element),
+an authenticated parent's DS, or the parent's signed proof that no DS exists; and
+`validate_rrset` / `validate_denial` decide answers, wildcard-expanded answers (§5.3.4¶1's
+closer-match proof, required and verified), and denials — geometry through the nsec.py
+predicates, then signatures over every record in the proof bundle. `verify.py`'s
+three-way outcome propagates upward unchanged: missing data says Indeterminate,
+contradicted data says Bogus, and the two never trade places. `namespy/validate.py` is
+not re-exported from the package root, same as its predecessors.
+
+**Findings.** (1) *A wrong citation was living in six files*: the last two rounds credited
+the Indeterminate state to "RFC 9080 §3.1" — RFC 9080 is the Homenet profile of Babel
+(author Chroboczek; nothing to do with DNSSEC). The states' actual home, checked against
+the document itself per rule 8, is RFC 4035 §4.3, with RFC 4033 §5 as the variant and RFC
+9499 §11 reprinting both verbatim while declining to reconcile them. All eight occurrences
+are corrected, and the correction is recorded in the roadmap row it touches. (2) *Origin
+bucketing is not tidiness*: a (name, type)-keyed store merges the parent's NSEC for a
+delegated name with the child's NSEC for its own apex — one RRset matching neither
+signature, every signed delegation a self-inflicted bogus; the RRSIG's Signer's Name is
+its own origin for free, and a test pins the split. (3) *A missing signature is Bogus, not
+Indeterminate* — RFC 4033 §5 lists "missing signatures" under Bogus literally, and §4.3¶5's
+"not able to obtain" is about absent records, not un-signed present ones; the two refusals
+read alike until you notice one is evidence of tampering. (4) *INSECURE must be earned by a
+verifying proof*: with the no-DS NSEC's signature octet flipped, the unsigned child is
+BOGUS, not downgraded — strip-a-DS-sign-the-lie turns every name below a subtree over to
+whatever the path answers, which is the attack RFC 4033 §5's phrase "signed proof" exists to
+close. In the combination order, BOGUS outranks INSECURE outright. (5) *The parent's
+verdict is a result, never a veto* — §5.1's islands and §5.2¶7's "MAY re-establish an
+authentication path": the directly-anchored zone stays SECURE below a parent whose DS was
+tampered with, and the walk's memo makes that one climb per zone per lookup. (6) *Expired
+is Bogus too*: the window is a check that ran and refused; "could not tell" would invite
+retrying stale data into permanence instead of the re-sign that fixes it. (7) The
+wildcard's synthesising name is reconstructed from the one octet that remembers it — the
+RRSIG's Labels — and the closer-match proof is then verified like the rest of the bundle,
+because a wildcard is only as strong as the denial that nothing closer exists.
+
+**Not claimed.** The resolver still consumes none of it: `NxdomainPolicy.VALIDATED`
+refuses at the door, its message now naming the true gap — the walk must *fetch* DS and
+DNSKEY RRsets at cut time and keep them available to a `Validator`, which is wiring plus
+a caching question (DNSKEY/DS have no place in the current entry model yet), not more
+verification logic. Nothing here touches the wire, the caches, or the AD/CD bits; the
+`now` a resolver would pin per lookup is threaded but nothing live calls it.
+
+**Verified**: 1294 passed (+45 in `tests/test_dnssec_validate.py`), `ruff check .` /
+`ruff format --check .` clean, `mypy namespy` exits 0 (23 modules), `-O` run holds,
+coverage 92% total with `namespy/validate.py` at 97% (the remainder: defensive arms —
+unsigned-proof propagation and the unreachable wildcard contradictions) and the whole
+45-test file passing without network: a three-level RSA-signed tree, both NSEC and NSEC3
+legs, broken one octet at a time, plus the captured live root validated end to end as an
+answer through the new layer.
+
+**Next, in order**: (1) `NxdomainPolicy.VALIDATED` wiring — DS/DNSKEY fetching at each
+cut, an entry kind for the keys the walk learns, `Validator` consumed at cut time and
+before synthesis, and §5.2¶7/¶10 routing of insecure and unsupported children; (2) the
+header AD/CD bits (§9.2, 6895, 8145). The DS-strip question and the `serve --dnssec` DO
+question remain open.
 
 ## Previous round: MQTYPE (RFC 10029)
 
