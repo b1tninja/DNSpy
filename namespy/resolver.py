@@ -92,7 +92,7 @@ from .packet import (
 )
 from .rdata import RData_A, RData_AAAA, type_name_of
 from .trace import Trace
-from .validate import Validator
+from .validate import SecurityStatus, Validator
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1667,6 +1667,7 @@ def resolve_steps(
     dnssec_ok: bool = False,
     anchors: tuple = (),
     now: float | None = None,
+    client_cd: bool = False,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -1699,6 +1700,24 @@ def resolve_steps(
     was: gathering, judging, and stamping nothing. ``now`` pins the signature
     window for the whole lookup; ``None`` takes the cache's clock, then the wall
     clock.
+
+    ``client_cd`` is the initiating query's CD bit, and it rewrites what a
+    failure means. RFC 4035 §3.2.2¶3 makes the set bit a request to be *passed
+    through*: "the recursive name server should not interfere", so a Bogus denial
+    is answered rather than refused, no failure is noted (nothing failed -- §4.2¶2
+    exempts a CD lookup from validating, and an unexecuted check is not a cached
+    failure), the remembered *validation* failures in the failure cache do not
+    suppress it (§3.2.2¶5: withholding the raw data "does not help the client"
+    that can check it), and -- because this package caches no unvalidated data a
+    later non-CD lookup might inherit -- nothing from a CD lookup is written to
+    the response cache at all. Its own answer never claims AD either: with CD set
+    the walk validates nothing it must stand behind. Clear, with anchors, the walk
+    is the client's validator: a Bogus denial becomes a SERVFAIL carrying a
+    ``dnssec_bogus`` marker (the serve side reads it to attach RFC 8914 §4.7's EDE
+    6), the forged answer is kept out of the cache where RFC 8020's ALWAYS cut
+    could serve it, and the failure is noted -- RFC 9520 §3.4 turned 4035 §4.7's
+    MAY into a MUST, with §3.2's backoff as the TTL guidance, which is the
+    amplification guard §4.7¶4 wanted.
 
     ``nxdomain_cut`` decides whether a denial cached at or above the name may
     answer for it without a query (RFC 8020 §2 -- see :class:`NxdomainPolicy`). It
@@ -1856,6 +1875,23 @@ def resolve_steps(
         if reason not in reasons:
             reasons.append(reason)
 
+    def _remember_dnssec(reason):
+        """Note that this name failed *validation* (RFC 9520 §2.6, §3.4's MUST).
+
+        Split from :func:`_remember` only by the entry's flag: the backoff, the
+        key and the suppression are 9520's ordinary machinery, while the flag lets
+        a CD query walk past it, which RFC 4035 §3.2.2¶5's reasoning demands. The
+        reason is capped -- a verdict sentence is longer than the network phrases
+        this field usually holds, and it reappears inside every suppressed
+        lookup's failure line.
+        """
+        if failures is None:
+            return
+        note = f"DNSSEC bogus: {reason}"[:200]
+        failures.note_query(sname.qname, sname.qtype, sname.qclass, note, dnssec=True)
+        if origin != sname.qname:
+            failures.note_query(origin, sname.qtype, sname.qclass, note, dnssec=True)
+
     for _ in range(max_hops):
         if cache is not None:
             hit = cache.get(sname.qname, sname.qtype, sname.qclass)
@@ -1866,7 +1902,22 @@ def resolve_steps(
                     yield Nxdomain()
                 else:
                     yield Nodata(hit.soa)
-                yield Done(_synthesize_response(sname, hit, dnssec_ok))
+                # A cached denial's stamp is this resolver's own recorded verdict,
+                # and RFC 4035 §3.2.3 lets AD ride on exactly that -- "considers
+                # all RRsets ... to be authentic" is a claim about this server's
+                # knowledge, not about the wire a packet arrived on. A resolver
+                # with no anchors reading a stamp somebody else wrote asserts
+                # nothing: it has no trust point of its own to have checked
+                # against, and §3.1.6¶3 forbids authenticating what it cannot.
+                yield Done(
+                    _synthesize_response(
+                        sname,
+                        hit,
+                        dnssec_ok,
+                        validated=bool(sec_validator is not None)
+                        and bool(getattr(hit, "validated", False)),
+                    )
+                )
                 return
             if cut_enabled or require_validated:
                 cut = _nxdomain_cut(cache, sname.qname, sname.qclass, require_validated)
@@ -1879,11 +1930,19 @@ def resolve_steps(
                     entry, denied_by = cut
                     yield NxdomainCut(str(sname.qname), str(denied_by))
                     yield Nxdomain()
-                    yield Done(_synthesize_response(sname, entry, dnssec_ok))
+                    yield Done(
+                        _synthesize_response(
+                            sname,
+                            entry,
+                            dnssec_ok,
+                            validated=bool(sec_validator is not None)
+                            and bool(getattr(entry, "validated", False)),
+                        )
+                    )
                     return
         if failures is not None:
             blocked = failures.match(sname.qname, sname.qtype, sname.qclass)
-            if blocked is not None:
+            if blocked is not None and not (client_cd and getattr(blocked, "dnssec", False)):
                 # RFC 9520 §3.2: "When an incoming query matches a cached
                 # resolution failure, the resolver MUST NOT send any
                 # corresponding outgoing queries until after the cache entries
@@ -1892,6 +1951,15 @@ def resolve_steps(
                 # *not* re-noted here: a client hammering a dead name would
                 # otherwise keep pushing its expiry out to the five-minute
                 # ceiling and hold a recovered zone shut.
+                #
+                # One exception, and one entry kind: a remembered validation
+                # failure does not stop a CD query. §3.2's sentence was written
+                # about failures of *resolution*, and a CD client has not asked
+                # for ours -- RFC 4035 §3.2.2¶5 says outright that shielding a
+                # client that can validate for itself "does not help the client".
+                # A dead zone is still a dead zone for everyone: the bypass is
+                # keyed on the entry's dnssec flag, not on the client's wishes
+                # about zones that never answered.
                 yield Fail(_cached_failure_reason(blocked))
                 return
         entry = slist.best()
@@ -2049,7 +2117,48 @@ def resolve_steps(
                 sec_verdict = yield from _fetch_chain(
                     sname.qname, int(sname.qtype), denial_rcode, denying_zone
                 )
-            if cache is not None and isinstance(step, (Answer, Nodata, Nxdomain)):
+                if sec_verdict.status is SecurityStatus.BOGUS and not client_cd:
+                    # The walk is this client's validator (RFC 4035 §3.2.2¶3
+                    # inverted: CD is clear, so the authentication duty is
+                    # ours), and a denial that failed it is not an answer. It
+                    # is also not cacheable: RFC 4035 §4.7's BAD-data cache is
+                    # the optional one, and storing forged evidence would let
+                    # the RFC 8020 cut -- which ALLOWS serving an ancestor's
+                    # denial for every name beneath it -- launder one poisoned
+                    # packet into a subtree-wide lie. What §9520 §3.4 does make
+                    # mandatory is caching the *failure*, which the note below
+                    # files with §3.2's backoff -- 4.7¶4's amplification guard,
+                    # met by the machinery 9520 was written to standardise.
+                    yield DnssecVerdict(
+                        str(denying_zone), sec_verdict.status.value, sec_verdict.reason
+                    )
+                    _remember_dnssec(sec_verdict.reason)
+                    refused = Response(
+                        QR=DnsQR.RESPONSE,
+                        RCODE=DnsResponseCode.SERVER_FAILURE,
+                        questions=list(sname.questions),
+                    )
+                    # A marker, not an option: the OPT record a walk collects
+                    # is stripped on egress and rebuilt (RFC 6891 §6.1.1 says
+                    # OPT is never forwarded), so the reason rides as this
+                    # attribute and the serving side turns it into RFC 8914
+                    # §4.7's EDE 6 -- "the resolver attempted DNSSEC
+                    # validation, but validation ended in the Bogus state" is
+                    # precisely what happened, and 22 (no reachable authority)
+                    # would name the wrong fault.
+                    refused.dnssec_bogus = True
+                    yield Done(refused)
+                    return
+            # A CD lookup validated nothing -- §4.2¶2 waived the checks -- and data
+            # nobody checked must not enter the cache this validator's other
+            # answers are drawn from. The strip-a-signature attacker's cheapest
+            # move is to poison through a CD client; refetching for CD callers is
+            # the whole cost of closing it.
+            if (
+                cache is not None
+                and isinstance(step, (Answer, Nodata, Nxdomain))
+                and not (sec_validator is not None and client_cd)
+            ):
                 _write_cache(
                     cache,
                     sname,
@@ -2057,7 +2166,15 @@ def resolve_steps(
                     response,
                     validated=bool(sec_verdict is not None and sec_verdict.secure),
                 )
-            if failures is not None and isinstance(step, (Answer, Nodata, Nxdomain)):
+            if (
+                failures is not None
+                and isinstance(step, (Answer, Nodata, Nxdomain))
+                # Forgetting says "this name resolved after all" -- a claim a CD
+                # lookup cannot make, having checked nothing (§4.2¶2). Clearing a
+                # validation failure on the strength of unvalidated data would let
+                # one CD query unlock the suppression every non-CD query needs.
+                and not (sec_validator is not None and client_cd)
+            ):
                 # Recovery, and it has to be explicit rather than left to the clock.
                 # An answer is direct evidence that whatever was remembered about
                 # this name is stale and that every zone which spoke during this
@@ -2081,6 +2198,16 @@ def resolve_steps(
                 # loops among the failures worth remembering.
                 _remember(step.reason)
             if sec_verdict is not None:
+                if response is not None and sec_verdict.ad_worthy:
+                    # RFC 4035 §3.2.3: AD means this server considers the Answer
+                    # and relevant negative-response RRs authentic -- and this is
+                    # the only moment in the walk entitled to say so, with the
+                    # verdict freshly derived under this resolver's own anchors.
+                    # `ad_worthy` carries the second half of the rule too: an
+                    # Opt-Out next closer proves the denial without proving the
+                    # name absent (RFC 5155 §9.2¶1's MUST NOT), so the bit stays
+                    # down on an otherwise-secure verdict.
+                    response.AD = True
                 # Before the event it judged: the verdict is why the NXDOMAIN below
                 # may cut, and a reader should meet the reason before the fact.
                 yield DnssecVerdict(str(denying_zone), sec_verdict.status.value, sec_verdict.reason)
@@ -2240,12 +2367,20 @@ def _nxdomain_cut(cache, name, qclass, require_validated=False):
     return None
 
 
-def _synthesize_response(sname, hit, dnssec_ok: bool = False):
+def _synthesize_response(sname, hit, dnssec_ok: bool = False, validated: bool = False):
     """Build a synthetic :class:`Response` from a cache hit.
 
     The resolver's outer code expects a :class:`Response` from a successful
     resolution (it stamps the original packet's ``ID`` onto it); we manufacture
     one whose AN/NS sections reflect the cached entry.
+
+    *validated* is the caller's decision, not this function's reading of the
+    entry: it means "this resolver is a validator, and this entry carries its
+    SECURE stamp", and it sets the header's AD bit (RFC 4035 §3.2.3 — the claim
+    is that *this server* considers the answer authentic, which a remembered
+    verdict supports for exactly as long as the entry lives). Left false for a
+    non-validating resolver even when a stamp is present: without anchors of its
+    own this server has no basis to vouch, and §3.1.6¶3 says so in MUSTNOT terms.
 
     *dnssec_ok* decides whether the denial's proof records travel with it, and it means "this
     resolver asked the authorities for DNSSEC data" -- the instance knob, not a client's DO bit.
@@ -2282,6 +2417,7 @@ def _synthesize_response(sname, hit, dnssec_ok: bool = False):
     return Response(
         QR=DnsQR.RESPONSE,
         AA=False,
+        AD=validated,
         RCODE=rcode,
         questions=questions,
         nameservers=nameservers,
@@ -3083,7 +3219,7 @@ class RecursiveResolver(Resolver):
                 extended_error_presentation(error),
             )
 
-    async def _drive(self, gen, trace, depth=0):
+    async def _drive(self, gen, trace, depth=0, client_cd=False):
         """Pump the resolve_steps generator and fulfill its effects.
 
         *depth* bounds sub-resolutions (a glueless NS whose address must itself be
@@ -3091,6 +3227,13 @@ class RecursiveResolver(Resolver):
         raising is deliberate: the caller treats it as "no address found" and
         demotes the entry, so a deep chain degrades instead of aborting the
         lookup that triggered it.
+
+        *client_cd* is the initiating query's CD bit, passed down so a glue
+        sub-walk inherits the policy that governs the lookup it serves: a CD
+        request that exempts the outer answer from validation and cache writes
+        exempts the address of the nameserver that answers it too, and a
+        sub-resolution that silently re-imposed the validating stance would
+        change the client's request halfway down.
         """
         if depth > self.max_depth:
             self.log.debug("resolver_depth_exceeded(depth=%d limit=%d)", depth, self.max_depth)
@@ -3105,6 +3248,18 @@ class RecursiveResolver(Resolver):
 
             if isinstance(step, SendQuery):
                 sent = await self._send_for_entry(step.entry, step.questions, step.extra_qtypes)
+                if isinstance(sent, Response):
+                    # RFC 4035 §4.6¶3: "A resolver MUST disregard the meaning of
+                    # the CD and AD bits in a response unless the response was
+                    # obtained by using a secure channel" -- and UDP to an
+                    # authority with no TSIG is not one. An upstream's AD is
+                    # somebody else's assertion over an authenticable-free wire;
+                    # forwarding it would launder a forged "I validated this" into
+                    # our client's answer. The bits are cleared on arrival so no
+                    # later path can forward one by accident, and any AD this
+                    # resolver returns was set here, under our own anchors.
+                    sent.AD = False
+                    sent.CD = False
                 continue
             if isinstance(step, NeedAddress):
                 # RFC 1034 section 5.3.3 step 2: glue may be absent (a
@@ -3143,8 +3298,11 @@ class RecursiveResolver(Resolver):
                         failures=self.failure_cache,
                         dnssec_ok=self.dnssec_ok,
                         anchors=self.trust_anchors,
+                        client_cd=client_cd,
                     )
-                    sub_response = await self._drive(sub_gen, child_trace, depth + 1)
+                    sub_response = await self._drive(
+                        sub_gen, child_trace, depth + 1, client_cd=client_cd
+                    )
                     if not isinstance(sub_response, Response):
                         continue
                     for record in sub_response.answers:
@@ -3243,6 +3401,7 @@ class RecursiveResolver(Resolver):
             trace.sname = sname
             self.last_trace = trace
         slist = self.sbelt.copy_for(sname)
+        client_cd = bool(getattr(dns_packet, "CD", False))
         gen = resolve_steps(
             sname,
             slist,
@@ -3256,10 +3415,18 @@ class RecursiveResolver(Resolver):
             extra_qtypes=tuple(extra_qtypes),
             dnssec_ok=self.dnssec_ok,
             anchors=self.trust_anchors,
+            client_cd=client_cd,
         )
-        response = await self._drive(gen, self.last_trace)
+        response = await self._drive(gen, self.last_trace, client_cd=client_cd)
         if isinstance(response, Response):
             response.ID = dns_packet.ID
+            # RFC 4035 §3.2.2¶2: "The name server side MUST copy the setting of
+            # the CD bit from a query to the corresponding response." Doing it
+            # here as well as at the server's egress keeps a bare resolve()
+            # caller -- a test, a script, an embedder without namespy.server --
+            # reading the same honest header the served client gets, and the
+            # copy is idempotent when both halves run.
+            response.CD = client_cd
             response.trace = self.last_trace
         return response, sname
 

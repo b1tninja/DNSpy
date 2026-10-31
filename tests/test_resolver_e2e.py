@@ -353,3 +353,35 @@ async def test_resolve_rejects_bad_input(resolver):
     )
     with pytest.raises(ValueError, match="must agree on name and class"):
         await resolver.resolve(mixed)
+
+
+async def test_upstream_ad_and_cd_are_disregarded(resolver):
+    """RFC 4035 §4.6¶3: a response's CD and AD mean nothing over an insecure channel.
+
+    The walk fetches over plain UDP, so an upstream that sets AD -- a
+    misconfigured forwarder, a forger, a middlebox that copies header bits --
+    asserts to nobody this resolver may hear. Clearing on arrival is what lets
+    the AD this resolver eventually returns be only ever its own claim.
+    """
+    signed = authoritative()
+    signed.AD = True
+    signed.CD = True
+    network = FakeNetwork({GTLD_IP: zone_referral(), NS_EX_IP: signed}, root_referral())
+    _wire(resolver, network)
+
+    response = await resolver.resolve(Query(questions=[DnsQuestion(HOST, A_T, 1)]))
+    assert response.AD is False
+    assert response.CD is False
+    assert len(response.answers) == 1  # disregarded is not distrusted: the data stands
+
+
+async def test_cd_is_echoed_from_query_to_response(resolver):
+    """§3.2.2¶2's copy, on the resolver object itself, before any server gets a turn."""
+    network = FakeNetwork({GTLD_IP: zone_referral(), NS_EX_IP: authoritative()}, root_referral())
+    _wire(resolver, network)
+
+    checking = await resolver.resolve(Query(questions=[DnsQuestion(HOST, A_T, 1)], CD=True))
+    assert checking.CD is True
+    assert checking.AD is False  # no anchors configured: nothing checked, nothing claimed
+    plain = await resolver.resolve(Query(questions=[DnsQuestion(HOST, A_T, 1)]))
+    assert plain.CD is False

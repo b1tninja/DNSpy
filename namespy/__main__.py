@@ -232,11 +232,18 @@ def _format_response(response, args, elapsed_ms, bundle=None, cut=None):
         flags.append("rd")
     if response.RA:
         flags.append("ra")
-    # No "ad" or "cd" here on purpose. Those are header bits 5 and 4 (RFC 6895), and this
-    # package does not model the header's copy of either yet; the bits that were printed here came
-    # from the response's OPT record, where bit 15 is DO -- a request the server granted, not data
-    # anyone validated. Printing them in the header line told users their answer was authenticated.
-    # The EDNS line below is where the OPT flags belong, and they are named there correctly.
+    # ad and cd are the header's own bits 5 and 4 (RFC 4035 §2, RFC 6895 §2), and
+    # they are printed here now that the package models them there. They were
+    # removed the day it was noticed that the values printed came from the OPT
+    # record, where bit 15 is DO -- a request the server granted, not data anyone
+    # validated -- and printing that in the header line told users their answer was
+    # authenticated. The lesson stands as the rule the code now follows: ``ad`` here
+    # can only mean a namespy.validate verdict (see DnsPacket.AD), and the OPT
+    # flags keep their own line below, named correctly.
+    if response.AD:
+        flags.append("ad")
+    if response.CD:
+        flags.append("cd")
 
     lines.append(";; Got answer:")
     lines.append(

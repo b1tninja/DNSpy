@@ -1048,7 +1048,7 @@ def soa_record(name=HOST, ttl=300):
     )
 
 
-def reply_with(records=(), nameservers=(), rcode=None, aa=False, tc=False):
+def reply_with(records=(), nameservers=(), rcode=None, aa=False, tc=False, ad=False):
     """A ``resolve()`` reply shaped like the standalone answer for one question.
 
     The echoed question comes from the packet handed to the stub, so a sub-query for
@@ -1063,6 +1063,7 @@ def reply_with(records=(), nameservers=(), rcode=None, aa=False, tc=False):
             RA=True,
             AA=aa,
             TC=tc,
+            AD=ad,
             RCODE=int(DnsResponseCode.NO_ERROR if rcode is None else rcode),
             questions=list(packet.questions),
             answers=list(records),
@@ -1249,6 +1250,34 @@ async def test_a_combination_that_is_authoritative_when_the_primary_is_not_is_no
     assert not reply.AA, "the primary's flags are the reply's flags, decided before combining"
     assert [int(DnsRType.A)] == [int(record.rtype) for record in reply.answers]
     assert () == mqtype_answered_qtypes(reply.edns_options(), primary_qtype=int(DnsQType.A))
+
+
+async def test_a_combination_that_claims_authenticity_when_the_primary_does_not_is_not_merged() -> (
+    None
+):
+    """The AA example's sibling, possible again now that the header's AD is a bit: a
+    validator may validate the answer to one QTx and not the answer to another -- the
+    AAAA denial proved, the A positive not -- and those are different promises.
+
+    RFC 10029 section 3.4 leaves "and other flags" to the implementer; the flags the
+    merge must agree on are the ones that change what the combined message asserts,
+    and AD asserts the most of any of them.
+    """
+    server, resolver, transport = make_server()
+    resolver.resolve = resolver_by_qtype(
+        {
+            int(DnsRType.A): reply_with(records=[a_record()]),
+            int(DnsRType.AAAA): reply_with(records=[aaaa_record()], ad=True),
+        }
+    )
+
+    server.datagram_received(bytes(mqtype_query([DnsQType.AAAA])), ADDR)
+    await drain(server)
+
+    reply = transport.replies[0]
+    assert not reply.AD, "the combination's promise does not become the message's"
+    assert [int(DnsRType.A)] == [int(record.rtype) for record in reply.answers]
+    assert () == mqtype_answered_qtypes(reply.edns_options(), primary_qtype=int(DnsRType.A))
 
 
 async def test_a_record_both_questions_returned_appears_once() -> None:

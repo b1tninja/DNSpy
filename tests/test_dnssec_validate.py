@@ -148,6 +148,7 @@ def build_store(
     nsec3: bool = False,
     bad_salt: bool = False,
     contradict_sub: bool = False,
+    opt_out=(),
     www_sig_alg: int = 8,
     a_sig_alg: int = 8,
     ds_alg: int = 8,
@@ -159,8 +160,11 @@ def build_store(
     answer denies; ``nsec3`` swaps the zone's NSEC chain for a real NSEC3 chain (the
     hashed owners, digests in canonical order); ``bad_salt`` makes that chain claim a
     salt its owner labels were not hashed with, so nothing matches; ``contradict_sub``
-    lists the DS bit on the unsigned child's NSEC3; the ``*_alg`` knobs sign one RRset
-    with an algorithm no backend can attempt.
+    lists the DS bit on the unsigned child's NSEC3; ``opt_out`` (owner names)
+    sets the Opt-Out flag on the named NSEC3 records' RDATA before they are
+    signed, which keeps a next-closer proof valid and forbids the AD bit
+    (RFC 5155 §7.2.8, §9.2¶1); the ``*_alg``
+    knobs sign one RRset with an algorithm no backend can attempt.
     """
 
     drops = {drop} if isinstance(drop, str) else set(drop or ())
@@ -254,7 +258,11 @@ def build_store(
                 "zone.test.",
                 f"{label}.zone.test.",
                 int(DnsRType.NSEC3),
-                [RData_NSEC3(1, 0, 0, salt, digests[nxt], owners[owner])],
+                [
+                    RData_NSEC3(
+                        1, 1 if owner in opt_out else 0, 0, salt, digests[nxt], owners[owner]
+                    )
+                ],
                 _pk("zone"),
             )
     else:
@@ -1018,3 +1026,76 @@ def test_invalidate_reopens_conclusions_but_not_requests():
     assert other.authenticate_zone("zone.test.").fetch_hint is not None
     other.invalidate()
     assert other.authenticate_zone("zone.test.").fetch_hint is None
+
+
+# ------------------------------------------------------------- Opt-Out and the AD bit
+#
+# RFC 5155 §9.2¶1: an Opt-Out span may carry the next closer of a closest encloser
+# proof -- denying the DS is exactly what Opt-Out proves -- yet the response
+# "MUST NOT" then claim AD, because the covered name "may or may not exist as an
+# insecure delegation": a part of the answer went cryptographically unchecked.
+
+
+def _next_closer_owner(qname: str) -> str:
+    """Which NSEC3 of the fixture's chain covers the hash of *qname* itself.
+
+    Recomputes the fixture's own digest ordering rather than trusting a fixed
+    name: the test must flag the exact record nsec.py will consult as the next
+    closer's cover, and that is whichever span the name's hash falls into,
+    spans running (owner, next] and the last wrapping to the first.
+    """
+    owners = ["zone.test.", "sub.zone.test.", "www.zone.test.", "y.zone.test."]
+    digests = {o: nsec3_hash(o, iterations=0, salt=b"") for o in owners}
+    target = nsec3_hash(qname, iterations=0, salt=b"")
+    order = sorted(owners, key=lambda o: digests[o])
+    for index, owner in enumerate(order):
+        nxt = order[(index + 1) % len(order)]
+        low, high = digests[owner], digests[nxt]
+        if high < low:  # the wrapping span: above the greatest or no greater than the least
+            if target > low or target <= high:
+                return owner
+        elif low < target <= high:
+            return owner
+    raise AssertionError("no span covered the name -- the fixture moved")
+
+
+def test_an_opt_out_next_closer_proves_the_denial_but_not_the_ad_bit():
+    _needs_backend()
+    covering = _next_closer_owner("missing.zone.test.")
+    validator = _nsec3_validator(opt_out=(covering,))
+    verdict = validator.validate_denial(
+        "missing.zone.test.",
+        int(DnsRType.A),
+        rcode=DnsResponseCode.NAME_ERROR,
+        zone="zone.test.",
+    )
+    assert verdict.secure  # §7.2.8: denying the next closer's DS is what Opt-Out proves
+    assert verdict.via_opt_out
+    assert not verdict.ad_worthy  # §9.2¶1's MUST NOT
+    assert verdict.zone is not None
+    assert str(verdict.zone) == "zone.test."
+
+
+def test_a_signed_next_closer_earns_the_ad_bit_it_denied_opt_out():
+    """The control: the same denial, nothing Opt-Out, AD worthy."""
+    _needs_backend()
+    covering = _next_closer_owner("missing.zone.test.")
+    plain = _nsec3_validator()  # opt_out=() -- the covering record carries the flag clear
+    assert str(covering)  # the fixture and this helper agree on where the name lives
+    verdict = plain.validate_denial(
+        "missing.zone.test.",
+        int(DnsRType.A),
+        rcode=DnsResponseCode.NAME_ERROR,
+        zone="zone.test.",
+    )
+    assert verdict.secure
+    assert verdict.via_opt_out is False
+    assert verdict.ad_worthy
+    # And the NSEC leg never has an Opt-Out to worry about.
+    nsec_verdict = build_validator().validate_denial(
+        "missing.zone.test.",
+        int(DnsRType.A),
+        rcode=DnsResponseCode.NAME_ERROR,
+        zone="zone.test.",
+    )
+    assert nsec_verdict.ad_worthy

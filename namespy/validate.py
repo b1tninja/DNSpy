@@ -109,10 +109,31 @@ class ValidationVerdict:
     #: means the resolver MUST query the parent, and this field says so in terms a
     #: caller can act on rather than only in prose.
     fetch_hint: tuple | None = None
+    #: True when a SECURE denial rests on an NSEC3 Opt-Out span at the next closer.
+    #: The verdict stays SECURE -- §7.2.8 permits Opt-Out to prove the absence of a
+    #: DS, which is all a next-closer denial needs -- but RFC 5155 §9.2¶1 is then
+    #: explicit: the AD bit "MUST NOT be set when returning a response containing a
+    #: closest (provable) encloser proof in which the NSEC3 RR that covers the
+    #: 'next closer' name has the Opt-Out bit set", because names inside that span
+    #: may exist as insecure delegations and "not all the data ... will have been
+    #: cryptographically verified". A resolver reads this to withhold the bit it
+    #: otherwise earns from :attr:`secure`.
+    via_opt_out: bool = False
 
     @property
     def secure(self) -> bool:
         return self.status is SecurityStatus.SECURE
+
+    @property
+    def ad_worthy(self) -> bool:
+        """Whether this verdict lets a server set the AD bit.
+
+        ``secure`` is the necessary half; ``via_opt_out`` subtracts the case RFC
+        5155 §9.2¶1 forbids. Kept as one property because a caller that remembers
+        to check the first and not the second produces a response that lies about
+        being fully verified -- which is the entire content of the rule.
+        """
+        return self.status is SecurityStatus.SECURE and not self.via_opt_out
 
     def __repr__(self) -> str:
         where = f" @{self.zone}" if self.zone is not None else ""
@@ -824,15 +845,20 @@ class Validator:
                 zone=zone,
             )
         error = DnsResponseCode(int(rcode))
+        via_opt_out = False
         try:
             if error is DnsResponseCode.NAME_ERROR:
                 if entries3:
-                    nsec3_proves_nxdomain(qname, usable_nsec3(entries3), zone)
+                    via_opt_out = nsec3_proves_nxdomain(
+                        qname, usable_nsec3(entries3), zone
+                    ).via_opt_out
                 else:
                     nsec_proves_nxdomain_response(qname, entries1)
             elif error is DnsResponseCode.NO_ERROR:
                 if entries3:
-                    nsec3_proves_no_data(qname, int(qtype), usable_nsec3(entries3), zone)
+                    via_opt_out = nsec3_proves_no_data(
+                        qname, int(qtype), usable_nsec3(entries3), zone
+                    ).via_opt_out
                 else:
                     nsec_proves_no_data(qname, int(qtype), entries1)
             else:
@@ -862,4 +888,5 @@ class Validator:
             f"verifies under key tag {zv.matched_key_tag}",
             zone=zone,
             matched_key_tag=zv.matched_key_tag,
+            via_opt_out=via_opt_out,
         )

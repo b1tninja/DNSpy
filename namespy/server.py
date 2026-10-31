@@ -159,6 +159,14 @@ EDE_NOT_SUPPORTED = 21
 #: condition this server is in when its resolver hands back nothing.
 EDE_NO_REACHABLE_AUTHORITY = 22
 
+#: RFC 8914 section 4.7: "The resolver attempted to perform DNSSEC validation,
+#: but validation ended in the Bogus state." The one EDE this server can send for
+#: a response that is not an error-of-its-own-composition: the refusal was
+#: composed by its resolver side under its own trust anchors, so §4.7's sentence
+#: describes this host exactly -- and a validation failure labelled 22 would name
+#: the wrong fault ("nobody answered" when somebody answered unforgably).
+EDE_DNSSEC_BOGUS = 6
+
 #: The Extended DNS Errors this server reports about *itself*.
 #:
 #: Only its own failures are listed, and that is the deliberate half of RFC 8914
@@ -296,6 +304,20 @@ class DnsServer(asyncio.Protocol):
         self, response, addr, request=None, extended_errors=(), mqtype_answered=None
     ) -> None:
         if request is not None:
+            # RFC 4035 §3.2.2¶2: "The name server side MUST copy the setting of the
+            # CD bit from a query to the corresponding response." Verbatim, every
+            # response: the bit is the client's claim that it validates for itself,
+            # and echoing it is what lets a client tell "the server did what I
+            # asked" from a header a middlebox smeared.
+            response.CD = bool(request.CD)
+            # RFC 6840 §5.8: "validating resolvers SHOULD only set the AD bit when
+            # ... the request contained either a set DO bit or a set AD bit." A
+            # client that signalled neither does not read the bit -- legacy stubs
+            # and middleboxes copy header flags without understanding them -- so
+            # an assertion aimed at nobody is an assertion that can be laundered
+            # into an answer that was never asked to be trusted.
+            if response.AD and not (request.dnssec_ok or request.AD):
+                response.AD = False
             # Order matters: the strip judges the answer the resolver produced, while
             # _apply_edns composes a reply OPT from what the client asked for. Stripping after that
             # would examine a record this server just built for the client rather than one that came
@@ -303,6 +325,15 @@ class DnsServer(asyncio.Protocol):
             # in that state is _error(), whose response carries no records to withdraw.
             if not request.dnssec_ok:
                 self._strip_dnssec(request, response, mqtype_answered)
+            if not extended_errors and getattr(response, "dnssec_bogus", False):
+                # The resolver side refused this answer under its own anchors (see
+                # namespy.resolver's Bogus branch); RFC 8914 §4.7's code is what
+                # distinguishes "validation refused" from every other SERVFAIL.
+                extended_errors = (
+                    extended_dns_error_option(
+                        EDE_DNSSEC_BOGUS, b"namespy: DNSSEC validation failed"
+                    ),
+                )
             self._apply_edns(request, response, extended_errors, mqtype_answered)
         wire = bytes(response)
         self.log.debug(
@@ -786,7 +817,13 @@ class DnsServer(asyncio.Protocol):
             int(primary.RCODE) == int(other.RCODE)
             and bool(primary.AA) == bool(other.AA)
             and bool(primary.TC) == bool(other.TC)
-            and bool(primary.dnssec_ok) == bool(other.dnssec_ok)
+            # The header's AD, since the bit this list has always named. The line
+            # used to read ``dnssec_ok`` -- the OPT DO flag under the property's
+            # former, confused name -- which made it a tautology: every QTx of one
+            # MQTYPE query shares the one request OPT, so DO can never differ here.
+            # Authentic Data can: a validator judges each answer on its own, and
+            # "DNSSEC valid" is exactly the promise the merge must not inherit.
+            and bool(primary.AD) == bool(other.AD)
         )
 
     def _prospective_size(self, request, response, answered) -> int:

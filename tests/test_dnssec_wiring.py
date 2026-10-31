@@ -18,7 +18,7 @@ import ipaddress
 import pytest
 import test_dnssec_validate as tree
 
-from namespy.cache import MemoryDnsCache
+from namespy.cache import FailureCache, MemoryDnsCache
 from namespy.crypto import crypto_available
 from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType
 from namespy.names import DomainName
@@ -26,6 +26,9 @@ from namespy.packet import DnsQuestion, DnsRecord, Response
 from namespy.rdata import RData_A, RData_DS, RData_NS, RData_RRSIG, RData_SOA
 from namespy.resolver import (
     DnssecVerdict,
+    Done,
+    Fail,
+    Nxdomain,
     NxdomainCut,
     NxdomainPolicy,
     SendQuery,
@@ -315,11 +318,25 @@ def _drive(generator, responses):
     return events
 
 
-def _walk(cache, name, *, responses=(), anchors=(), policy=None, qtype=DnsQType.AAAA):
+def _walk(
+    cache,
+    name,
+    *,
+    responses=(),
+    anchors=(),
+    policy=None,
+    qtype=DnsQType.AAAA,
+    client_cd=False,
+    failures=None,
+):
     sname = Sname(DomainName(name), qtype)
     kwargs = {"dnssec_ok": True, "anchors": tuple(anchors), "now": NOW}
     if policy is not None:
         kwargs["nxdomain_cut"] = policy
+    if client_cd:
+        kwargs["client_cd"] = True
+    if failures is not None:
+        kwargs["failures"] = failures
     return _drive(
         resolve_steps(sname, _seed_slist(sname), cache, **kwargs),
         list(responses),
@@ -354,6 +371,12 @@ def _verdict(events):
     return next((event for event in events if isinstance(event, DnssecVerdict)), None)
 
 
+def _done(events):
+    """The response the walk ended with, or ``None`` if it ended in a bare failure."""
+    end = next((event for event in events if isinstance(event, Done)), None)
+    return None if end is None else end.response
+
+
 # --------------------------------------------------------------------------- secure walk
 
 
@@ -377,6 +400,11 @@ def test_a_secure_denial_is_judged_stamped_and_traced():
     asked = [(str(q.questions[0].name), int(q.questions[0].qtype)) for q in _helpers(events)]
     assert asked == [(".", 48), ("test.", 48), ("zone.test.", 48)]
     assert len(_queries(events)) - len(_helpers(events)) == 3  # the descent itself stays unmarked
+    # RFC 4035 §3.2.3: the walk judged every RRset of this answer and its proofs
+    # under its own anchors, which is the only claim AD is allowed to make.
+    response = _done(events)
+    assert response.AD is True
+    assert response.RCODE == DnsResponseCode.NAME_ERROR
 
 
 def test_validated_policy_cuts_a_descendant_on_the_stamped_verdict():
@@ -420,8 +448,44 @@ def test_no_anchors_no_verdict_no_stamp():
 # --------------------------------------------------------------------------- refusals
 
 
-def test_a_forged_proof_is_bogus_unstamped_and_never_cuts():
+def test_a_non_validating_reader_of_a_stamped_cache_never_asserts_ad():
+    """RFC 4035 §3.1.6¶3: authenticity without a trust point is a copy, not a claim.
+
+    The stamp stays in the entry -- it records the validator that wrote it, and
+    that record is the basis of the VALIDATED cut -- but a server reading it with
+    no anchors of its own has validated nothing and MUST NOT say otherwise.
+    """
     cache = MemoryDnsCache(time_fn=Clock())
+    _walk(cache, "aaa.zone.test.", responses=_secure_script("aaa.zone.test."), anchors=(_anchor(),))
+    events = _walk(cache, "deeper.aaa.zone.test.", responses=[])
+    assert any(isinstance(event, NxdomainCut) for event in events)
+    assert _done(events).AD is False
+    assert _verdict(events) is None
+
+
+def test_the_stamp_answers_ad_when_a_cache_hit_serves_the_very_name():
+    """The exact-key hit path judges from the stamp too, not only the cut path."""
+    cache = MemoryDnsCache(time_fn=Clock())
+    _walk(cache, "aaa.zone.test.", responses=_secure_script("aaa.zone.test."), anchors=(_anchor(),))
+    events = _walk(cache, "aaa.zone.test.", responses=[], anchors=(_anchor(),))
+    assert not _queries(events)
+    assert _done(events).AD is True
+    assert _verdict(events) is None  # nothing was re-judged; the stamp is what speaks
+
+
+def test_a_forged_proof_is_refused_and_the_failure_is_cached():
+    """Bogus is not an answer to a client that asked for validation, and not data to keep.
+
+    RFC 4035 §3.2.2¶3 assigns the authentication duty to this server when CD is
+    clear, and a denial that failed it must not masquerade as a denial; §4.7's
+    BAD-data cache stays optional, and unexercised here on purpose -- a cached
+    forged denial would let the RFC 8020 cut spread one bad packet across a whole
+    subtree. What RFC 9520 §3.4 made a MUST is caching the *failure*, with §3.2's
+    backoff as the TTL guidance, so the repeat lookup is suppressed at the top of
+    the walk and answers the same SERVFAIL without touching the network.
+    """
+    cache = MemoryDnsCache(time_fn=Clock())
+    failures = FailureCache()
     script = _secure_script("aaa.zone.test.")
     script[2] = nxdomain("aaa.zone.test.", [soa(), *zone_denials(flip_apex=True)])
     events = _walk(
@@ -429,23 +493,74 @@ def test_a_forged_proof_is_bogus_unstamped_and_never_cuts():
         "aaa.zone.test.",
         responses=script,
         anchors=(_anchor(),),
-        policy=NxdomainPolicy.VALIDATED,
+        failures=failures,
     )
     verdict = _verdict(events)
     assert verdict is not None
     assert verdict.status == "bogus"
-    entry = cache.get("aaa.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
-    assert entry.validated is False
-    # The descendant is re-asked rather than cut: unvalidated entries prove nothing.
-    events2 = _walk(
+    assert not any(isinstance(event, Nxdomain) for event in events)  # the lie is not served
+    response = _done(events)
+    assert response is not None
+    assert response.RCODE == DnsResponseCode.SERVER_FAILURE
+    assert response.dnssec_bogus is True  # the serve side reads this to attach EDE 6
+    assert cache.get("aaa.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN)) is None
+    note = failures.lookup_query("aaa.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert note is not None
+    assert note.dnssec is True
+    assert "DNSSEC bogus" in note.reason
+    # A repeat of the same name asks nothing (§9520 §3.2's sentence, earned by §3.4's MUST).
+    events2 = _walk(cache, "aaa.zone.test.", responses=[], anchors=(_anchor(),), failures=failures)
+    assert not _queries(events2)
+    assert any(isinstance(event, Fail) for event in events2)
+
+
+def test_a_cd_query_collects_the_forged_data_it_asked_to_judge():
+    """§3.2.2¶3: with CD set, "the recursive name server should not interfere".
+
+    The same forged denial arrives at a client that validates for itself, so it is
+    *delivered* -- stripped of any claim (AD stays down), un-noted (nothing failed:
+    §4.2¶2 waived the checks, and an unexecuted check is not a cacheable failure),
+    and uncached, because a validator that files unvalidated data for its later
+    non-CD clients is the opening the strip-a-signature attacker pays for. The
+    remembered validation failure from the earlier CD-clear lookup does not stop
+    this walk: §3.2.2¶5's "does not help the client" is the whole reason.
+    """
+    cache = MemoryDnsCache(time_fn=Clock())
+    failures = FailureCache()
+    forged = _secure_script("aaa.zone.test.")
+    forged[2] = nxdomain("aaa.zone.test.", [soa(), *zone_denials(flip_apex=True)])
+    _walk(cache, "aaa.zone.test.", responses=forged, anchors=(_anchor(),), failures=failures)
+    assert failures.lookup_query("aaa.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    fresh = _secure_script("aaa.zone.test.")
+    fresh[2] = nxdomain("aaa.zone.test.", [soa(), *zone_denials(flip_apex=True)])
+    events = _walk(
         cache,
-        "deeper.aaa.zone.test.",
-        responses=_secure_script("deeper.aaa.zone.test."),
+        "aaa.zone.test.",
+        responses=fresh,
         anchors=(_anchor(),),
-        policy=NxdomainPolicy.VALIDATED,
+        failures=failures,
+        client_cd=True,
     )
-    assert not any(isinstance(event, NxdomainCut) for event in events2)
-    assert _queries(events2)  # the walk went back to the name servers
+    assert _queries(events)  # the bypass, keyed on the entry's dnssec flag
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.NAME_ERROR  # the data, warts and all
+    assert response.AD is False
+    assert cache.get("aaa.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN)) is None
+    note = failures.lookup_query("aaa.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert note.strikes == 1  # the CD walk added no failure to remember
+
+
+def test_a_cd_query_still_answers_from_an_unvalidated_cache_like_anyone_elses():
+    """The CD bypass is of *validation-failure suppression*, not of the response cache.
+
+    A denial cached by an ordinary walk (no anchors, nothing judged) is an ordinary
+    answer; CD changes who validates, not what a lookup may remember.
+    """
+    cache = MemoryDnsCache(time_fn=Clock())
+    _walk(cache, "aaa.zone.test.", responses=_secure_script("aaa.zone.test."))  # no anchors
+    events = _walk(cache, "aaa.zone.test.", responses=[], client_cd=True)
+    assert not _queries(events)
+    assert isinstance(_done(events), Response)
 
 
 def test_a_second_walk_rejudges_rather_than_laundering_the_first():
@@ -455,6 +570,7 @@ def test_a_second_walk_rejudges_rather_than_laundering_the_first():
     script[2] = nxdomain("deeper.aaa.zone.test.", [soa(), *zone_denials(flip_apex=True)])
     events = _walk(cache, "deeper.aaa.zone.test.", responses=script, anchors=(_anchor(),))
     assert _verdict(events).status == "bogus"
+    assert _done(events).RCODE == DnsResponseCode.SERVER_FAILURE
 
 
 def test_an_unsigned_child_is_insecure_and_earns_no_cut():
@@ -481,6 +597,7 @@ def test_an_unsigned_child_is_insecure_and_earns_no_cut():
     )  # the denying zone; the verdict leans on zone.test.'s proof
     entry = cache.get(name, int(DnsQType.AAAA), int(DnsRClass.IN))
     assert entry.validated is False
+    assert _done(events).AD is False  # RFC 4035 §3.2.3: an Insecure answer never claims AD
 
 
 def test_an_unproved_absent_ds_sends_the_must_query_of_section_5_2():
@@ -532,6 +649,7 @@ def test_a_chain_that_cannot_be_fetched_is_indeterminate():
     assert verdict.status == "indeterminate"
     entry = cache.get("aaa.zone.test.", int(DnsQType.AAAA), int(DnsRClass.IN))
     assert entry.validated is False
+    assert _done(events).AD is False  # "could not tell" never claims otherwise
 
 
 def test_a_hint_pointing_at_an_unvisited_zone_stops_instead_of_spinning():

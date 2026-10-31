@@ -361,7 +361,16 @@ class FailureEntry:
     5" are different diagnoses of the same network.
     """
 
-    def __init__(self, key, reason, expires_at, ttl=FAILURE_INITIAL_TTL_S, strikes=1, zone=None):
+    def __init__(
+        self,
+        key,
+        reason,
+        expires_at,
+        ttl=FAILURE_INITIAL_TTL_S,
+        strikes=1,
+        zone=None,
+        dnssec=False,
+    ):
         self.key = key
         self.reason = reason
         self.expires_at = float(expires_at)
@@ -370,6 +379,15 @@ class FailureEntry:
         #: The zone cut this entry was keyed on, for :class:`ZONE_FAILURE`
         #: entries; ``None`` for query-keyed ones, whose name is ``key[1]``.
         self.zone = zone
+        #: True when this is a DNSSEC *validation* failure (RFC 9520 §2.6, the
+        #: category §3.4 makes caching one a MUST) rather than a zone that failed
+        #: to answer. The distinction serves the CD bit: a client that set it asked
+        #: for raw data it will validate itself (RFC 4035 §3.2.2¶3), and §3.2.2¶5's
+        #: reason -- "protecting a client that is capable of performing its own
+        #: signature validation ... does not help the client" -- is why the walk
+        #: lets a CD query past these entries while it still honours suppression
+        #: for every other kind of failure.
+        self.dnssec = bool(dnssec)
 
     def expired(self, now):
         return now >= self.expires_at
@@ -489,9 +507,17 @@ class FailureCache:
         #: knows the upstream is still down without reading a trace.
         self.hits = 0
 
-    def note_query(self, name, qtype, qclass, reason):
-        """Remember that resolving ``(name, qtype, qclass)`` just failed."""
-        return self._note((QUERY_FAILURE, _labels(name), int(qtype), int(qclass)), reason)
+    def note_query(self, name, qtype, qclass, reason, dnssec=False):
+        """Remember that resolving ``(name, qtype, qclass)`` just failed.
+
+        ``dnssec=True`` marks the entry as a DNSSEC validation failure (RFC 9520
+        §2.6, §3.4) -- the same suppression for the ordinary client, the same
+        backoff, and one exception for the CD one, which the walk lets through to
+        fetch the raw data its own validator asked for.
+        """
+        return self._note(
+            (QUERY_FAILURE, _labels(name), int(qtype), int(qclass)), reason, dnssec=dnssec
+        )
 
     def note_zone(self, zone, reason):
         """Remember that every name server of *zone* failed."""
@@ -575,7 +601,7 @@ class FailureCache:
             del self._entries[key]
         return best
 
-    def _note(self, key, reason, *, zone=None):
+    def _note(self, key, reason, *, zone=None, dnssec=False):
         now = self.time_fn()
         # The duration comes from `_history`, not from a live entry, and that split
         # is what makes the backoff reachable at all. A cached failure suppresses
@@ -595,7 +621,9 @@ class FailureCache:
         self._history.move_to_end(key)
         while len(self._history) > self.max_entries:
             self._history.popitem(last=False)
-        entry = FailureEntry(key, reason, now + ttl, ttl=ttl, strikes=strikes, zone=zone)
+        entry = FailureEntry(
+            key, reason, now + ttl, ttl=ttl, strikes=strikes, zone=zone, dnssec=dnssec
+        )
         self._entries[key] = entry
         # Re-inserting an existing key keeps its old LRU position in an
         # OrderedDict, and a failure that has just happened again is the last

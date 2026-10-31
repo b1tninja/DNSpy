@@ -28,6 +28,7 @@ import pytest
 
 from namespy.cache import NegativeEntry
 from namespy.dnssec import DNSSEC_SECURITY_TYPES
+from namespy.edns import extended_errors_of
 from namespy.enums import DnsRClass, DnsResponseCode, DnsRType
 from namespy.names import DomainName
 from namespy.packet import (
@@ -327,6 +328,98 @@ def test_the_reply_funnel_strips_and_still_answers_with_edns():
     signed = reply_to(True)
     assert _types_of(signed, "answers") == [A, int(DnsRType.RRSIG)]
     assert _types_of(signed, "nameservers") == [int(DnsRType.NSEC), int(DnsRType.RRSIG)]
+
+
+# --------------------------------------------- the header pair: CD copied, AD gated, EDE 6 named
+
+
+class _Transport:
+    def __init__(self):
+        self.sent = []
+
+    def get_extra_info(self, name, default=None):
+        return default
+
+    def sendto(self, data, addr):
+        self.sent.append(bytes(data))
+
+
+def _server_reply(response, request) -> DnsPacket:
+    """One turn through the reply funnel, parsed back off the wire it produced."""
+    server = DnsServer(RecursiveResolver())
+    server.transport = _Transport()
+    server._reply(response, ("127.0.0.1", 5353), request=request)
+    assert len(server.transport.sent) == 1
+    parsed, consumed = DnsPacket.parse(server.transport.sent[0])
+    assert consumed == len(server.transport.sent[0])
+    return parsed
+
+
+def _ask(*, dnssec: bool = True, cd: bool = False, ad: bool = False) -> Query:
+    request = Query(questions=[DnsQuestion(HOST, A, int(DnsRClass.IN))], CD=cd, AD=ad)
+    request.add_edns(1232, flags=EDNS_DO_BIT if dnssec else 0)
+    return request
+
+
+def _answered(*, ad: bool = False, rcode=DnsResponseCode.NO_ERROR) -> Response:
+    return Response(
+        ID=7,
+        QR=1,
+        AD=ad,
+        RCODE=rcode,
+        questions=[DnsQuestion(HOST, A, int(DnsRClass.IN))],
+        answers=_a_pair(),
+        nameservers=_denial_pair(),
+    )
+
+
+def test_cd_is_copied_from_query_to_response_verbatim():
+    """RFC 4035 §3.2.2¶2: "MUST copy the setting of the CD bit"."""
+    assert _server_reply(_answered(), _ask(cd=True)).CD is True
+    assert _server_reply(_answered(), _ask(cd=False)).CD is False
+    # And an error reply goes through the same funnel, not around it.
+    refusal = Response(
+        ID=7, QR=1, RCODE=DnsResponseCode.SERVER_FAILURE, questions=list(_ask().questions)
+    )
+    assert _server_reply(refusal, _ask(cd=True)).CD is True
+
+
+def test_ad_reaches_only_a_client_that_could_read_it():
+    """RFC 6840 §5.8: set AD only when the request set DO or AD.
+
+    A client that signalled neither does not understand the bit; asserting to it
+    is not communication but exposure -- legacy stacks copy unknown header bits
+    onward, and the assertion outlives the resolver that meant it.
+    """
+    assert _server_reply(_answered(ad=True), _ask(dnssec=True)).AD is True
+    assert _server_reply(_answered(ad=True), _ask(dnssec=False, ad=True)).AD is True, (
+        "RFC 6840 §5.7: AD in a query is itself the signal that the client reads AD"
+    )
+    plain = _server_reply(_answered(ad=True), _ask(dnssec=False, ad=False))
+    assert plain.AD is False
+
+
+def test_a_bogus_refusal_names_itself_with_extended_dns_error_6():
+    """The resolver side's marker becomes RFC 8914 §4.7's code on the wire.
+
+    "The resolver attempted to perform DNSSEC validation, but validation ended in
+    the Bogus state" is a sentence only this server can say about itself, and a
+    plain SERVFAIL would let the client guess -- 22 would say nobody answered,
+    which is the opposite of what happened.
+    """
+    response = _answered(rcode=DnsResponseCode.SERVER_FAILURE)
+    response.dnssec_bogus = True
+    parsed = _server_reply(response, _ask())
+    assert parsed.RCODE == DnsResponseCode.SERVER_FAILURE
+    (error,) = extended_errors_of(parsed.edns_options())
+    assert error.info_code == 6
+    assert b"namespy" in error.extra_text
+
+
+def test_an_ordinary_servfail_keeps_its_own_explanation():
+    """No marker, no code 6: EDE stays the honest trace of what this server knows."""
+    parsed = _server_reply(_answered(rcode=DnsResponseCode.SERVER_FAILURE), _ask())
+    assert [error.info_code for error in extended_errors_of(parsed.edns_options())] == []
 
 
 if __name__ == "__main__":

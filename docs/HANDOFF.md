@@ -1097,6 +1097,68 @@ flag tests; the door test rewritten), `ruff check`/`format` clean, `mypy namespy
 answers get judged for the answer's own `AD`, and the serve path can assert or strip
 honestly; (2) the DS-strip question and the `serve --dnssec` DO question remain open.
 
+### Follow-up: the AD/CD bits — a verdict the wire can read (RFC 4035 §2, §3.2.2–§3.2.3, §4.6–§4.7; RFC 6895 §2; RFC 6840 §5.7–§5.8; RFC 5155 §9.2; RFC 9520 §3.4; RFC 8914 §4.7)
+
+**Requested**: the last item the DO-round left standing — the header pair
+did not exist, so nothing could assert, honour, or even read validation
+without lying.
+
+**Delivered**: `DnsPacket` models AD (bit 5) and CD (bit 4) per RFC 6895 §2's
+reallocation (Z shrinks to the one bit still its own — pack, parse, and the CLI's
+re-printed `ad`/`cd` all moved to the registry's layout), and every rule about
+the pair landed beside the verdict it rests on. AD is asserted only where this
+resolver judged: on a SECURE denial's response, on cache answers read from a
+SECURE stamp — never by an anchorless reader (§3.1.6¶3: no trust point, no
+claim), never across an Opt-Out proof (`ValidationVerdict.via_opt_out` surfaces
+RFC 5155 §9.2¶1's MUST NOT; `ad_worthy` = secure ∧ ¬opt-out, one property so no
+caller can honour the rule halfway), gated at the server on the client having
+signalled DO-or-AD (RFC 6840 §5.8), and upstream copies are cleared on arrival
+because §4.6¶3 says bits over unauthenticated UDP mean nothing. CD rewrites what
+failure means: `resolve_steps(..., client_cd=...)` stops interfering — the Bogus
+denial is delivered with AD down, un-noted (§4.2¶2 waived the check), and uncached
+(the poisoning door a CD-fetched unvalidated entry would open for the next non-CD
+client — with no chain records cached, revalidation of a cached entry is not
+possible, so not storing it is the only stance that keeps the stamps meaningful);
+`DnsServer._reply` copies the bit verbatim (§3.2.2¶2's MUST). With CD clear and
+anchors set, Bogus now *refuses*: a SERVFAIL carrying the never-serialised
+`dnssec_bogus` marker (the EDE the walk collected can ride one reply OPT, so the
+reason rides an attribute between the two halves of one recursive server) which
+the serving side turns into RFC 8914 §4.7's EDE 6, the forged denial stays out
+of the cache entirely (RFC 4035 §4.7's BAD cache is optional, and a cached bogus
+denial would let the RFC 8020 cut launder one poisoned packet subtree-wide), and
+the *failure* is noted — RFC 9520 §3.4 turned that into a MUST, riding the
+existing §3.2 backoff, with `FailureEntry.dnssec` marking validation failures so
+CD queries walk past them (§3.2.2¶5's "does not help the client") while every
+other failure suppresses as before.
+
+**Findings along the way**: (1) `DnsServer._flags_match` — its docstring has
+listed "AD" among the must-agree flags since the MQTYPE round, while the line
+itself read `dnssec_ok`, an inheritor of the old misnamed property: comparing
+the request's OPT DO across combinations of one request is a tautology, and now
+that the real bit exists the comparison means what its prose always said (an AD-
+promising combination behind an unassertive primary is not merged). (2) RFC
+9520 §3.4 really does upgrade §4.7's MAY — the first reading of "no BAD cache
+implemented" looked like a gap until the update's own words appeared; the
+failure note closes it with machinery that already existed. (3) the CD
+lookup's `failures.forget` was silently unlocked on an unvalidated success —
+forgetting is a recovery claim, and a CD walk cannot make one.
+
+**Verified**: 1344 passed (+19 net: 4 wire bit-position/round-trip/old-stack
+decode, 5 rewritten-or-new wiring refusals and AD-at-write/hit/cut pins, 2
+validator Opt-Out `ad_worthy` tests over an `opt_out=` fixture knob, 4 serving
+egress tests (CD copy, §5.8 gate both ways, EDE 6, plain-SERVFAIL negative), 1
+MQTYPE AD-mismatch non-merge, 2 e2e tests (upstream bits disregarded, CD echo),
+1 failure-flag test, 1 CLI print test), `ruff check`/`format` clean, `mypy
+namespy` exits 0; `-O` run clean (the one standing cross-module-fixture warning
+is unchanged).
+
+**Next, in order**: (1) the positive half — judge terminal answers with
+`validate_rrset` under the same fetch-loop, stamp `PositiveEntry.validated`, and
+the §3.2.3 "if and only if" covers everything the rule names (the wildcard
+answer's closer proof comes along with it); (2) the DS-strip question and the
+`serve --dnssec` DO question remain open; (3) key-tag signalling (RFC 8145's
+actual subject) now has a home: the helper queries know which zones they ask.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

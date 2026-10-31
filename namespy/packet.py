@@ -300,6 +300,12 @@ class DnsPacket:
     header's 4-bit RCODE holds 0-15; larger codes need EDNS(0) and are reachable
     through :attr:`extended_rcode` (RFC 6891 section 6.1.3).
 
+    All nine defined header flags are modelled, including the DNSSEC pair --
+    ``AD`` (bit 5) and ``CD`` (bit 4) of RFC 4035 §2 as relocated by RFC 6895 §2.
+    They are data, never decisions: every rule about who may set them (4035
+    §3.2.2-§3.2.3, RFC 6840 §5.8) lives in :mod:`namespy.resolver` and
+    :mod:`namespy.server`, where it can be read beside the verdict it rests on.
+
     :param suffix: octets that followed the last RR when this message was
         parsed. Kept so a re-serialised copy can be byte-identical to what
         arrived; :meth:`parse` rejects trailing octets rather than setting it.
@@ -314,6 +320,8 @@ class DnsPacket:
         TC=False,
         RD=True,
         RA=False,
+        AD=False,
+        CD=False,
         Z=0,
         RCODE=DnsResponseCode.NO_ERROR,
         QDCOUNT=None,
@@ -359,7 +367,23 @@ class DnsPacket:
         self.TC = bool(TC)
         self.RD = bool(RD)
         self.RA = bool(RA)
-        self.Z = int(Z) & 0b111
+        #: Authentic Data -- header bit 5 (RFC 4035 §2, repositioned by RFC 6895 §2):
+        #: "the responder ... considers the RRs in the Answer and Authority sections
+        #: authentic". A recursive server sets it only on what it validated (§3.2.3),
+        #: which in this package means only on a verdict from :mod:`namespy.validate`
+        #: -- and an authoritative or non-validating server never sets it at all.
+        #: Not to be confused with OPT's DO flag, readable as :attr:`dnssec_ok`:
+        #: a granted request is not a verified answer.
+        self.AD = bool(AD)
+        #: Checking Disabled -- header bit 4 (RFC 4035 §2): the *client's* signal
+        #: that it will do its own validation, so the recursive server must not
+        #: withhold data over a validation failure (§3.2.2¶3) and MUST copy the bit
+        #: back in the response (§3.2.2¶2). A stub sets it on queries (§4.6¶1); a
+        #: resolver takes it off responses it fetched, whose copy means nothing
+        #: over UDP (§4.6¶3). Distinct from OPT FLAGS bit 14, readable as
+        #: :attr:`cd`, which shares the name and sits in a different field.
+        self.CD = bool(CD)
+        self.Z = int(Z) & 0b1
         self.RCODE = (
             RCODE if isinstance(RCODE, DnsResponseCode) else DnsResponseCode.parse(int(RCODE))
         )
@@ -375,6 +399,13 @@ class DnsPacket:
         if suffix is not None and not isinstance(suffix, bytes):
             raise TypeError(f"suffix must be bytes, got {type(suffix).__name__}")
         self.suffix = b"" if suffix is None else suffix
+        #: Not a wire field. A note from this host's resolver side to its serving
+        #: side that the answer was refused under RFC 4035 validation -- the one
+        #: reason a SERVFAIL here is worth RFC 8914 §4.7's EDE 6 rather than 22.
+        #: Never serialised and never parsed: it exists only between the two
+        #: halves of a recursive name server that share a process, which is what
+        #: RFC 4035 §3.2 defines and what namespy.server plus this resolver are.
+        self.dnssec_bogus = False
 
     # ------------------------------------------------------------- accessors
 
@@ -430,8 +461,8 @@ class DnsPacket:
         it back in its response OPT whether or not anything was authenticated. This property used
         to be called ``ad``, and every reader of it inherited that confusion -- a CLI printing
         ``ad`` from here was claiming verified data on the strength of a request being granted.
-        The header's AD and CD bits are not modelled by this package yet, so there is currently no
-        correct source for an ``ad`` flag; see the roadmap.
+        The header's AD now lives at :attr:`~namespy.packet.DnsPacket.AD`, and the only honest
+        source for it is a verdict from :mod:`namespy.validate`.
         """
         record = self.opt()
         return record is not None and bool(int(record.ttl) & EDNS_DO_BIT)
@@ -592,7 +623,13 @@ class DnsPacket:
             | (0x02 if self.TC else 0)
             | (0x01 if self.RD else 0)
         )
-        flags2 = (0x80 if self.RA else 0) | (self.Z & 0b111) << 4 | (rcode & 0xF)
+        flags2 = (
+            (0x80 if self.RA else 0)
+            | (self.Z & 0b1) << 6
+            | (0x20 if self.AD else 0)
+            | (0x10 if self.CD else 0)
+            | (rcode & 0xF)
+        )
         return struct.pack(
             _HEADER_FMT,
             self.ID,
@@ -680,7 +717,12 @@ class DnsPacket:
         QR = DnsQR((flags1 & 0x80) >> 7)
         OPCODE = DnsOpCode.parse((flags1 & 0x78) >> 3)
         AA, TC, RD = bool(flags1 & 0x04), bool(flags1 & 0x02), bool(flags1 & 0x01)
-        RA, Z = bool(flags2 & 0x80), (flags2 & 0x70) >> 4
+        # RFC 6895 §2 shrank Z from three bits to one and handed the freed pair to
+        # AD and CD (RFC 4035 §2). The old reading of bits 5-4 as Z is why a packet
+        # from a pre-DNSSEC stack with Z set oddly decodes as AD or CD here: that
+        # is the registry's own allocation, not a misparse.
+        RA, Z = bool(flags2 & 0x80), (flags2 >> 6) & 1
+        AD, CD = bool(flags2 & 0x20), bool(flags2 & 0x10)
         RCODE = DnsResponseCode.parse(flags2 & 0x0F)
 
         # Sections fill in order; on a TC=1 message the last one may legitimately
@@ -742,6 +784,8 @@ class DnsPacket:
                 TC,
                 RD,
                 RA,
+                AD,
+                CD,
                 Z,
                 RCODE,
                 len(questions),

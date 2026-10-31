@@ -276,3 +276,15 @@ def test_root_zone_entry_suppresses_everything(failures):
     # not the root's -- were the thing that did not answer.
     failures.note_zone(".", "all servers failed")
     assert failures.match("anything.at.all", 1, 1) is not None
+
+
+def test_a_dnssec_note_carries_the_flag_the_cd_walk_reads(failures):
+    """A validation failure is remembered as one (RFC 9520 §2.6, §3.4), not as a
+    zone that stopped answering -- the distinction is what lets a CD query walk
+    past it (RFC 4035 §3.2.2¶3: the client validates for itself) while every
+    other failure keeps suppressing exactly as before."""
+    bogus = failures.note_query("a.example.", 1, 1, "DNSSEC bogus: sig fails", dnssec=True)
+    dead = failures.note_query("b.example.", 1, 1, "no servers answered")
+    assert bogus.dnssec is True
+    assert dead.dnssec is False
+    assert failures.match("a.example.", 1, 1).dnssec is True

@@ -560,3 +560,54 @@ def test_count_shortfall_is_rejected_rather_than_tolerated() -> None:
     payload += rr_wire(b"\x07example\x03com\x00", 1, 1, 60, b"\x01\x02\x03\x04")
     with pytest.raises(DnsPacketParseError):
         DnsPacket.parse(payload)
+
+
+# ------------------------------------------------- AD and CD: header bits 5 and 4
+#
+# RFC 6895 §2 reallocated the header's second flags octet: RA keeps bit 7, Z
+# shrinks to the single bit 6, and the freed pair became Authentic Data and
+# Checking Disabled (RFC 4035 §2). Packing and parsing must agree with the
+# registry, not with RFC 1035's original three-bit Z.
+
+
+def _second_flags_octet(packet: DnsPacket) -> int:
+    return bytes(packet)[3]
+
+
+def test_ad_and_cd_round_trip_through_the_wire() -> None:
+    packet = DnsPacket(ID=9, QR=1, AD=True, CD=True)
+    parsed, _ = DnsPacket.parse(bytes(packet))
+    assert parsed.AD is True
+    assert parsed.CD is True
+    assert parsed.Z == 0
+
+
+def test_ad_and_cd_keep_their_registered_bit_positions() -> None:
+    ad = _second_flags_octet(DnsPacket(QR=1, AD=True))
+    assert ad & 0x20
+    assert not ad & 0x10
+    cd = _second_flags_octet(DnsPacket(QR=1, CD=True))
+    assert cd & 0x10
+    assert not cd & 0x20
+
+
+def test_z_keeps_only_the_bit_still_left_to_it() -> None:
+    # A three-bit Z would leak into bits 5 and 4 -- emitting "AD" and "CD" from
+    # a reserved field, claiming validation nobody performed.
+    octet = _second_flags_octet(DnsPacket(QR=1, Z=1))
+    assert octet & 0x40
+    assert not octet & 0x30
+
+
+def test_bits_5_and_4_decode_as_ad_and_cd_not_as_z() -> None:
+    """Decoding is not accepting: a packet from an old stack must still read.
+
+    A pre-DNSSEC sender that set bits 5-4 of what was then a three-bit Z lands on
+    what RFC 6895 §2 has since made AD and CD. Reading them as the registry says
+    they mean today is the honest decode; there is no third bit to recover.
+    """
+    header = struct.pack("!HBBHHHH", 1, 0x80, 0x30, 0, 0, 0, 0)  # flags2 = AD | CD
+    packet, _ = DnsPacket.parse(header)
+    assert packet.AD is True
+    assert packet.CD is True
+    assert packet.Z == 0

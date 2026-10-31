@@ -465,6 +465,19 @@ class Nsec3NxdomainProof:
     wildcard: DomainName
     wildcard_entry: Nsec3Entry
 
+    @property
+    def via_opt_out(self) -> bool:
+        """Whether the next closer was proved by an Opt-Out span, which forbids AD.
+
+        The same §9.2¶1 rule as :attr:`NodataProof.via_opt_out`, on the half of the
+        Name Error proof where it bites: Opt-Out can deny the next closer's DS
+        (the name does not exist *or* is an unsigned delegation), which still makes
+        the NXDOMAIN the right answer for a validator that reports Insecure below
+        the cut -- but not every alternative was cryptographically checked, so the
+        response may not claim Authentic Data.
+        """
+        return self.closest.via_opt_out
+
 
 def nsec3_proves_nxdomain(qname, entries, zone) -> Nsec3NxdomainProof:
     """RFC 5155 §8.4's whole Name Error check, not merely the encloser half.

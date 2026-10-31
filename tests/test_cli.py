@@ -288,6 +288,22 @@ def test_no_response_renders_as_dig_does():
     assert ";; no response" in text
 
 
+def test_header_ad_and_cd_appear_when_the_header_carries_them():
+    """The pair prints again now that the package models their real field.
+
+    The removal said the header had no honest source; RFC 4035 §3.2.3 gave one
+    (a verdict from the resolver's own validation), and RFC 6895 §2 fixed where
+    the bits live. The OPT line keeps its own flags under their own names: DO is
+    still not AD, printed together or apart.
+    """
+    response = _response_with_opt()
+    response.AD = True
+    response.CD = True
+    text = _format_response(response, _args(["example.com"]), 1.0)
+    assert "flags: qr rd ra ad cd;" in text
+    assert "flags: do;" in text
+
+
 def _explained(*errors):
     """A perfectly good NOERROR answer whose OPT carries *errors* -- INFO-CODE and
     EXTRA-TEXT pairs -- so the printer is tested against a response that has not failed."""
