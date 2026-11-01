@@ -56,7 +56,7 @@ namespy example.com                  # dig-style answer
 namespy example.com AAAA
 namespy example.com A --mqtype AAAA --mqtype HTTPS   # one walk, three types (RFC 10029)
 namespy --short example.com MX       # or: namespy +short example.com MX
-namespy example.com --trace          # write the resolution walk to last_resolution.md
+namespy example.com --trace          # print the steps; write the diagram to last_resolution.md
 namespy --serve                      # demo server on 127.0.0.1:53
 ```
 
@@ -65,9 +65,13 @@ namespy --serve                      # demo server on 127.0.0.1:53
 `--dns-suffix`, `--timeout`, `--trace-file`, `--qname-min`,
 `--allow-out-of-bailiwick-glue`, `--no-failure-cache`, `-v`, `--debug`).
 
-`--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
-useful for seeing exactly where a zone cut was crossed and which NS forced a glueless
-sub-resolution.
+`--trace` prints the walk live — one numbered line per step on stderr, as the
+walk takes it — queries show the zone
+asked (`-> .: example.com A (probe)`), replies and notes read downward in the
+order they happened — and writes the same steps as a Mermaid `sequenceDiagram`
+to `--trace-file`, so GitHub renders it directly; the diagram is where to look
+for exactly where a zone cut was crossed and which NS forced a glueless
+sub-resolution, and the terminal lines are where to look while it happens.
 
 `--serve` binds loopback on purpose. It is a codec exercise, not a name server;
 exposing a recursive resolver to a network you do not control turns it into an

@@ -43,6 +43,7 @@ from .resolver import (
 )
 from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer, DnsStreamServer
 from .stub import TRANSPORTS, StubResolver, Upstream
+from .trace import Trace
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
 EXAMPLE_NAME = "example.org"
@@ -114,6 +115,9 @@ def _dump_last_resolution_md(resolver_protocol, path="last_resolution.md") -> No
             f.write(trace.to_mermaid())
             f.write("\n```\n")
         logging.info("Wrote %s", path)
+        # The file alone made --trace look broken: INFO does not print by
+        # default, so the flag wrote its diagram in silence. Say where it went.
+        print(f";; trace diagram written to {path}", file=sys.stderr)
     except OSError:
         logging.exception("Failed to write %s", path)
 
@@ -447,18 +451,22 @@ def build_parser():
         help="dig +short style: print only RDATA, one record per line",
     )
     p.add_argument(
-        "--trace", action="store_true", help="write the resolution trace to last_resolution.md"
+        "--trace",
+        action="store_true",
+        help="print each resolution step to stderr as it happens -- numbered, "
+        "one per line, probes and helpers and demotions marked -- and write a "
+        "Mermaid sequence diagram of the whole walk to --trace-file",
     )
     p.add_argument(
         "--trace-file",
         default="last_resolution.md",
-        help="path for --trace output (default: last_resolution.md)",
+        help="path for the --trace Mermaid diagram (default: last_resolution.md)",
     )
     p.add_argument(
         "--root-hints",
         default=None,
         help="path to a root hints zone file (default: the copy packaged "
-        "with Namespy; refresh it with refresh_root_hints())",
+        "with Namespy; RecursiveResolver.refresh_root_hints() re-fetches it)",
     )
     p.add_argument(
         "--dns-suffix",
@@ -987,6 +995,23 @@ async def cli_query(args) -> int:
     try:
         question = DnsQuestion(qname, args.type, args.qclass)
         query = Query(questions=[question], RD=True)
+        if args.trace:
+            # The echo is wired before the walk, not printed after it: each line
+            # arrives when its step happens, which is what a reader watching a
+            # slow descent actually wants -- dig +trace streams for the same
+            # reason. Numbering runs through Trace.format_step, the same
+            # formatter to_text uses, so these live lines and the recorded
+            # account are character-identical. Children (glue chases, bundle
+            # re-asks) inherit the listener, so nothing happens silently.
+            step_count = [0]
+
+            def _live_step(step):
+                line = Trace.format_step(step, step_count[0] + 1)
+                if line is not None:
+                    step_count[0] += 1
+                    print(f";; {line}", file=sys.stderr)
+
+            resolver_protocol.trace_listener = _live_step
         start = time.monotonic()
         try:
             if asked:
@@ -1039,6 +1064,9 @@ async def cli_query(args) -> int:
             )
 
         if args.trace:
+            # The diagram arrives after the fact -- it needs the completed walk,
+            # which the terminal has already seen line by line. The answer on
+            # stdout stayed pipeable throughout: every step went to stderr.
             _dump_last_resolution_md(resolver_protocol, path=args.trace_file)
 
         if args.nsid:

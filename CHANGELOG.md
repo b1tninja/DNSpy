@@ -1115,6 +1115,49 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Fixed
 
+- **`--trace` now shows the resolution steps, as they happen.** It never had:
+  the flag wrote a Mermaid diagram to `last_resolution.md` and reported the
+  file at INFO, which prints for nobody — so the flag the help text (and
+  `--qname-min`'s "*--trace marks the probes*", and two other help texts)
+  described as a visible step list produced nothing a terminal reader could
+  see at all. The echo is now wired *before* the walk: `Trace` takes a
+  listener fired on every `record()` — children inherit it, so glue chases
+  and bundle re-asks narrate themselves too — and `--trace` installs one that
+  prints each step the moment the walk takes it, which means a slow or stuck
+  lookup now shows where it is stuck, something a dump rendered after
+  resolve() returned never could. `1 -> .: example.com A (probe)`,
+  `2 <- referral com. (match 0->1)`, bare notes on their own numbered lines.
+  The live lines come from `Trace.format_step`, the same formatter
+  `to_text()` uses for the recorded account, and both consume one
+  `_dispatch()` pass (query / reply / note, labels worded once) — so the
+  terminal while the walk runs, the terminal afterwards, and the diagram in
+  the file cannot tell three stories about one walk; a test pins that the
+  live line and the recorded line are character-identical, and the
+  mermaid-pinning tests pass against the refactor untouched. The step lines
+  name the zone each query goes to — the diagram has lanes for it, a line
+  needs the fact spelled out, and its absence was the report's literal
+  complaint. ASCII arrows throughout, because a Windows console is a
+  first-class audience for a zero-dependency resolver.
+
+- **Every help text that promises a behavior was audited against the code
+  that owes it — generalizing the `--trace` lesson.** Each behavioral claim
+  in the parser was checked against its implementation: `--serve` really
+  binds UDP *and* TCP (BCP 235); a REFUSED really rotates to the next
+  `--forward` upstream and only that (RFC 1035 §6 stub semantics as
+  documented); `--nsid` answers really print `;; NSID <addr> <hex>` per RFC
+  5001 §2.4's UI MUST; a bundle behind ANY really is announced-and-dropped
+  per RFC 10029 §3.3; believed *and* discarded glue each get a `--trace`
+  line; `--serve`+`--forward` and `--dot-authority`+`--forward` really
+  refuse to combine (already test-pinned); the minimisation budget really
+  degrades toward full names rather than failing. All held. Two helps were
+  imprecise: `--root-hints` named `refresh_root_hints()` as though it were a
+  function (it is a `RecursiveResolver` method), and `--trace` claimed the
+  steps arrived "as they happened" at the moment it did not — corrected by
+  making it true (the streaming entry above), not by rewording. Also
+  cleared: format and lint debt the RFC 9905 and RFC 5011 increments left
+  behind (five files, two annotations); the tree is `ruff check` and
+  `ruff format` clean.
+
 - **A citation audit of the encrypted-walk code cleared most of it and
   killed two dangles.** The `§4.6.x` references through `opportunistic.py`
   and `resolver.py` that looked like RFC 9461 phantoms (9461 has no §4.6)

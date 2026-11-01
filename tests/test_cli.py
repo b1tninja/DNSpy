@@ -569,15 +569,22 @@ async def test_the_no_failure_cache_switch_reaches_the_resolver(monkeypatch):
     assert isinstance(made[0][1].failure_cache, FailureCache)
 
 
-async def test_cli_query_writes_the_trace_file(monkeypatch, tmp_path):
+async def test_cli_query_writes_the_trace_file(monkeypatch, tmp_path, capsys):
     # The real resolve() records the walk on the protocol before returning, which
     # is the only thing --trace has to write. The stub has to do the same, or this
     # test would pass while asserting nothing about the wiring it claims to cover.
     async def resolving(_query):
         response = await _answered(_query)
-        trace = Trace(Sname(DomainName("example.com"), DnsQType.A, DnsRClass.IN))
+        # Mirrors what resolve() really does now: the trace is built with the
+        # protocol's listener, which is the entire wiring --trace became --
+        # so the stderr assertions below check it instead of a reconstruction.
+        protocol = made[0][1]
+        trace = Trace(
+            Sname(DomainName("example.com"), DnsQType.A, DnsRClass.IN),
+            listener=protocol.trace_listener,
+        )
         trace.record(Done(response))
-        made[0][1].last_trace = trace
+        protocol.last_trace = trace
         return response
 
     made = _stub_endpoints(monkeypatch, resolving)
@@ -590,6 +597,12 @@ async def test_cli_query_writes_the_trace_file(monkeypatch, tmp_path):
     assert "```mermaid" in body
     assert "sequenceDiagram" in body
     assert "done" in body
+    # The other half of the flag, and the half that used to be missing entirely:
+    # steps printed live, and a line saying where the diagram went.
+    err = capsys.readouterr().err
+    assert ";;   1" in err
+    assert "done" in err
+    assert "trace diagram written to" in err
 
 
 async def test_trace_flag_is_silent_without_tracing(monkeypatch, tmp_path):

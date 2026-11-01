@@ -63,7 +63,7 @@ import socket
 import ssl
 import struct
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib import resources
 from socket import gaierror
@@ -4546,6 +4546,11 @@ class RecursiveResolver(Resolver):
         self.root_hints = self.bootstrap(root_hints_path)
         self.sbelt = Sbelt.from_response(self.root_hints)
         self.last_trace = None
+        # Set by --trace: a callable that hears each step as it is recorded and
+        # prints it, so the walk is visible while it happens rather than
+        # reconstructed afterwards. None (the default) keeps recording purely
+        # bookkeeping; the resolver never prints anything on its own.
+        self.trace_listener: Callable[[str], None] | None = None
         self.cache = cache if cache is not None else MemoryDnsCache()
         if self.serve_stale > 0:
             # The retention half of the timer belongs to the cache (§5¶11
@@ -5186,7 +5191,7 @@ class RecursiveResolver(Resolver):
         qname = question.name.qualify(dns_suffix=self.dns_suffix)
         sname = Sname(qname, question.qtype, question.qclass)
         if trace is None:
-            self.last_trace = Trace(sname)
+            self.last_trace = Trace(sname, listener=self.trace_listener)
         else:
             # The child was made before this walk knew what it would ask, so the title is
             # filled in here rather than by the caller re-deriving the qualification rules:

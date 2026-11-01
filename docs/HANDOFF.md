@@ -2853,6 +2853,68 @@ resolver fetch wiring — observe()'s contract is that the caller is the validat
 walk, and a deployment decides where its anchor fetches come from.
 
 
+### Follow-up: the flag that described itself — --trace shows steps now (increment R)
+
+A user report cut through three help texts that had been pointing at each other:
+"--trace marks the probes" (--qname-min), "a --trace line per address believed"
+(8145), "already visible in --trace" (9952 cost note) -- and --trace itself, in
+fact, printed nothing. It had one output, a Mermaid block in a file, announced at
+logging.INFO, the level that prints for nobody. The diagram was fine; the
+documented *visible steps* had never existed. The fix put a terminal view into
+the trace — `to_text()`, sharpened in increment T into a live `format_step()`
+echo that prints each step the moment `record()` takes it — and
+the structural decision is the one to review: rather than a second per-event loop
+(next to to_mermaid's, drifting from it by exactly the phrasing each line is
+supposed to get right), the event vocabulary moved into a single `_dispatch()`
+generator yielding (kind, zone, label), and both renderers became thin
+projections -- arrows and lanes for Mermaid, numbered lines for the terminal. A
+parity test asserts every dispatched label appears in both outputs, which is what
+keeps the drift structurally impossible rather than merely unlucky. One rendering
+lesson the tests encode: a text line must name the zone each query goes to
+(`1 -> .: example.com A`); the diagram had lanes and never missed them, but a
+line without the destination is what made the walk "invisible" even in principle.
+Serve mode keeps the file-only behavior (per-response step spam on a server's
+stderr is a different decision someone hasn't asked for); the dump now always
+says where the diagram went, on stderr, dig-style. 6 new tests, full suite 1748
+passed, 1 skipped, mermaid pins untouched. The citation audit the earlier round
+began still stands as practice (roadmap row 194 stays 🟡): this session has now
+caught phantoms only by sweeping, never by the code failing.
+
+
+### Follow-up: the promises the parser owed — help-text audit, live --trace (increment T)
+
+The --trace bug generalizes to a class: *a help text that promises a behavior
+the code does not owe*. This sweep audited every behavioral claim in the parser
+against its implementation — --serve binding UDP *and* TCP (BCP 235), a REFUSED
+rotating to the next --forward upstream and only that, --nsid printing
+`;; NSID <addr> <hex>` per RFC 5001 §2.4's UI MUST, a bundle behind ANY being
+announced-and-dropped per RFC 10029 §3.3, believed *and* discarded glue each
+earning a --trace line, both incompatible-combination errors, the minimisation
+budget degrading toward full names rather than failing. All held, several with
+tests already pinning them. Two texts were imprecise: --root-hints named
+`refresh_root_hints()` as if it were a function (it is a RecursiveResolver
+method), and --trace said "as they happened" when steps actually printed after
+the walk returned. The second was corrected by making it true, not by rewording:
+`Trace` now takes a *listener* fired by `record()`, children inherit it (glue
+chases and bundle re-asks narrate themselves the moment they act), and
+`RecursiveResolver.trace_listener` threads it to every trace the walk builds.
+A stuck lookup now shows where it is stuck. One vocabulary backs all three
+views: `_describe()` (extracted from `_dispatch`) classifies, `_format_line()`
+formats, and `to_text()`, `format_step()`, and `to_mermaid()` are thin
+consumers — the live line and the recorded line are asserted
+character-identical. The CLI test stub now mirrors the real wiring (builds its
+Trace with the protocol's listener) for the same reason it already reconstructed
+last_trace: a stub that skips the wiring under test proves nothing. Also swept:
+format/lint debt increment P and Q left (five files); the tree is
+`ruff check`/`ruff format` clean. One Windows caution this session earned the
+hard way — PowerShell 5.1 `Get-Content`/`Set-Content` re-encodes UTF-8 through
+cp1252: a dedent run through the shell corrupted trace.py's typographic dashes
+and a follow-up BOM-strip ate the docstring's opening quote (recovered by the
+byte-level `text.encode("cp1252")` reversal). Do not round-trip source through
+PowerShell text cmdlets; use the editor or python with explicit encodings.
+4 new listener/parity tests; full suite 1752 passed, 1 skipped.
+
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them
