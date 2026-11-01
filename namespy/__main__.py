@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import ipaddress
 import logging
 import sys
 import time
@@ -28,6 +29,7 @@ from .enums import (
     DnsQType,
     DnsRClass,
     DnsResponseCode,
+    DnsRType,
     is_data_rrtype,
 )
 from .filtering import FilterPolicy
@@ -35,6 +37,8 @@ from .idna import IdnaError
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query, Response
 from .querylog import QueryLog
+from .rbl import interpret as _rbl_interpret
+from .rbl import rbl_query_name, reverse_address
 from .rdata import generic_presentation, type_name_of
 from .resolver import (
     EDNS_PAYLOAD_SIZE,
@@ -429,6 +433,7 @@ def build_parser():
         "  namespy example.com MX\n"
         "  namespy +short example.com\n"
         "  namespy +trace example.com A\n"
+        "  namespy rbl 203.0.113.7 zen.example\n"
         "  namespy --forward 10.1.1.1 example.com\n"
         "  namespy --serve\n"
         "  python -m namespy example.com   (same thing, without installing)",
@@ -634,6 +639,30 @@ def build_parser():
         "default: this file records where your clients went, so it exists "
         "only because a flag said so, and retention stays the filesystem's "
         "problem",
+    )
+    p.add_argument(
+        "--rbl",
+        nargs=2,
+        metavar=("ADDRESS", "ZONE"),
+        default=None,
+        help="ask a blocklist zone about one address: builds the reversed "
+        "name (octets per RFC 1035 section 3.5, nibbles per RFC 3596 "
+        "section 2.5) and asks the zone itself -- the walk ends at that "
+        "zone's authorities, the only 127.0.0.x whose meaning was ever "
+        "claimed (with --forward, the named upstream answers instead). "
+        "Reads A codes and TXT explanations, caps the answer's cache life "
+        "at an hour, and keeps listed/not-listed/unknown three separate "
+        "answers: exits 0 listed, 1 not-listed, 2 unknown. The bareword "
+        "form 'namespy rbl ADDRESS ZONE' means this",
+    )
+    p.add_argument(
+        "--ptr",
+        metavar="ADDRESS",
+        default=None,
+        help="look up an address rather than a name: --ptr 203.0.113.7 "
+        "asks for the PTR of 7.113.16.203.in-addr.arpa (RFC 1035 section "
+        "3.5); IPv6 addresses get the nibbled ip6.arpa form (RFC 3596 "
+        "section 2.5). The first step of any reverse walk",
     )
     p.add_argument(
         "--qname-min",
@@ -1113,18 +1142,17 @@ def _qname_from_arg(text: str) -> DomainName:
         raise SystemExit(f"namespy: {text}: {exc}") from None
 
 
-async def cli_query(args) -> int:
-    loop = asyncio.get_running_loop()
-    qname = _qname_from_arg(args.name)
-    # Decided before the resolver is built, because it decides what the resolver sends on
-    # every hop rather than on one: an empty tuple here means the walk below never carries
-    # an MQTYPE-Query option and no server is asked to do anything new.
-    asked = _bundle_qtypes(args)
-    # Anchors are fetched before the endpoint is built, so a missing file or a dead
-    # IANA is a startup sentence, not a lookup that silently skipped validation.
-    anchors = _trust_anchors(args)
+async def _start_recursive_client(loop, args):
+    """Build the recursive endpoint that every asking mode shares.
 
-    _transport, resolver_protocol = await loop.create_datagram_endpoint(
+    Anchors are fetched before the endpoint is built, so a missing file
+    or a dead IANA is a startup sentence, not a lookup that silently
+    skipped validation. (Lifted verbatim from ``cli_query``, which was
+    the only caller until the blocklist client started asking the same
+    kind of question of a zone.)
+    """
+    anchors = _trust_anchors(args)
+    return await loop.create_datagram_endpoint(
         lambda: RecursiveResolver(
             root_hints_path=args.root_hints,
             dns_suffix=args.dns_suffix,
@@ -1146,6 +1174,83 @@ async def cli_query(args) -> int:
         ),
         local_addr=("0.0.0.0", 0),
     )
+
+
+async def cli_rbl(args) -> int:
+    """Ask a blocklist zone about one address and print the verdict.
+
+    The etiquette is the architecture (namespy.rbl labels every part of
+    it convention, not citation): a plain walk ends at the zone's own
+    authorities, which is precisely the party whose 127.0.0.x was ever
+    claimed; ``--forward`` is honored because an operator naming their
+    own recursive is naming a party too. Two questions leave -- A for
+    the code, TXT for the explanation -- and :func:`namespy.rbl.interpret`
+    decides what they mean. The exit code is the same answer for
+    scripts: 0 listed, 1 not-listed, 2 unknown, because the third state
+    existing is the whole point of the module.
+    """
+    loop = asyncio.get_running_loop()
+    address, zone = args.rbl
+    ip = ipaddress.ip_address(address)  # main() validated
+    try:
+        zone_name = _qname_from_arg(zone)
+    except IdnaError as exc:
+        print(f"namespy: --rbl: {exc}", file=sys.stderr)
+        return 2
+    qname = rbl_query_name(ip, zone_name)
+
+    if args.forward:
+        try:
+            upstreams = [
+                Upstream.parse(text, transport=args.stub_transport) for text in args.forward
+            ]
+        except ValueError as exc:
+            raise SystemExit(f"namespy: --forward: {exc}") from None
+        _transport, asker = await loop.create_datagram_endpoint(
+            lambda: StubResolver(
+                upstreams,
+                dnssec_ok=args.dnssec,
+                edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
+                query_padding=not args.no_query_padding,
+            ),
+            local_addr=("0.0.0.0", 0),
+        )
+    else:
+        _transport, asker = await _start_recursive_client(loop, args)
+    try:
+
+        async def _ask(rtype):
+            query = Query(questions=[DnsQuestion(qname, rtype, args.qclass)], RD=True)
+            if args.forward:
+                try:
+                    return await asyncio.wait_for(
+                        asker.forward(query.questions), timeout=args.timeout
+                    )
+                except TimeoutError:
+                    return None
+            try:
+                return await asyncio.wait_for(asker.resolve(query), timeout=args.timeout)
+            except TimeoutError:
+                return None
+
+        verdict = _rbl_interpret(ip, zone_name, await _ask(DnsRType.A), await _ask(DnsRType.TXT))
+        print(verdict.describe())
+        if verdict.listed:
+            return 0
+        return 1 if verdict.status == "not-listed" else 2
+    finally:
+        _transport.close()
+        await asker.aclose()
+
+
+async def cli_query(args) -> int:
+    loop = asyncio.get_running_loop()
+    qname = _qname_from_arg(args.name)
+    # Decided before the resolver is built, because it decides what the resolver sends on
+    # every hop rather than on one: an empty tuple here means the walk below never carries
+    # an MQTYPE-Query option and no server is asked to do anything new.
+    asked = _bundle_qtypes(args)
+    _transport, resolver_protocol = await _start_recursive_client(loop, args)
     try:
         question = DnsQuestion(qname, args.type, args.qclass)
         query = Query(questions=[question], RD=True)
@@ -1487,6 +1592,12 @@ async def serve(args) -> int:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["rbl"]:
+        # The subcommand spelling is the same question as the flag, and
+        # the dig-plus normalizer below sets the precedent for rewriting
+        # argv before the parser ever sees it: one implementation, two
+        # shapes of habit.
+        argv = ["--rbl", *argv[1:]]
     argv = _normalize_dig_plus_args(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1501,6 +1612,11 @@ def main(argv=None) -> int:
     if args.serve:
         if args.forward:
             parser.error("--serve and --forward do not combine")
+        if args.rbl or args.ptr:
+            parser.error(
+                "--rbl/--ptr ask one question and print its answer; --serve is the "
+                "job of answering everyone's -- one flag at a time"
+            )
         if args.serve_dot and not (args.dot_cert and args.dot_key):
             parser.error(
                 "--serve-dot needs --dot-cert and --dot-key: its clients "
@@ -1530,6 +1646,28 @@ def main(argv=None) -> int:
             "--serve-dot/--forward-dot configure the --serve server's TLS "
             "half; run with --serve (a one-shot lookup forwards with --forward)"
         )
+    if args.rbl:
+        if args.name is not None:
+            parser.error("--rbl builds its name from ADDRESS and ZONE; give no NAME positional")
+        if args.type != DnsQType.A or args.qclass != DnsQClass.IN:
+            parser.error("--rbl asks the zone A and TXT; its TYPE and CLASS are its own")
+        if args.mqtype:
+            parser.error("--rbl asks two fixed questions of one name; --mqtype is another mode")
+        try:
+            ipaddress.ip_address(args.rbl[0])
+        except ValueError as exc:
+            parser.error(f"--rbl: {exc}")
+        return asyncio.run(cli_rbl(args))
+    if args.ptr:
+        if args.name is not None:
+            parser.error("--ptr takes the ADDRESS and builds the NAME; give one or the other")
+        if args.type != DnsQType.A:
+            parser.error("--ptr looks up PTR records; the TYPE is set by --ptr")
+        try:
+            args.name = str(reverse_address(args.ptr))
+        except ValueError as exc:
+            parser.error(f"--ptr: {exc}")
+        args.type = DnsQType.PTR
     if args.name is None:
         parser.error("name is required (or use --serve to run the demo server)")
     if args.stub_transport and not args.forward:

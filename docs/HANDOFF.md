@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, **12 commits ahead of `origin/master`** as of the post-increment-Y docs round (the split history + increments U–Y) — pushing runs the branch-protected 10 required checks, strict |
-| Suite | 1866 passed, 0 failed, 1 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements) |
+| Suite | 1888 passed, 0 failed, 1 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements) |
 | Coverage | 91% measured with `coverage run -m pytest` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` — the ratchet comment asks for it to be raised only from numbers CI itself reports, so it stays at 80 |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`), and **the serve side grew a ladder** — special-use names (RFCs 6761/6762/7686) are refused to walk, `DnsServer.bind()` responders and the reflexive zone answer from the socket (increment V), DNS over TLS works in both directions (`--serve-dot`, `--forward-dot`; increment W), `--filter` refuses by policy with RFC 8914 §4.16–§4.19's codes and nothing else (increment X), and `--serve-query-log` signs every answer as one JSON line naming the rung it came off (increment Y) |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`), and **the serve side grew a ladder** — special-use names (RFCs 6761/6762/7686) are refused to walk, `DnsServer.bind()` responders and the reflexive zone answer from the socket (increment V), DNS over TLS works in both directions (`--serve-dot`, `--forward-dot`; increment W), `--filter` refuses by policy with RFC 8914 §4.16–§4.19's codes and nothing else (increment X), and `--serve-query-log` signs every answer as one JSON line naming the rung it came off (increment Y), and `--rbl`/`--ptr` read blocklist zones and reverse trees through the same reversal, keeping listed/not-listed/unknown three separate answers down to the exit code (increment Z, `namespy/rbl.py`, `examples/blocklist.py`) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -3210,6 +3210,70 @@ literal backslash-n correctly, and `namespy/__init__.py` deliberately
 re-exports no server surface at all (checked: `DnsServer` and V's
 responder types live at module paths too), so X/Y's unexported modules
 are house policy, not an oversight.
+
+### Follow-up: the client that asks the list — three states and one reversal (increment Z, row U9)
+
+`namespy/rbl.py` keeps the two halves of its subject on different footings,
+which is the whole design: the reversal is RFC (1035 §3.5 octets, 3596
+§2.5 nibbles — one `_reversed_labels`, two tails: `reverse_address` hangs
+the arpa trees for PTR, `rbl_query_name` hangs the zone for a listing),
+and the etiquette is deployed convention, labelled as such in the
+docstring because the corpus check found nothing to cite — which is the
+row's "cites nothing rather than ghosting a number" discipline, kept.
+`interpret`'s spine is the three-state rule: NXDOMAIN is the only
+"not-listed" a zone can give, SERVFAIL/REFUSED/timeouts are `unknown`,
+and the exit codes 0/1/2 carry the same refusal-to-collapse into
+scripts. 127.0.0.x codes ride uninterpreted (bit meanings are the zone's
+documentation; inventing names for them would be phantom citation with
+integers); TXT at the leaf is best-effort; the one-hour cache cap is
+polite *and* disclosed (`ttl` beside `zone_ttl`, so the cut is visible).
+
+CLI: one `--rbl ADDRESS ZONE` flag plus a bareword `rbl` argv rewrite in
+front of the parser (the dig-plus normalizer's precedent again — one
+implementation, two shapes of habit), and `--ptr ADDRESS` which just
+builds the arpa name and joins the ordinary lookup. The default walk
+*is* the etiquette (a recursive walk ends at the zone's own authorities);
+`--forward` is honored because naming your own recursive is naming a
+party deliberately. `cli_rbl` shares `cli_query`'s construction through
+the extracted `_start_recursive_client` — the anchors-before-endpoint
+ordering comment moved verbatim with it.
+
+Three bugs the increment surfaced, all worth remembering:
+
+- `cli_query`'s serve-branch ordering: the conflict checks for
+  `--rbl --serve` were *after* the `if args.serve:` branch that returns,
+  so the probe did not get its promised parser error — it started the
+  real server and hung on `Event().wait()` until the command timeout.
+  Unreachable conflict checks are how "validated" lies. The checks now
+  live inside the serve branch, before the return.
+- The example printed its banner and then `main()` returned: a server
+  that existed only in the past tense, every query after the banner
+  timing out against a closed socket. `await asyncio.Event().wait()` +
+  cleanup in `finally` keeps it present; cross-process live verification
+  (exit 0 LISTED, exit 1 NOT-LISTED, PTR answered) is what caught it —
+  the canned-asker tests could not see a dead socket because they
+  monkeypatch it away.
+- `cli_rbl` reached for `DnsRType` through an `__main__` import list that
+  never had it (the CLI prints types through `type_name_of`); the e2e
+  test's NameError caught it. Import lists are claims; the suite checks them.
+
+`examples/blocklist.py` closes the loop honestly: one suffix-bound
+responder is the whole fake zone — known leaves answer A code + TXT
+sentence, everything else gets `DynamicResponse(NAME_ERROR)` because a
+list zone answers for its whole tree and an absent leaf *is* an answer
+(returning None there would fall through to the real internet, which is
+exactly the impoliteness the module exists to prevent). Bindings are
+built with `rbl_query_name` itself; the demo and the client cannot
+drift apart, and the listed host is RFC 5737 documentation space.
+
+Tests: 22 in `tests/test_rbl.py` (name arithmetic both families and both
+tails, the verdict matrix including empty-NOERROR and non-loopback
+answers, TXT rejoin, TTL disclosure, CLI validation fail-fast, canned-
+asker exit codes). Full suite after: 1888 passed, 1 skipped; `-O` clean;
+mypy 33 files; ruff check and format clean. The second horizon's
+remaining rows are the two campaigns, U6 (zones, AXFR — and the Catalog
+Zone transport that X's filter rules would want) and U7 (mDNS/DNS-SD,
+with its two open errata to check at implement time).
 
 
 ## Previous round: MQTYPE (RFC 10029)

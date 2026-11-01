@@ -77,6 +77,19 @@ private network that really does serve those names; it warns, because the
 same flag releases `.onion` queries, which leak the question before they
 waste it.
 
+The blocklist client reads lists the way their operators mean them
+(`namespy/rbl.py`): `namespy --rbl 203.0.113.7 zen.example` (or
+`namespy rbl ADDRESS ZONE`) builds the reversed address — octets per
+RFC 1035 §3.5, nibbles per RFC 3596 §2.5 — and asks the **zone's own
+authorities** (a walk ends there; only their 127.0.0.x was ever
+claimed), decodes the listing codes, fetches the TXT explanation, and
+caps the answer's cache life at an hour. Listed, not-listed and unknown
+stay three answers — exit codes 0/1/2 say so to scripts, and a zone that
+declined to answer is never read as innocent. `namespy --ptr 203.0.113.7`
+asks the same reversed name under `in-addr.arpa`: one reversal, both
+trees. `examples/blocklist.py` serves a fake list zone and checks it
+live, both verdicts and all.
+
 `--trace` prints the walk live — one numbered line per step on stderr, as the
 walk takes it — queries show the zone
 asked (`-> .: example.com A (probe)`), replies and notes read downward in the

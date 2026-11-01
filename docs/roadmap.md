@@ -248,8 +248,8 @@ this table tested itself against it: **four remembered RFC numbers were wrong**
 (RPZ's is RTP/TTML, the filtering experience RFC is MPLS, the DNS log-record
 RFC is COSE, the blocklist-etiquette RFC is SIP), and the corpus check
 settled each row's anchors the same way the citation sweeps settle code's.
-Six of the nine rows below are ✅ — U1, U2, U3, U4, U5 and U8
-shipped; U6, U7 and U9 remain proposals — and every row, shipped or
+Seven of the nine rows below are ✅ — U1, U2, U3, U4, U5, U8 and U9
+shipped; U6 and U7 remain proposals — and every row, shipped or
 not, cites documents that answered `info()` and `search()` at planning
 time, October 2026.
 
@@ -263,7 +263,7 @@ time, October 2026.
 | U6 | **The authoritative arc: serve a zone, then transfer one** | master file: RFC 1035 §5.1; AXFR: RFC 5936 (PS, current, updated by 9103); XoT: RFC 9103; IXFR: RFC 1995; TSIG: RFC 8945 (STD 93 — **1 verified errata**, read first per house practice) | `--zone FILE` makes the demo server authoritative for real zones: presentation-format parse, AA answers, and genuine referrals (the server has only ever recursed; *composing* a referral is new muscle with an old shape the walk already consumes); then AXFR out (5936 framing + 9103's fast-done), authenticated with TSIG (stdlib `hmac` covers HMAC-SHA256/512); IXFR and the client side (zone fetch feeding anchor and blocklist files) follow | the codecs, the OPT rules, and the truncation math all serve any response — the zone work is data-plane addition, not pipeline surgery; it also gives U3's conventions and U2's reflexes a *format* to live in |
 | U7 | **mDNS + DNS-SD: the second DNS** | RFC 6762 (PS, current; 2 open errata — check at implementation) and RFC 6763 (PS, updated by 8553); newer siblings worth watching: 9665 (unicast registration), 8766 (discovery proxy) | a *different profile*, not a new transport: 5353 on the multicast group, `.local`, the cache-flush/unicast-response class bits, known-answer suppression, probe/announce/defend — DNS-SD browse (`_http._tcp.local`) and register, so the demo server can announce itself and namespy can discover itself on a LAN | reuses packet, rdata, names wholesale (the wire is DNS-shaped); the genuinely new things are multicast socket options and a state machine with timers; U8 is a prerequisite, not a nicety |
 | U8 | ✅ **Special-use names: stop walking them** — shipped, increment U | RFC 6761 (PS, current, updates 1918/2606) and RFC 8244 (the problem statement — required reading per its own words) | `.local`, `.invalid`, `.test`, `.onion`, and the eighteen RFC 1918 reverse zones — deliberately *not* `.example`, because §6.5¶4 commands normal resolution, and not `127.in-addr.arpa`, because §6.1's list does not name it: the resolver was walking registry names to root servers that have no business answering. `namespy/special.py` is the table; the guard at the top of `resolve_steps` answers before cache, failure cache, and network — localhost synthesis per §6.3¶4 with TTL 0, the rest per their paragraphs; `SpecialNamesPolicy.IGNORE` is §6.2¶4's named configuration option, warned about and surfaced as `--ignore-special-names`; the `SpecialName` trace event carries the citation | 39 tests in `tests/test_special_names.py`; the row's real proof was 67 fixture failures on landing — the test network lives in `.test`, and the harness took the opt-out exactly as §6.2¶4 pictures a private network doing. It is also what makes U7 honest: 6762 §3¶4's MUST sends `.local` queries to the multicast group, and a unicast resolver that does not speak mDNS owes the network nothing |
-| U9 | **The blocklist client, done politely** | the mechanics are RFCs (PTR shapes: 1035 §3.5 in-addr.arpa, 3596 §2.5 ip6.arpa); the *etiquette* — ask the list's authority not a random recursive, read 127.0.0.x codes, fetch TXT explanations, cache under an hour — is deployed convention with no anchor in this corpus; labelled as such | `namespy rbl 203.0.113.7 zen.example`: build the reversed name, ask over the best transport available, decode return codes and explanation strings, print verdict + why; `namespy --ptr 203.0.113.7` as the reverse first step | it is a pure *consumer* demo: the resolver, the transports, and `--forward`'s direct-ask etiquette already do everything but decide what to print |
+| U9 | ✅ **The blocklist client, done politely** — shipped, increment Z | the mechanics are RFCs (PTR shapes: 1035 §3.5 in-addr.arpa, 3596 §2.5 ip6.arpa); the *etiquette* — ask the list's authority not a random recursive, read 127.0.0.x codes, fetch TXT explanations, cache under an hour — is deployed convention with no anchor in this corpus; labelled as such in the module's own words | `namespy/rbl.py`: `_reversed_labels` built once, hung under the arpa trees (`reverse_address`, the PTR question) or the list zone (`rbl_query_name`, the listing question); `interpret` keeps listed/not-listed/**unknown** three states — NXDOMAIN is the only no a zone can give, a refusal is never innocence — passes 127.0.0.x codes uninterpreted (bit meanings belong to the zone's documentation, not here), reads TXT best-effort, and discloses the one-hour cache cap (`ttl` vs `zone_ttl`). CLI `--rbl ADDRESS ZONE` (bareword `rbl` rewrite) asks the zone's authorities by default or a named recursive with `--forward`; exits 0/1/2 for the three states; `--ptr ADDRESS` closes the reverse first step | 22 tests, `tests/test_rbl.py`, and `examples/blocklist.py` run live cross-process: a suffix-bound fake zone answers known leaves and NXDOMAINs the rest, bindings built through the client's own `rbl_query_name` so demo and reader cannot drift; exit 0 LISTED / exit 1 NOT-LISTED / PTR answered over real UDP |
 
 **Order of attack, with reasons.** U8 first (it is a correctness bug wearing a
 feature's clothes); then U1 → U2 in one pair, because the hook without the
@@ -274,12 +274,16 @@ U3 then shipped as increment X, landing on the EDE machinery that already
 exists: W's SERVFAIL-plus-EDE-22 relay was that vocabulary's first use on
 the server's own failures, and filtering is its use on the operator's.
 U4 followed as increment Y, riding the same pipeline for free — its
-`origin` vocabulary is X's ladder read from the egress door. U6 and U7 are each a
+`origin` vocabulary is X's ladder read from the egress door. U9 shipped
+as increment Z, the consumer half of the same etiquette: what X emits
+and Y logs, a list reader must believe — three states, one reversal,
+codes passed through uninterpreted. U6 and U7 are each a
 campaign, not an increment — U6 earns its size by feeding U3 and U9 with real
 zone data, U7 by being the only row that makes namespy useful on a network
-with no DNS in it at all. An `examples/` directory should grow with U2, U5,
-U7 and U9 — one self-contained script per capability, each runnable against
-the loopback server this project already ships (U5's example is its test
+with no DNS in it at all. An `examples/` directory grows with the
+capabilities — U2's `dynamic_responders.py` and U9's `blocklist.py`
+already run against the loopback server this project ships, one
+self-contained script per capability; U7's lands with U7 (U5's example is its test
 suite: a live demo wants a certificate some verifier can trust, and shipping
 a "real-looking" one would be theater).
 

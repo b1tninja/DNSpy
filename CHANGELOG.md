@@ -8,6 +8,38 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **The blocklist client: reading lists in three honest states
+  (second-horizon U9).** `namespy/rbl.py` separates the mechanics
+  (RFCs) from the etiquette (deployed convention, labelled because it
+  was checked): the reversed address is RFC 1035 §3.5's octets under
+  `in-addr.arpa` and RFC 3596 §2.5's nibbles under `ip6.arpa`, built
+  once and hung under either tree — a PTR name and a list leaf are the
+  same address spoken backwards. `interpret` reads a zone's answers:
+  A records in 127.0.0.0/8 mean LISTED (the codes travel uninterpreted
+  — which bit means which list is the zone's documentation, and
+  inventing bit names would be the phantom-citation move wearing
+  integers), TXT at the same name rides as the explanation, **NXDOMAIN
+  is the zone's only "not-listed", and a refusal is never innocence**:
+  `unknown` is a first-class status, not a fallback default. The
+  polite-cache ceiling caps listings at an hour and discloses itself
+  (`ttl` beside `zone_ttl`). CLI: `namespy --rbl 203.0.113.7
+  zen.example` — or the bareword `namespy rbl ADDRESS ZONE`, the argv
+  rewrite the dig-plus normalizer already set the precedent for —
+  builds the leaf and asks the zone's own authorities (the default
+  walk *is* the etiquette; `--forward` honors an operator naming
+  their own recursive), prints verdict, codes and explanation, and
+  exits **0 listed, 1 not-listed, 2 unknown** so scripts keep the
+  three states too. `namespy --ptr 203.0.113.7` asks the same reversed
+  name under the arpa tree. `examples/blocklist.py` closes the loop
+  live: one suffix-bound responder serves a whole fake zone
+  (`blocked.test` — RFC 5737 addresses only, because a demo that lists
+  a real host is an accusation) answering known leaves with their
+  code and sentence and every other name with the zone's honest
+  NXDOMAIN, bindings built through `rbl_query_name` itself so the
+  demo cannot drift from the client. 22 tests, `tests/test_rbl.py`
+  (canned-answer CLI included), plus a live cross-process run of the
+  example: exit 0 LISTED, exit 1 NOT-LISTED, PTR answered, all over
+  real UDP.
 - **The query log: one JSON line per answer, and every line names its
   rung (second-horizon U4).** `namespy/querylog.py`'s `QueryLog` appends
   one JSON object per query/response pair to a file of the operator's
