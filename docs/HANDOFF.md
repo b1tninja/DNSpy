@@ -2564,10 +2564,79 @@ service". Row 181 ⬜→✅.
 coverage 91.4%. Roadmap row 181 ⬜→✅; CHANGELOG carries the increment.
 
 **Next, in order**: (1) 8509/9535 anchor maintenance (row 157 🟡 --
-acquisition shipped, refresh-on-schedule and rollover handling did not);
+acquisition shipped, refresh-on-schedule and rollover handling did not;
+the sentinel shipped as increment M below, and the list's "9535" turned out
+to be JSONPath);
 (2) DoQ (9250) deferred as ever, its §5.4 padding riding the
 `query_padding` decision whenever the transport lands; (3) the
 authority-leg DoH answer, same small remainder as before.
+
+### Follow-up: a questionnaire for the trust store — RFC 8509's sentinel (increment M)
+
+Row 157 opened with a citation audit of its own -- and this one found a
+real phantom. The row (and every "next" list back to the earliest
+handoff rounds) named **RFC 9535; RFC 9535 is JSONPath**. Nothing was ever
+specified by it; the rollover-timing document the list half-remembered is
+RFC 7583 (INFORMATIONAL, a timeline of DNSSEC key-rollover events), and
+the normative anchor-maintenance mechanism the row actually names is RFC
+8509's sentinel -- which is not a refresh scheduler at all, whatever the
+handoff's prose had been assuming for a dozen rounds. Reading the document
+before coding is the whole increment's method again.
+
+What 8509 actually specifies is a questionnaire: §2's two labels,
+``root-key-sentinel-is-ta-<key-tag>`` and ``...-not-ta-<key-tag>``, asked
+of a validating resolver so its answers reveal the trust-anchor store it
+carries -- on KSK-ceremony night, exactly the thing an operator cannot
+otherwise see. §2.2¶4's table is the protocol (claim matches store:
+original answer; claim contradicts it: §2.2¶5's SERVFAIL with an empty
+Answer Section), §2.1 is six preconditions any one of which forbids
+alteration, and §2.1¶9 is precision law: the key tag is "zero-padded to
+five digits" and a near-miss label is an ordinary name. That last rule
+does real work here: the actual ceremonies queried ten-digit labels
+carrying a key *identifier*, which §2's 16-bit key-tag arithmetic can
+never match -- this implementation follows the document as written,
+processes those as ordinary queries, and says so in the parser's docstring
+rather than inventing a laxer dialect nobody standardized.
+
+`namespy/anchors.py` gained `sentinel_expectation` (label shape, exact)
+and `trusted_anchor_tags` (the store, live: §2.2¶2's AddPend/Revoked
+exclusion read through RFC 9718 §2.2¶7's windows, since this package
+keeps no 5011 state machine -- a future `validFrom` is as untrusted as an
+AddPend, a closed `validUntil` as a Revoked; root-zone-only, because
+§2.2¶2 speaks of root KSKs). `DnsServer._sentinel_gate` enforces the
+preconditions, each with its own exit, and reads the validation verdict
+*before* RFC 6840 §5.8's courtesy AD strip -- the precondition is about
+what the resolver knows, not what this client asked to see; a refusal
+withdraws AD with the answer it used to describe, and outranks the MQTYPE
+combination (§2.2¶5's "ignoring all other documents"), the support claim
+surviving as the empty list that already serves an unanswered query.
+Eighteen tests ask every cell of the table, every precondition's inertia,
+both edges of the validity window, the above-range-but-legal 65536, and
+the ten-digit ceremony name end to end.
+
+Declined, reasons in the row: §3.1's forwarder half (a forwarding resolver
+is supposed to fire its own synthetic sentinel at its upstream and mirror
+the verdict; namespy's forwarding path mirrors the upstream's *answer*
+already, and per-upstream ceremony testing is deployment scope the fixture
+declines like it declined RRL); RFC 5011 auto-add (its own future row --
+the sentinel is explicitly a store *test*, not a store *writer*); and a
+refresh schedule, which no document in the row's own citation list asked
+for: re-acquisition is one `fetch_root_anchors` call from the operator's
+cron, and the sentinel is what proves the call landed. Row 157 🟡→✅.
+
+**Verified**: 1700 passed, 1 skipped (+18). `ruff`/`format`/`mypy` clean,
+coverage 91.5%. Roadmap row 157 🟡→✅ with the 9535→7583 correction;
+README's "open roadmap row" sentence rewritten to describe the
+questionnaire; CHANGELOG Added carries the increment.
+
+**Next, in order**: (1) the authority-leg DoH answer -- same small
+remainder as before, now including §4.6.8.1-style padding on that leg by
+inheritance; (2) DoQ (9250) deferred as ever, its §5.4 padding riding the
+`query_padding` decision whenever the transport lands; (3) RFC 5011 as
+its own honest row if active maintenance is ever wanted (it would *write*
+the store the sentinel now lets you *read*); (4) the standing human task:
+the first release tag the Status section has been waving at for ten
+rounds.
 
 ## Previous round: MQTYPE (RFC 10029)
 

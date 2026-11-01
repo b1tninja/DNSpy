@@ -159,8 +159,13 @@ them change the security properties of anything built on top.
   client asked for CD (RFC 4035 §3.2.2¶3); RFC 9824's compact denials and the
   aggressive-NSEC and wildcard cache reuse ride the same verdicts. What is
   *not* there: validation runs only when anchors are configured (the IANA root
-  document is fetched on `--validate` unless a file is given — RFC 8509-style
-  rollover maintenance is an open roadmap row), and the walk cannot yet speak
+  document is fetched on `--validate` unless a file is given, and the store
+  is now testable during a ceremony: a query for RFC 8509's
+  `root-key-sentinel-is-ta-20326.` is answered only if tag 20326 is in the
+  trust store *right now*, refusal-as-SERVFAIL otherwise —
+  `namespy.anchors` holds the arithmetic, `DnsServer` the table); nothing
+  re-fetches on a schedule, which stays an operator's cron-shaped decision,
+  and the walk cannot yet speak
   to DNS-over-QUIC servers at all. With no anchors configured nothing is
   verified, and answers
   are unauthenticated: anyone who can deliver a well-formed response that

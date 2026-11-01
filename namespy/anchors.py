@@ -23,7 +23,9 @@ DS at a zone cut must itself have been authenticated by the parent's keys before
 anything. Anchors are where that recursion bottoms out. Nothing here walks the chain --
 that is :func:`namespy.verify.authenticate_dnskey_rrset` -- and nothing here rolls a key
 that has been compromised or replaced: RFC 9718 §2.2¶7's validity windows say when a
-published anchor *may* be used, and RFC 8509's rollover model is still roadmap work.
+published anchor *may* be used, and RFC 8509's sentinel mechanism -- the test an
+operator runs to prove a resolver's store matches the ceremony -- lives at the
+bottom of this module, answered at the serving edge by :mod:`namespy.server`.
 """
 
 from __future__ import annotations
@@ -47,12 +49,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only; rdata arrives duck-typed at
 
 __all__ = [
     "IANA_ROOT_ANCHORS_URL",
+    "SENTINEL_IS_TA_LABEL",
+    "SENTINEL_NOT_TA_LABEL",
     "TrustAnchor",
     "TrustAnchorFetchError",
     "TrustAnchorFormatError",
     "active_anchors",
     "fetch_root_anchors",
     "parse_root_anchors",
+    "sentinel_expectation",
+    "trusted_anchor_tags",
 ]
 
 #: RFC 9718 §3.1¶3, the published location of the root trust anchors. The scheme is the
@@ -402,3 +408,83 @@ def fetch_root_anchors(
             f"{url} returned content that is not UTF-8 XML: {exc}"
         ) from None
     return parse_root_anchors(text)
+
+
+# ---------------------------------------------------------------- RFC 8509 §2: the sentinel
+
+#: The two special leftmost labels of RFC 8509 §2¶3 and §2¶4, written without
+#: their trailing ``-<key-tag>``. An operator (or a ceremony's test harness)
+#: asks for ``root-key-sentinel-is-ta-20326.`` and the validating resolver
+#: answers it only if 20326 *is* a key tag the resolver currently trusts --
+#: the pair of labels asks "is X in your store?" and "is X out of your
+#: store?", and §2.2's four-cell table is the whole protocol. The document
+#: chose these shapes deliberately (§2¶7: no underscore prefix, so browsers
+#: and hostname-parsing operating systems will carry them); copying any part
+#: of them from memory is exactly the mistake §2.1¶9 legislates against.
+SENTINEL_IS_TA_LABEL = "root-key-sentinel-is-ta"
+SENTINEL_NOT_TA_LABEL = "root-key-sentinel-not-ta"
+
+_IS_TA_UPPER = SENTINEL_IS_TA_LABEL.upper() + "-"
+_NOT_TA_UPPER = SENTINEL_NOT_TA_LABEL.upper() + "-"
+
+
+def sentinel_expectation(name) -> tuple[bool, int] | None:
+    """What a sentinel query asks, or ``None`` that this is an ordinary name.
+
+    Returns ``(is_ta_label, key_tag)`` -- *is_ta_label* True for the
+    ``is-ta`` form -- when the leftmost label matches §2's pattern. The
+    match is exact, because §2.1¶9 is emphatic that it must be: the key tag
+    is "zero-padded to five digits", and a label that does not carry that
+    precise shape "should be handled as any other label and not according to
+    Section 2.2". So four digits, six digits, or a non-digit is not a
+    near-miss to be interpreted generously but an ordinary query to be
+    answered normally -- which is also the honest answer to the real-world
+    ceremony names like ``root-key-sentinel-is-ta-0208502326``, ten digits
+    long because they encode a key *identifier*, not the 16-bit key tag this
+    document's arithmetic compares: under the document as written, a
+    validating resolver processes them as any other name, and this
+    implementation does not silently invent a laxer rule.
+
+    Labels are DNS-case-insensitive; the key tag is decimal (§2.1¶9, citing
+    RFC 4034 §5.3), and a five-digit value above 65535 is legal to *ask* --
+    it can never be trusted, being unrepresentable as a key tag, which is
+    the table's "not trusted" column, not a parse failure.
+    """
+    labels = name.labels()
+    if not labels:
+        return None
+    try:
+        leftmost = labels[0].decode("ascii").upper()
+    except UnicodeDecodeError:
+        return None  # an IDN cannot spell either label; §2's pattern is pure ASCII
+    for prefix, is_ta in ((_IS_TA_UPPER, True), (_NOT_TA_UPPER, False)):
+        if leftmost.startswith(prefix):
+            digits = leftmost[len(prefix) :]
+            if len(digits) == 5 and all("0" <= d <= "9" for d in digits):
+                return (is_ta, int(digits))
+            return None  # §2.1¶9: the precise specification, or no specification
+    return None
+
+
+def trusted_anchor_tags(
+    anchors: Iterable[TrustAnchor],
+    *,
+    zone: str = ".",
+    moment: _datetime.datetime | None = None,
+) -> frozenset[int]:
+    """The key tags §2.2¶2 would find "trusted": this zone's anchors, live now.
+
+    §2.2¶2's filter is an anchor that "could currently be used for
+    validation", excluding AddPend and Revoked states from RFC 5011 -- this
+    package keeps no 5011 state machine, and RFC 9718 §2.2¶7's windows are
+    its equivalent of that clause: :meth:`TrustAnchor.active` is exactly
+    "could currently be used", a pre-publication anchor (the document's
+    shape for a next-KSK ceremony) is as untrusted here as an AddPend one,
+    and an expired one as a Revoked. The zone default is the root because
+    §2.2¶2 is about root-zone KSKs, wherever an operator's anchors live;
+    a sentinel query about a tag that exists only in some other zone's
+    anchor set reads the store the document is not asking about.
+    """
+    return frozenset(
+        anchor.key_tag for anchor in anchors if anchor.zone == zone and anchor.active(moment)
+    )

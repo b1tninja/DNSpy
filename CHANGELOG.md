@@ -8,6 +8,32 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **The trust-anchor store can now be interrogated during a ceremony:
+  RFC 8509 §2's sentinel mechanism answers at the serving edge.** An
+  operator (or §4.3's harness, on ceremony night) queries
+  `root-key-sentinel-is-ta-<tag>` and `root-key-sentinel-not-ta-<tag>`, and
+  the validating resolver answers the store's yes/no with §2.2¶4's table:
+  the original answer when the label's claim matches reality, §2.2¶5's
+  SERVFAIL with an empty Answer Section — question echoed, AD withdrawn —
+  when it does not. `namespy.anchors.sentinel_expectation` enforces §2.1¶9's
+  precise five-digit zero-padded form as the document writes it: the real
+  ceremonies' ten-digit labels carry a key *identifier*, not §2's 16-bit key
+  tag, and land in ordinary processing rather than a generously widened
+  parser; `trusted_anchor_tags` reads §2.2¶2's AddPend/Revoked exclusion
+  through RFC 9718 §2.2¶7's windows (a future `validFrom` is an AddPend, a
+  closed `validUntil` a Revoked). `DnsServer._sentinel_gate` keeps every
+  precondition its own exit — CD set, a QTYPE beyond A/AAAA, a non-Secure
+  verdict (read before RFC 6840 §5.8's courtesy strip, because the
+  precondition is about what the resolver knows), an ordinary name — because
+  §2.1¶8 makes any of them a MUST NOT alter; the refusal also outranks the
+  MQTYPE combination per §2.2¶5's "ignoring all other documents", with the
+  support claim surviving as an empty list. 18 tests in
+  `tests/test_anchor_sentinel.py`. Declined with reasons: §3.1's forwarder
+  synthetic test, RFC 5011 auto-add, and a refresh scheduler no document
+  asks for. Roadmap row 157 🟡→✅ — with its citation corrected: the row (and
+  every handoff list since) named **RFC 9535, which is JSONPath**; the
+  rollover-timing document is RFC 7583, and 8509 is the sentinel itself.
+
 - **The referral shape answers to RFC 9471 §3 now, in tests.** The server's
   truncation mechanism (increment J's `_fit_datagram`) had only ever been
   measured against fat *answers*; a referral carries its payload in the other

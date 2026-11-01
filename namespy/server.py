@@ -120,6 +120,7 @@ import logging
 import struct
 
 from . import enable_path_mtu_discovery
+from .anchors import sentinel_expectation, trusted_anchor_tags
 from .dnssec import DNSSEC_SECURITY_TYPES
 from .edns import (
     COOKIE_OPTION_CODE,
@@ -135,7 +136,7 @@ from .edns import (
     keepalive_option,
     nsid_of,
 )
-from .enums import DnsOpCode, DnsQR, DnsResponseCode, DnsRType
+from .enums import DnsOpCode, DnsQR, DnsQType, DnsResponseCode, DnsRType
 from .mqtype import (
     MQTYPE_RECOMMENDED_QTX_LIMIT,
     mqtype_query_rejection,
@@ -566,6 +567,66 @@ class DnsServer(asyncio.Protocol):
                 cap,
             )
         return wire
+
+    def _sentinel_gate(self, request, response) -> bool:
+        """RFC 8509 §2: answer the sentinel's question, obey its table.
+
+        The mechanism is a trust-questionnaire: an operator (or a ceremony's
+        test harness, §4.3) queries ``root-key-sentinel-is-ta-<tag>`` and
+        ``root-key-sentinel-not-ta-<tag>`` and reads the resolver's answer
+        as a yes/no about its own anchor store. §2.2¶4's table is the whole
+        protocol, and this method enacts its off-diagonal: when the label
+        claims ``is-ta`` but the store has no such active root anchor -- or
+        claims ``not-ta`` and the store does -- the response is rewritten to
+        §2.2¶5's SERVFAIL with an empty Answer Section.
+
+        Every precondition keeps its own exit, because §2.1¶8 makes any
+        failure to meet them a MUST NOT alter: CD set (§2.1¶4 -- a client
+        validating for itself asked for the data, not the diagnosis), a
+        QTYPE other than A or AAAA (§2.1¶5), a label that is not the precise
+        five-digit form (§2.1¶7 and §2.1¶9, enforced by
+        :func:`namespy.anchors.sentinel_expectation`), and the validation
+        state itself: §2.1¶2-¶3 want a response that *was DNSSEC-validated*
+        with result Secure, which this walk marks by the AD bit it stamps at
+        validation -- read here before RFC 6840 §5.8's courtesy strip in
+        :meth:`_reply`, because the precondition concerns what the resolver
+        knows, not what this client asked to see. An anchorless resolver
+        never sets that bit, so the mechanism is inert without anchors,
+        which is §2.1¶8's own silence rather than a policy invented here;
+        the OPCODE gate (§2.1¶6) ran earlier in :meth:`respond_to_packet`,
+        and QDCOUNT is one by the FORMERR gate, so question zero is the
+        original QNAME §2.1¶7 means.
+        """
+        question = request.questions[0]
+        expectation = sentinel_expectation(question.name)
+        if expectation is None:
+            return False
+        if request.CD:
+            return False
+        if int(question.qtype) not in (int(DnsQType.A), int(DnsQType.AAAA)):
+            return False
+        if not response.AD or getattr(response, "dnssec_bogus", False):
+            return False
+        is_ta, key_tag = expectation
+        trusted = key_tag in trusted_anchor_tags(self.resolver.trust_anchors)
+        if is_ta == trusted:
+            return False  # §2.2¶4 diagonal: the original answer, untouched
+        response.RCODE = DnsResponseCode.SERVER_FAILURE
+        response.answers = []
+        response.ANCOUNT = 0
+        # §2.2¶5 mandates the RCODE and the empty Answer Section and says
+        # nothing about AD -- but AD is an assertion about the answer data,
+        # and the data is gone. A refusal that still claimed "validated,
+        # trust this" would be laundering the diagonal cell's verdict into
+        # the off-diagonal one; the bit goes with what it described.
+        response.AD = False
+        self.log.debug(
+            "server_sentinel_refuse(label=%s tag=%d trusted=%s)",
+            "is-ta" if is_ta else "not-ta",
+            key_tag,
+            trusted,
+        )
+        return True
 
     def _error(
         self,
@@ -1317,7 +1378,16 @@ class DnsServer(asyncio.Protocol):
                 )
                 return
             answered = None
-            if asked is not None:
+            if self._sentinel_gate(dns_packet, response):
+                # RFC 8509 §2.2¶5's rewrite has spoken: SERVFAIL, empty Answer
+                # Section, "ignoring all other documents that specify the
+                # content of the Answer Section" -- which includes the MQTYPE
+                # combination below: it is not attempted, because a combined
+                # answer would violate the sentence that just forbade it. The
+                # support claim survives the refusal as an empty list, the
+                # same reading §3.4 gets when resolution produced nothing.
+                answered = [] if asked is not None else None
+            elif asked is not None:
                 try:
                     answered = await self._combine_mqtype(dns_packet, response, asked)
                 except asyncio.InvalidStateError:
