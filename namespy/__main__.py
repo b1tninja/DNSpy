@@ -579,6 +579,19 @@ def build_parser():
         " to the library.",
     )
     p.add_argument(
+        "--dot-authority",
+        dest="dot_authority",
+        action="store_true",
+        help="encrypt the leg to authoritative servers when they support it (RFC 9539):"
+        " probe DoT to port 853, race it against cleartext until the outcome is known,"
+        " then prefer encryption while success is remembered (3 days) and stay on"
+        " cleartext while failure is (1 day). Certificates are accepted as they come --"
+        " rejecting one would force a fallback to cleartext, which is the leak this"
+        " avoids; the trust worth having is DNSSEC's. Off by default: it is OPTIONAL"
+        " by design, it opens new outbound connections, and it adds nothing that"
+        " --dnssec validation does not already cover. Incompatible with --forward.",
+    )
+    p.add_argument(
         "--forward",
         action="append",
         metavar="UPSTREAM",
@@ -904,6 +917,7 @@ async def cli_query(args) -> int:
             aggressive_nsec=args.aggressive_nsec,
             serve_stale=args.serve_stale,
             trust_anchors=anchors,
+            opportunistic_dot=args.dot_authority,
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -1063,6 +1077,7 @@ async def serve(args) -> int:
                 aggressive_nsec=args.aggressive_nsec,
                 serve_stale=args.serve_stale,
                 trust_anchors=anchors,
+                opportunistic_dot=args.dot_authority,
             ),
             local_addr=("0.0.0.0", 0),
         )
@@ -1167,6 +1182,12 @@ def main(argv=None) -> int:
             "give it an upstream with --forward"
         )
     if args.forward:
+        if args.dot_authority:
+            parser.error(
+                "--dot-authority probes encryption of the leg to authoritative servers;"
+                " a --forward stub has none -- its upstream is the operator's choice,"
+                " whose transport --stub-transport already names"
+            )
         return asyncio.run(cli_stub(args))
     return asyncio.run(cli_query(args))
 

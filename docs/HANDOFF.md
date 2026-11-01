@@ -1867,6 +1867,97 @@ leg -- the transports it needs have all landed, so the row is purely the
 probe, the store, and the fallback; (3) DoQ (9250) stays deferred on the
 `aioquic`-sized conversation.
 
+### Follow-up: the walker encrypts its own authority leg when the server will (RFC 9539 §4)
+
+Increment E of the transport track: the row whose turn the last two
+increments were announced to serve. `--dot-authority` (and
+`RecursiveResolver(opportunistic_dot=True)`) makes the walk try DNS over
+TLS to port 853 of every authoritative address, remember the verdict, and
+choose transports from the memory -- the document's own "bolt-on" shape
+(§4.3¶4), with the policy extracted whole into
+`namespy/opportunistic.py`: Table 2's per-(transport, IP) record and
+Table 1's parameters (persistence 3 d, damping 1 d, timeout 4 s,
+per-protocol per errata 7831/7832 -- both verified errata applied and
+cited at the formulas they fix), and §4.6's decision functions
+(`send_over_do53`, `may_initiate`, `consider`, the note_* transitions of
+§4.6.4-6.7) as pure (state, now, params) arithmetic, 100% covered without
+a socket.
+
+The hands live in `resolver.py`. `query()`'s cleartext ladder moved,
+unchanged, into `_query_do53`; `_query_authority` now consults the table
+first: established session rides alone, fresh success (the §4.6.1¶2
+bullets) speaks only encrypted with §4.6.5's one-line cleartext fallback
+when the leg fails, nothing-remembered races Do53 against a fresh
+initiation, and *the losing encrypted initiation keeps running* --
+§4.6¶5's explicit unlike-Happy-Eyeballs clause ("continued to establish
+whether the IP address X is capable"), its verdict landing in the table
+via a strong-referenced learning set whose done-callback both retires the
+task and consumes its exception. The RFC's "already processed" marking
+(§4.6.2¶4-¶5, §4.6.9¶7-¶8) is emergent, not bookkept: the winner pops the
+pending key, so the loser's late answer finds no slot -- machinery that
+predated the RFC discharging its instruction. The DoT leg is the same
+`_Session`/`_stream_exchange` machinery as the pool, under a per-host
+lock (one initiation, one exchange at a time; §4.6.8.2's pipeline MUST
+applies only when multiplexing, which this is not), and its TLS posture
+is the deliberate inverse of the stub's: `CERT_NONE` because §4.6.3.4's
+MUST to accept any certificate rests on the downgrade argument (rejecting
+forces cleartext, and a forced fallback is the leak), no
+`server_hostname` because §4.6.3.3¶4 says the SNI would be the wire's
+clue which query the walk is walking (the stub verifies strictly
+*because* its operator chose that server -- both stances are cited at
+their doors so nobody "fixes" one into the other), ALPN `"dot"` offered
+per §4.4¶2's MUST and -- per 7858/9539 containing no ALPN-result
+rejection clause, verified by grep -- offered as a target, not enforced
+as a veto. Failure taxonomy: refusal/alert → §4.6.5 fail-damp; handshake
+stall → §4.6.3¶4 timeout-damp; EOF on a ride → §4.6.7 close-no-damp
+("retry promptly" is what status SUCCESS buys); stall-mid-exchange →
+§4.6.6 fail-damp (an authority that takes queries then goes silent is
+§4.2¶4's accidental delay, damped away); mismatch or garbage → desynced
+stream, fail-damp, same reading-position argument as the cleartext pool.
+§7828 rides the same leg: an authority's keepalive TIMEOUT arms the
+session, a 0 retires it blamelessly (the §4.6.7 shape again).
+
+Deferred, each cited in the module docstring: DoQ (§4.4's second SHOULD,
+`aioquic` again), resumption (§4.6.3.2 -- asyncio's client exposes no
+ticket-presenting seam, so Table 2's `resumptions` field stays honestly
+empty; early data §4.6.3.1 is conditional on exactly that seam), padding
+(§4.6.8.1 → the 8145 §5 row), restart persistence (§4.5¶7 is vacuous for
+a library object), and the row's SVCB half: the `_dns.<name>` discovery
+is RFC 9461 §4 policy (alpn-absent means incompatible, port is
+auto-mandatory) over codecs that already exist -- the next increment,
+which turns this row 🟡 to ✅. Flag refused with `--forward` (a stub has
+no authority leg); default off (§4.1¶1's OPTIONAL, plus new egress).
+
+**Verified**: 1529 passed, 1 skipped (+21: `tests/test_opportunistic.py`
+-- 8 pure-policy tests walking §4.6.1/§4.6.3/§4.6.4-6.7 clause by clause
+including both errata proven *as* per-protocol formulas (two
+ProbeParams, two verdicts), and 13 live tests against the DoT fixture --
+race both-go/encryption-wins, success silences cleartext on the next
+query (one connection, counted server-side), **SNI absent and ALPN
+"dot" negotiated proven from the server's own `ssl_object`** (the only
+witness that could), self-signed certificate accepted because §4.6.3.4
+says so, closed-port fallback + damping, stalled-handshake learning
+continuation (settle-then-assert), §4.6.7 stream-kill → cleartext
+carries that one query → prompt retry over a fresh connection,
+mismatched and malformed answers discredit their streams, keepalive 0
+retires blamelessly, force_tcp outranks the policy, `aclose` closes the
+encrypted streams, and the §4.6.6 stall damps). Two test-harness lessons
+are written into the file: a DoT fixture's `wait_closed()` deadlocks with
+an undisposed client in the same loop (hence `dispose()`), and Windows
+loopback black-holes refused ports rather than RST-ing them, so
+"refused" asserts fail-*or*-timeout -- the two §4.6.3¶6 gates that retry
+identically. `ruff`/`format`/`mypy` clean, coverage 91%
+(`opportunistic.py` 100%). Roadmap: the 9539 row ⬜ → 🟡, naming the
+SVCB half as what remains.
+
+**Next, in order**: (1) the `_dns.<name>` SVCB discovery over the landed
+9461 codecs -- port, alpn, policy from the answer -- completing the row;
+(2) the earlier list as it fits -- 6841, 9824, 10001, 8509/9535,
+9364/9904/9905/9906, IDNA, 9471, 8145 §5 (padding would serve both this
+leg and 7858); (3) DoQ (9250) stays deferred on the `aioquic`-sized
+conversation, blocking §4.4's second SHOULD and this row's third
+transport.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

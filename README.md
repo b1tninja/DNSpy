@@ -245,10 +245,15 @@ them change the security properties of anything built on top.
   and — because BCP 235 makes TCP non-optional — over TCP too
   (`DnsStreamServer`, speaking length-framed queries with the
   edns-tcp-keepalive conversation).
-- **The recursive walk speaks Do53.** Queries to authority servers go over
-  UDP, with TCP for truncation and timeouts — those streams are held and
-  reused (RFC 7766 §6.2.1, paced by RFC 7828's keepalive) rather than opened
-  per query; DNS over QUIC (RFC 9250) and
+- **The recursive walk speaks Do53** — UDP with TCP for truncation and
+  timeouts, those streams held and reused (RFC 7766 §6.2.1, paced by RFC
+  7828's keepalive) rather than opened per query — unless `--dot-authority`
+  opts it into RFC 9539 §4 opportunistic encryption: the walker then probes
+  DNS over TLS to port 853 of each authority, races it against cleartext
+  while the outcome is unknown, and remembers the verdict per address
+  (certificates accepted as they come — the trust here is DNSSEC's, and
+  rejecting one would force a cleartext fallback, which is the leak).
+  DNS over QUIC (RFC 9250) and
   mDNS/DNS-SD (RFC 6762, RFC 6763) are not spoken anywhere. The stub's
   forwarded leg offers more: UDP, TCP, TLS (RFC 7858) and HTTPS
   (RFC 8484, HTTP/2 via the optional `doh` extra) — see `--stub-transport`.

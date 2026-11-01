@@ -57,6 +57,7 @@ import random
 import re
 import secrets
 import socket
+import ssl
 import struct
 import urllib.request
 from collections.abc import Sequence
@@ -91,6 +92,7 @@ from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType, is_dat
 from .minimis import QnameMinimiser
 from .names import DomainName
 from .nsec import collect_proof_records, name_order_key
+from .opportunistic import AuthorityProbe, OpportunisticError, ProbeParams
 from .packet import (
     EDNS_DO_BIT,
     OPT_RTYPE,
@@ -248,6 +250,13 @@ class NxdomainPolicy(enum.Enum):
 #: independently.
 _KEEPALIVE_DEFAULT_S = 30.0
 _KEEPALIVE_FLOOR_S = 2.0
+
+#: Placeholder stored in an :class:`~namespy.opportunistic.AuthorityProbe`
+#: while a TLS handshake is in flight: §4.6.3¶9 wants a session handle at
+#: initiation time, before any stream exists to be one, and the pending/
+#: established distinction is what every §4.6 formula reads -- the object
+#: itself is never touched, only its identity and ``None``-ness.
+_HANDSHAKE_PENDING = object()
 
 
 def _idle_seconds(timeout: int | None) -> float:
@@ -420,6 +429,31 @@ class Resolver(asyncio.Protocol):
     #: ``Resolver()`` driven by tests that never bind it).
     _tcp_sessions: dict
 
+    #: RFC 9539 section 4.1: opportunistic encryption of the authority leg
+    #: is OPTIONAL for a recursive resolver -- OPTIONAL in the protocol-
+    #: design sense, so the default is the one that changes nobody's
+    #: egress pattern: off. ``RecursiveResolver(opportunistic_dot=True)``
+    #: (and the CLI's ``--dot-authority``, which the server passes through)
+    #: turns the walker's per-address queries into the §4.6 decision. The
+    #: stub ignores this flag: its upstream is an operator's chosen server
+    #: whose transport the operator *named*, which is §7858/§8484
+    #: territory, not the unilateral probing this policy governs.
+    #: :attr:`opportunistic_dot_port` is §4.4¶2's 853, an instance
+    #: attribute only so tests and unusual deployments can move it;
+    #: :attr:`opportunistic_params` is Table 1 per §4.3 (shared class
+    #: default: the object is read-only, no instance ever mutates it).
+    #: The maps behind them -- Table 2 records, per-host initiation locks,
+    #: live sessions, and background learners -- are lazily bound by the
+    #: accessors, in the style of ``_query_tcp``'s pool, because an
+    #: ordinary query path with the flag off must not allocate any of it.
+    opportunistic_dot = False
+    opportunistic_dot_port = 853
+    opportunistic_params = ProbeParams()
+    _dot_probes: dict
+    _dot_locks: dict
+    _dot_sessions: dict
+    _probes_learning: set
+
     async def query(
         self,
         questions,
@@ -437,8 +471,6 @@ class Resolver(asyncio.Protocol):
         ):
             if value is not None and not isinstance(value, DnsRecord):
                 raise TypeError(f"{label} must be a DnsRecord or None, got {type(value).__name__}")
-
-        future = asyncio.get_running_loop().create_future()
 
         ip = _answer_address(address_record)
         if ip is None:
@@ -481,7 +513,37 @@ class Resolver(asyncio.Protocol):
             self.log.debug("resolver_force_tcp_axfr(dst=%s id=%s)", ip.exploded, dns_packet.ID)
             return await self._query_tcp(ip.exploded, bytes(dns_packet), dns_packet, port=port)
 
+        # RFC 9539 section 4: when the operator has enabled opportunistic
+        # encryption of the authority leg, which transport speaks for this
+        # address is a policy decision about *X*, not a fixed "UDP first".
+        # Both early-outs above outrank the policy -- force_tcp is the
+        # caller's own transport choice and AXFR is TCP by definition --
+        # and a non-default port is not the cleartext half of the (53, 853)
+        # pair the policy is written around. The stub never arrives here
+        # with the flag on: its forwarded leg names its transport outright.
+        if getattr(self, "opportunistic_dot", False) and port == 53:
+            return await self._query_authority(ip, dns_packet)
+        return await self._query_do53(ip, dns_packet, port=port)
+
+    async def _query_do53(self, ip, dns_packet, port: int = 53):
+        """The cleartext half of :meth:`query` -- the ladder the walk has always used.
+
+        Returns the response, or ``None`` when this address said nothing
+        usable after every demotion: an EDNS rejection re-asks without the
+        OPT (RFC 6891 section 6.2.2), a FORMERR to a well-formed MQTYPE
+        query re-asks without the option (RFC 10029 section 3.5), and a
+        timeout or TC bit falls through to cleartext TCP (RFC 7766 section
+        6.2.1's reuse pool, shared with every other leg). The pending slot
+        is registered just before each ``sendto`` and lives until an answer
+        matches, a timeout reaps it, or a cancellation pops it -- which is
+        also what makes :meth:`_query_authority`'s discard honest: a late
+        cleartext answer to a query the encrypted leg already won finds no
+        key here and is dropped, the same outcome §4.6.2 of RFC 9539
+        prescribes by marking the query "already processed".
+        """
+        future = asyncio.get_running_loop().create_future()
         key = _pending_key(ip.exploded, dns_packet)
+        q0 = dns_packet.questions[0] if dns_packet.questions else None
         self.log.debug(
             "resolver_sendto(dst=%s id=%s q=%s %s %s)",
             ip.exploded,
@@ -541,6 +603,12 @@ class Resolver(asyncio.Protocol):
         #
         # The pending key cannot shift between attempts: it is built from the
         # transaction ID and the question, and neither retry touches either.
+        # The options as this packet actually carries them: rebuilt from the
+        # OPT rather than threaded in as a local, because the demotion below
+        # edits the packet and must edit the same list it just serialised.
+        # A query built under --no-edns has no OPT and so no options, which
+        # is also what makes its bundle degrade to plain questions upstream.
+        options = tuple(dns_packet.edns_options())
         bundle_in_flight = any(option.code == MQTYPE_QUERY_OPTION_CODE for option in options)
         for attempt in (1, 2, 3):
             if attempt > 1:
@@ -924,6 +992,322 @@ class Resolver(asyncio.Protocol):
         sessions, self._tcp_sessions = getattr(self, "_tcp_sessions", None), {}
         for session in (sessions or {}).values():
             session.close_now()
+        dot, self._dot_sessions = getattr(self, "_dot_sessions", None), {}
+        for session in (dot or {}).values():
+            session.close_now()
+
+    # ------------------------------------------- RFC 9539: the authority leg,
+    # opportunistically encrypted. The policy lives in
+    # :mod:`namespy.opportunistic`; these are the hands that act on it.
+
+    def _dot_probe(self, host):
+        """This address's Table 2 record, created null as §4.6¶3 demands."""
+        probes = getattr(self, "_dot_probes", None)
+        if probes is None:
+            probes = self._dot_probes = {}
+        return probes.setdefault(host, AuthorityProbe())
+
+    def _dot_lock(self, host):
+        """One initiation, one exchange at a time per X (§6.2.2's politeness)."""
+        locks = getattr(self, "_dot_locks", None)
+        if locks is None:
+            locks = self._dot_locks = {}
+        return locks.setdefault(host, asyncio.Lock())
+
+    def _learning(self) -> set:
+        """Strong references to background probes the race left running."""
+        learning = getattr(self, "_probes_learning", None)
+        if learning is None:
+            learning = self._probes_learning = set()
+        return learning
+
+    def _note_learning(self, task) -> None:
+        """A background initiation finished: retire it and land its outcome.
+
+        The set is the strong reference that keeps asyncio from GC-ing an
+        unawaited task, so this callback -- registered as the task's own
+        done-callback -- is also what releases it; and reading the exception
+        back is the other half of the job, because an unretrieved exception
+        on a task nobody awaits surfaces as asyncio's "Future exception was
+        never retrieved" noise at every damped port. The Table 2 state the
+        task wrote is the point of the whole exercise; by this line it is
+        already in the probe.
+        """
+        learning = getattr(self, "_probes_learning", None)
+        if learning is not None:
+            learning.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    @staticmethod
+    def _opportunistic_tls_context():
+        """The TLS posture §4.6.3.3 and §4.6.3.4 prescribe: no SNI, no trust, ALPN ``dot``.
+
+        ``verify_mode = CERT_NONE`` is section 4.6.3.4's MUST -- "the
+        client connecting under this policy MUST accept any certificate
+        presented by the server... it MUST NOT reject the connection due
+        to the authentication failure, as the result would be falling back
+        to cleartext, which would leak the content of the session to a
+        passive network monitor." This is the deliberate opposite of the
+        stub's RFC 7858 client (:meth:`namespy.stub.StubResolver._dot_initiate`),
+        which verifies strictly because its operator chose that named
+        server for privacy; here the server is a stranger chosen by a
+        delegation, the encryption is a convenience rather than a trust
+        claim, and the trust that matters is DNSSEC's. No SNI either:
+        section 4.6.3.3 paragraph 4's SHOULD NOT, honoured by simply never
+        naming ``server_hostname``. The ALPN offer is section 4.4
+        paragraph 2's MUST ("DoT queries... MUST target TCP port 853 using
+        an ALPN of 'dot'") -- an offer, not a veto: nothing in 7858 or
+        9539 makes a negotiated result other than ``dot`` grounds for
+        rejection, and inventing that veto here would be stricter than
+        either document.
+        """
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.set_alpn_protocols(["dot"])
+        return context
+
+    async def _query_authority(self, ip, dns_packet):
+        """The §4.6 decision, and the §4.6¶5 race when both transports may speak.
+
+        The document's bolt-on hooks, expressed in the shapes this resolver
+        already has:
+
+        * an established session rides alone (§4.6.3¶1), cleartext silenced
+          by §4.6.1¶2's first bullet;
+        * a fresh success with no session -- the last connection closed
+          cleanly, or a background initiation learned capability without an
+          answer -- is the same silence (§4.6.1¶2's second bullet, erratum
+          7831's per-protocol persistence), with a new initiation replacing
+          the lost session;
+        * nothing remembered, or damping elapsed: Do53 and the encrypted
+          attempt go out **concurrently** (§4.6¶5's Happy-Eyeballs shape),
+          and unlike Happy Eyeballs the loser is not terminated when the
+          encrypted leg loses -- §4.6¶5 says so out loud ("they can be
+          continued to establish whether the IP address X is capable"), so
+          a winning cleartext answer lets the handshake finish in the
+          background and fill the table for the next query;
+        * damped failure: cleartext alone (§4.6.3¶6 denies initiation,
+          §4.6.1 permits Do53);
+        * an encrypted failure on a query cleartext was silenced for:
+          §4.6.5's bullet list -- "add Q to Do53-queries[X] and send query
+          Q to X over Do53" -- the one-line fallback below.
+
+        The "already processed" marking of §4.6.2¶4-¶5 and §4.6.9¶7-¶8
+        needs no bookkeeping here, because the cleartext half matches by the
+        pending table: the winner's path pops the key, so a loser's late
+        answer finds no slot and is dropped by :meth:`datagram_received`
+        -- the same instruction, emergent from machinery that predates the
+        RFC.
+        """
+        host = ip.exploded
+        loop = asyncio.get_running_loop()
+        params = self.opportunistic_params
+        probe = self._dot_probe(host)
+        probe.consider(loop.time(), params)  # §4.6.3¶3-¶4, before any question
+        do53_ok = probe.send_over_do53(loop.time(), params)
+        # The encrypted leg speaks when a session can carry the query now,
+        # when an initiation is allowed to build one, or while a handshake
+        # is already pending -- _dot_query waits on that session rather
+        # than racing a second one.
+        dot_wanted = (
+            probe.ride() or probe.session is not None or probe.may_initiate(loop.time(), params)
+        )
+        if not dot_wanted:
+            return await self._query_do53(ip, dns_packet)  # damped, or policy alone forbade E
+        if not do53_ok:
+            try:
+                return await self._dot_query(host, bytes(dns_packet), dns_packet)
+            except OpportunisticError:
+                self.log.debug("resolver_opportunistic_fallback(dst=%s)", host)
+                return await self._query_do53(ip, dns_packet)  # §4.6.5's "and send over Do53"
+        wire = bytes(dns_packet)
+        do53_task = asyncio.ensure_future(self._query_do53(ip, dns_packet))
+        dot_task = asyncio.ensure_future(self._dot_query(host, wire, dns_packet))
+        answer = None
+        finished = set()
+        try:
+            pending = {do53_task, dot_task}
+            while pending and answer is None:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                finished |= done
+                for task in done:
+                    answer = self._race_outcome(host, task) or answer
+                    if answer is not None:
+                        break
+            return answer
+        finally:
+            for loser in (do53_task, dot_task):
+                if loser in finished:
+                    continue
+                if loser is dot_task:
+                    # §4.6¶5: keep learning whether X speaks DoT, even
+                    # though this query is already answered.
+                    self._learning().add(loser)
+                    loser.add_done_callback(self._note_learning)
+                    if loser.done():
+                        # add_done_callback fires only for pending tasks --
+                        # one that finished between the race's last wait and
+                        # this finally has already had its state land in the
+                        # table, and would otherwise sit in the learning set
+                        # forever: consume it here and let it go. (Tests
+                        # settle on this set; a sticky member is a wall.)
+                        self._note_learning(loser)
+                else:
+                    # Cleartext has nothing to teach: its cancellation pops
+                    # the pending slot (_await_udp's CancelledError branch),
+                    # so a late answer is dropped as §4.6.2 prescribes.
+                    loser.cancel()
+
+    def _race_outcome(self, host, task):
+        """One racer's outcome: the answer it brought, or ``None`` for failure."""
+        if task.cancelled():
+            return None
+        error = task.exception()
+        if error is not None:
+            self.log.debug(
+                "resolver_opportunistic_leg_failed(dst=%s err=%s)", host, type(error).__name__
+            )
+            return None
+        return task.result()
+
+    async def _dot_query(self, host, wire, query_packet):
+        """One query over X's DoT session, building it if the table says to.
+
+        Raises :class:`~namespy.opportunistic.OpportunisticError` with the
+        probe already updated, so the racer or the §4.6.5 fallback never
+        has to repeat the failure taxonomy: handshake refusals and stalls
+        are §4.6.5's fail (damped), a session that dies mid-exchange is
+        §4.6.6's established-then-broken fail (also damped -- an authority
+        that takes queries and then stops answering them is exactly the
+        "unreachable or firewalling" server §4.2¶4 warns the timeout away
+        from), and a clean EOF is §4.6.7's shutdown, which deliberately
+        does *not* damp: status survives so the next query retries
+        promptly, this one falls back. A mismatched answer gets the
+        fail-damp too: §4.6.9¶12 hands malformed or wrong answers to "the
+        resolver's policy for unresponsive or non-compliant authoritative
+        servers", and treating a stream that answers other people's
+        questions as trustworthy is compliant with nothing.
+        """
+        params = self.opportunistic_params
+        loop = asyncio.get_running_loop()
+        probe = self._dot_probe(host)
+        async with self._dot_lock(host):
+            probe.consider(loop.time(), params)  # truth may have aged while queued
+            session = probe.session
+            if session is None:
+                if not probe.may_initiate(loop.time(), params):
+                    raise OpportunisticError(f"{host}: initiation not allowed")
+                session = await self._dot_initiate(host, probe, params)
+            elif not probe.session_established:
+                # Pending, and we hold the lock: the initiation that set it
+                # is gone (cancelled mid-handshake, its owner's task torn
+                # down). §4.6.3¶4's timer may not have matured yet, but a
+                # half-dead session is not worth waiting for.
+                probe.note_closed()
+                raise OpportunisticError(f"{host}: session abandoned")
+            probe.note_activity(loop.time())  # §4.6.8¶2
+            try:
+                pkt = await self._stream_exchange(
+                    session.reader, session.writer, wire, query_packet, host
+                )
+            except TimeoutError:
+                probe.note_failed(loop.time(), timed_out=True)
+                self._drop_dot_session(probe, session)
+                raise OpportunisticError(f"{host}: session stalled") from None
+            except DnsPacketParseError:
+                # A malformed answer desyncs a length-prefixed stream as
+                # surely as a mismatch does -- §4.6.9¶12's "malformed or a
+                # failure", same reading-position logic as the cleartext
+                # pool -- so the session goes with it, damped.
+                probe.note_failed(loop.time())
+                self._drop_dot_session(probe, session)
+                raise OpportunisticError(f"{host}: malformed answer") from None
+            except Exception as exc:
+                self.log.debug(
+                    "resolver_opportunistic_closed(dst=%s err=%s)", host, type(exc).__name__
+                )
+                probe.note_closed()  # §4.6.7: status survives, retry promptly
+                self._drop_dot_session(probe, session)
+                raise OpportunisticError(f"{host}: session died") from None
+            if pkt is None:
+                probe.note_failed(loop.time())
+                self._drop_dot_session(probe, session)
+                raise OpportunisticError(f"{host}: answered something else")
+            probe.note_response(loop.time())  # §4.6.9¶6
+            self._arm_dot_idle(host, probe, session, pkt)
+            self.log.debug("resolver_opportunistic_ok(dst=%s id=%s)", host, pkt.ID)
+            return pkt
+
+    def _arm_dot_idle(self, host, probe, session, pkt) -> None:
+        """§7828 on the authority leg: honour the offered TIMEOUT, 0 included.
+
+        An authority that answers with keepalive 0 is saying this
+        connection holds nothing (§3.2.2¶3) -- the close is §4.6.7's shape
+        (status survives, next query initiates fresh), not a failure.
+        """
+        timeout = keepalive_of(pkt.edns_options())
+        if timeout == 0:
+            self.log.debug("resolver_opportunistic_keepalive_refused(dst=%s)", host)
+            probe.note_closed()
+            self._drop_dot_session(probe, session)
+        else:
+            session.arm_idle(_idle_seconds(timeout), asyncio.get_running_loop())
+
+    async def _dot_initiate(self, host, probe, params):
+        """One §4.6.3 initiation: the marker first, the handshake, then the truth."""
+        loop = asyncio.get_running_loop()
+        probe.note_initiating(loop.time(), _HANDSHAKE_PENDING)  # §4.6.3¶9
+        try:
+            reader, writer = await asyncio.wait_for(
+                # server_hostname=None is the whole of §4.6.3.3¶4's SHOULD NOT:
+                # leaving it out would make open_connection volunteer the
+                # connect address as SNI, which is exactly the leakage the
+                # section names.
+                asyncio.open_connection(
+                    host,
+                    self.opportunistic_dot_port,
+                    ssl=self._opportunistic_tls_context(),
+                    server_hostname=None,
+                ),
+                timeout=params.timeout,
+            )
+        except TimeoutError:
+            probe.note_failed(loop.time(), timed_out=True)  # E-timeout, Table 1
+            raise OpportunisticError(f"{host}: handshake timeout") from None
+        except Exception as exc:
+            self.log.debug(
+                "resolver_opportunistic_handshake_failed(dst=%s err=%s)",
+                host,
+                type(exc).__name__,
+            )
+            probe.note_failed(loop.time())  # §4.6.5: refused, alerted, gone
+            raise OpportunisticError(f"{host}: handshake failed") from None
+        tls = writer.get_extra_info("ssl_object")
+        negotiated = tls.selected_alpn_protocol() if tls is not None else None
+        self.log.debug("resolver_opportunistic_handshake(dst=%s alpn=%s)", host, negotiated or "-")
+        session = _Session(reader, writer)
+        sessions = getattr(self, "_dot_sessions", None)
+        if sessions is None:
+            sessions = self._dot_sessions = {}
+        sessions[host] = session
+        probe.session = session
+        probe.note_established(loop.time())  # §4.6.4: status and clocks, all at once
+        session.arm_idle(_KEEPALIVE_DEFAULT_S, loop)  # until the server's number says otherwise
+        return session
+
+    def _drop_dot_session(self, probe, session) -> None:
+        """Unlink *session* from the host map and close it; the probe note is the caller's."""
+        sessions = getattr(self, "_dot_sessions", None)
+        if sessions is not None:
+            for host, held in list(sessions.items()):
+                if held is session:
+                    del sessions[host]
+        if probe.session is session:
+            probe.session = None
+            probe.session_established = False
+        session.close_now()
 
     async def _stream_exchange(self, reader, writer, wire, query_packet, host):
         """One length-prefixed exchange on an already-open stream.
@@ -3701,6 +4085,7 @@ class RecursiveResolver(Resolver):
         serve_stale: float = 0.0,
         dnssec_ok: bool = False,
         trust_anchors=(),
+        opportunistic_dot: bool = False,
     ):
         """Build a resolver without touching the network.
 
@@ -3793,10 +4178,21 @@ class RecursiveResolver(Resolver):
             *trust_anchors* -- a policy that silently failed to apply would be
             worse than one refused at the door.
         :raises FileNotFoundError: if *root_hints_path* is named but missing.
+        :param opportunistic_dot: try encrypted transport to authoritative
+            servers per RFC 9539 section 4 -- probe DoT to port 853, race it
+            against cleartext while the outcome is unknown, remember success
+            for a persistence period and failure for a damping period, and
+            accept the server's certificate whatever it is, because under
+            this policy a verification failure would mean falling back to
+            cleartext and a forced fallback is the leak (:mod:`namespy.
+            opportunistic` is the door). Off by default: §4.1¶1 makes the
+            whole exercise OPTIONAL, it puts new egress connections on the
+            network, and its privacy dividend is DNSSEC's to confirm.
         """
         self.queue: dict[tuple, tuple] = {}
         self.queue_v6: dict[tuple, tuple] = {}
         self._tcp_sessions: dict = {}
+        self.opportunistic_dot = bool(opportunistic_dot)
         self.transport_v6 = None
         self._v6_ready = None
         self.log = LOGGER
