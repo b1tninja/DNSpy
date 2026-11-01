@@ -2053,7 +2053,7 @@ class ServeStale:
     has been expired, because that is the number an operator weighing
     resiliency against staleness asks for. The event always carries the
     reason two sections care about: never AD (the claim is present tense and
-    this data's verdict is past), and RFC 8914 §4.2's Stale Answer EDE on the
+    this data's verdict is past), and RFC 8914 §4.4's Stale Answer EDE on the
     wire to clients that read extended errors.
     """
 
@@ -3961,7 +3961,7 @@ def _synthesize_stale(sname, hit, dnssec_ok: bool = False) -> Response:
     present tense, and this data outlived the verdict that earned it;
     §10¶1's calculus accepts serving stale signatures for reachability, not
     asserting them. And the ``stale_answer`` marker rides the response so the
-    serve side can tell the client what happened (RFC 8914 §4.2's EDE, and
+    serve side can tell the client what happened (RFC 8914 §4.4's EDE, and
     the reason §9's rejected opt-in EDNS option is not missed: the extended
     error says in one field what the option would have signalled in two).
     """
@@ -4529,7 +4529,7 @@ class RecursiveResolver(Resolver):
             (every server for the name spent, or the failure remembered and
             not yet due for a retry). The answer carries §4¶4's greater-than-
             zero TTLs (the recommended 30 seconds), never the AD bit, and is
-            marked for RFC 8914 §4.2's Stale Answer EDE on the way out.
+            marked for RFC 8914 §4.4's Stale Answer EDE on the way out.
         :param trust_anchors: :class:`~namespy.anchors.TrustAnchor` objects to
             validate answers against -- the trust point RFC 4035 §4.4 calls
             "configured" and §4.3 makes the origin of every Secure verdict.

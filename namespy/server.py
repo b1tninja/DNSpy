@@ -197,13 +197,15 @@ EDE_NO_REACHABLE_AUTHORITY = 22
 #: the wrong fault ("nobody answered" when somebody answered unforgably).
 EDE_DNSSEC_BOGUS = 6
 
-#: RFC 8914 section 4.2: "The response contains data that is stale, i.e. the
-#: data's TTL has expired." RFC 8767 §9 rejected a dedicated EDNS option for
+#: RFC 8914 section 4.4: "The resolver was unable to resolve the answer within
+#: its time limits and decided to answer with previously cached data instead of
+#: answering with an error." RFC 8767 §9 rejected a dedicated EDNS option for
 #: exactly this signal and RFC 8914 later provided the general one, so a
 #: serve-stale answer says what it is in the field built for it -- the client
 #: that reads extended errors learns the record is expired; the one that does
 #: not still gets the >0 short TTL that makes it retry rather than settle.
-EDE_STALE_ANSWER = 2
+#: (Code 2 is Unsupported DS Digest Type, §4.3 -- a different fault entirely.)
+EDE_STALE_ANSWER = 3
 
 #: RFC 9824 section 3.5 para 3: a query for the NXNAME Meta-TYPE earns a
 #: FORMERR (section 3.5 para 2's MUST) and this code MAY explain it. The MAY
@@ -817,7 +819,7 @@ class DnsServer(asyncio.Protocol):
                 )
             elif not extended_errors and getattr(response, "stale_answer", False):
                 # RFC 8767 served this from an expired record because the refresh
-                # failed; RFC 8914 §4.2's Stale Answer says so in the one field
+                # failed; RFC 8914 §4.4's Stale Answer says so in the one field
                 # the earlier document's rejected EDNS option never needed -- and
                 # unlike Bogus this is a *successful* answer, an NOERROR or
                 # NXDOMAIN the client may well act on, which is precisely why it

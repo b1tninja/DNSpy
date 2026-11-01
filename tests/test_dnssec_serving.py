@@ -456,8 +456,8 @@ def test_an_ordinary_servfail_keeps_its_own_explanation():
     assert [error.info_code for error in extended_errors_of(parsed.edns_options())] == []
 
 
-def test_a_stale_answer_names_itself_with_extended_dns_error_2():
-    """RFC 8767 §9 rejected a stale EDNS option; RFC 8914 §4.2 later built the general door.
+def test_a_stale_answer_names_itself_with_extended_dns_error_3():
+    """RFC 8767 §9 rejected a stale EDNS option; RFC 8914 §4.4 later built the general door.
 
     The marker rides the response the resolver side synthesised from an
     expired entry, and a NOERROR that used to be a promise within a TTL is
@@ -469,7 +469,7 @@ def test_a_stale_answer_names_itself_with_extended_dns_error_2():
     parsed = _server_reply(response, _ask())
     assert parsed.RCODE == DnsResponseCode.NO_ERROR  # stale is not an error
     (error,) = extended_errors_of(parsed.edns_options())
-    assert error.info_code == 2
+    assert error.info_code == 3
     assert b"namespy" in error.extra_text
 
 

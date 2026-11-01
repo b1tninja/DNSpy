@@ -1,4 +1,4 @@
-"""Serving stale data when refreshing fails (RFC 8767; EDE 2 per RFC 8914 §4.2).
+"""Serving stale data when refreshing fails (RFC 8767; EDE 3 per RFC 8914 §4.4).
 
 The resiliency feature in two layers: the cache keeps expired rows inside a
 maximum-stale window (§5¶11) without ever letting :meth:`get` hand them out
@@ -289,11 +289,11 @@ def test_the_trace_says_the_answer_was_expired():
 
 
 def test_the_stale_response_carries_the_marker_the_ede_door_reads():
-    """`stale_answer` is to EDE 2 what `dnssec_bogus` is to EDE 6 -- and 2 is 8914 §4.2's."""
+    """`stale_answer` is to EDE 3 what `dnssec_bogus` is to EDE 6 -- and 3 is 8914 §4.4's."""
     from namespy.resolver import _synthesize_stale
     from namespy.server import EDE_STALE_ANSWER
 
-    assert EDE_STALE_ANSWER == 2
+    assert EDE_STALE_ANSWER == 3
     cache = _seeded_cache()
     hit = cache.stale(DomainName("www.zone.test."), int(DnsRType.AAAA), IN)
     sname = Sname(DomainName("www.zone.test."), wiring.DnsQType.AAAA)
