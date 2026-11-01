@@ -43,10 +43,12 @@ from .resolver import (
     SpecialNamesPolicy,
 )
 from .server import (
+    DOT_DEFAULT_PORT,
     MQTYPE_RECOMMENDED_QTX_LIMIT,
     REFLEXIVE_NAME,
     DnsServer,
     DnsStreamServer,
+    dot_ssl_context,
     whoami_responder,
 )
 from .stub import TRANSPORTS, StubResolver, Upstream
@@ -539,6 +541,69 @@ def build_parser():
         "-- and an A query from an IPv6-only peer answers NODATA rather than "
         "inventing an address it cannot see (see namespy.server.whoami_responder, "
         "and DnsServer.bind for binding your own)",
+    )
+    p.add_argument(
+        "--serve-dot",
+        dest="serve_dot",
+        action="store_true",
+        help="with --serve: also listen for DNS over TLS (RFC 7858) on "
+        "--dot-port, answering through the same pipeline as the cleartext "
+        "ports -- same guards, same responders (a query over TLS reports "
+        "itself as 'dot' to the reflex zone), same EDNS obligations, "
+        "because TLS changes how the bytes travel and not what they mean. "
+        "Requires --dot-cert and --dot-key: clients authenticate a DoT "
+        "server by its certificate (RFC 7858 section 3.2), and a listener "
+        "with no identity serves only the connection that section tells "
+        "them to distrust",
+    )
+    p.add_argument(
+        "--dot-port",
+        dest="dot_port",
+        type=int,
+        default=DOT_DEFAULT_PORT,
+        metavar="PORT",
+        help="the port --serve-dot listens on (default 853, the port "
+        "RFC 7858 section 3.1 dedicates to the transport -- and its "
+        "warning that an alternative 'MUST NOT be port 53' is why this is "
+        "a second listener rather than one port guessing at TLS. Like 53 "
+        "it needs the privileges a loopback bind still demands; any high "
+        "port works when the clients name it explicitly)",
+    )
+    p.add_argument(
+        "--dot-cert",
+        dest="dot_cert",
+        metavar="FILE",
+        help="PEM certificate for --serve-dot: the identity a client's "
+        "BCP 195 check judges against the #<name> it configured. Its "
+        "subjectAltNames must cover that name; tests and closed loops "
+        "pin a self-signed fixture, real networks want a CA issuance",
+    )
+    p.add_argument(
+        "--dot-key",
+        dest="dot_key",
+        metavar="FILE",
+        help="PEM private key matching --dot-cert",
+    )
+    p.add_argument(
+        "--forward-dot",
+        dest="forward_dot",
+        action="append",
+        default=[],
+        metavar="ADDRESS#NAME",
+        help="with --serve: forward the server's queries to this recursive "
+        "server over DNS over TLS instead of walking from the root (the "
+        "stub arrangement of RFC 1035 section 5.3.1, on RFC 7858's "
+        "transport). Repeat for backups, asked in order: a REFUSED "
+        "advances the list, silence or universal refusal answers SERVFAIL "
+        "with an RFC 8914 'no reachable authority' explanation, and an "
+        "upstream that refused TLS is remembered and skipped for an hour "
+        "(RFC 7858 section 3.1 paragraph 4's own remedy). The #<name> is "
+        "mandatory -- it is who the handshake authenticates, not a label. "
+        "Bound names and the special-use zones still answer locally, "
+        "before any upstream is asked. This is the classic resolver "
+        "shape: cleartext on your own port 53, encryption from here to "
+        "whoever recurses. Incompatible with --forward (that builds a "
+        "client; this configures the server)",
     )
     p.add_argument(
         "--qname-min",
@@ -1209,7 +1274,9 @@ async def serve(args) -> int:
     resolver_protocol = None
     _resolver_transport = None
     _server_transport = None
+    _server_protocol = None
     _stream_server = None
+    _dot_server = None
     try:
         loop = asyncio.get_running_loop()
         anchors = _trust_anchors(args)
@@ -1239,12 +1306,26 @@ async def serve(args) -> int:
             "%s bound to: %s", resolver_protocol, _resolver_transport.get_extra_info("sockname")
         )
 
+        dot_upstreams = []
+        if args.forward_dot:
+            try:
+                dot_upstreams = [Upstream.parse(text, transport="dot") for text in args.forward_dot]
+            except ValueError as exc:
+                raise SystemExit(f"namespy: --forward-dot: {exc}") from None
         _server_transport, _server_protocol = await loop.create_datagram_endpoint(
             lambda: DnsServer(
-                resolver_protocol, nsid=args.advertise_nsid, max_qtypes=args.max_qtypes
+                resolver_protocol,
+                nsid=args.advertise_nsid,
+                max_qtypes=args.max_qtypes,
+                dot_upstreams=dot_upstreams,
             ),
             local_addr=("127.0.0.1", 53),
         )
+        if dot_upstreams:
+            logging.info(
+                "server_forwarding=%s",
+                ", ".join(f"{u.host}:{u.port}#{u.server_name}" for u in dot_upstreams),
+            )
         if getattr(args, "serve_reflexive", False):
             # Bound after construction rather than passed in: bind() is the
             # same door a library embedder uses, and the demo flag is allowed
@@ -1271,6 +1352,31 @@ async def serve(args) -> int:
             lambda: DnsStreamServer(_server_protocol), host="127.0.0.1", port=53
         )
         logging.debug("%s bound to: %s", "DnsStreamServer", _stream_server.sockets[0].getsockname())
+        if args.serve_dot:
+            try:
+                _dot_ssl = dot_ssl_context(args.dot_cert, args.dot_key)
+            except ValueError as exc:
+                raise SystemExit(f"namespy: --serve-dot: {exc}") from None
+            # The TLS listener is the stream protocol itself, one class
+            # behind asyncio's own TLS transport: RFC 7858 section 3.3
+            # paragraph 1 asks for the framing this class already speaks,
+            # so keepalive, idle policy, MQTYPE and the responder hook all
+            # serve the encrypted port unchanged. ssl_handshake_timeout
+            # bounds the half-open TLS farm the module docstring's
+            # third rule is about -- asyncio's 60-second default is a
+            # client's patience, not a server's budget.
+            _dot_server = await loop.create_server(
+                lambda: DnsStreamServer(_server_protocol),
+                host="127.0.0.1",
+                port=args.dot_port,
+                ssl=_dot_ssl,
+                ssl_handshake_timeout=10.0,
+            )
+            logging.debug(
+                "%s bound to: %s over TLS",
+                "DnsStreamServer",
+                _dot_server.sockets[0].getsockname(),
+            )
         # The DNSSEC stance this process takes upstream, recorded at the one
         # moment it is fixed. The two DO directions face different rules and
         # only one is the operator's choice: RFC 4035 §4.1¶1 obliges a
@@ -1308,16 +1414,21 @@ async def serve(args) -> int:
     finally:
         # This mode runs until someone stops it, which is exactly when an
         # unclosed socket stops being a detail: the two endpoint transports,
-        # the stream listener, plus the resolver's private IPv6 one. Every
-        # way out of here -- bind failure, Ctrl+C, something unexpected --
-        # lets all four go.
+        # the stream listener, the TLS listener when one was asked for, the
+        # forwarder's held sessions, plus the resolver's private IPv6 one.
+        # Every way out of here -- bind failure, Ctrl+C, something
+        # unexpected -- lets them all go.
         for transport in (_resolver_transport, _server_transport):
             if transport is not None:
                 transport.close()
         if _stream_server is not None:
             _stream_server.close()
+        if _dot_server is not None:
+            _dot_server.close()
         if resolver_protocol is not None:
             await resolver_protocol.aclose()
+        if _server_protocol is not None:
+            await _server_protocol.aclose()
 
 
 def main(argv=None) -> int:
@@ -1336,7 +1447,19 @@ def main(argv=None) -> int:
     if args.serve:
         if args.forward:
             parser.error("--serve and --forward do not combine")
+        if args.serve_dot and not (args.dot_cert and args.dot_key):
+            parser.error(
+                "--serve-dot needs --dot-cert and --dot-key: its clients "
+                "authenticate the server by its certificate (RFC 7858 "
+                "section 3.2), and a listener without an identity serves "
+                "only the connection that section says to distrust"
+            )
         return asyncio.run(serve(args))
+    if args.serve_dot or args.forward_dot:
+        parser.error(
+            "--serve-dot/--forward-dot configure the --serve server's TLS "
+            "half; run with --serve (a one-shot lookup forwards with --forward)"
+        )
     if args.name is None:
         parser.error("name is required (or use --serve to run the demo server)")
     if args.stub_transport and not args.forward:

@@ -8,6 +8,38 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **DNS over TLS in both directions — the listener, and the server that
+  forwards encrypted (second-horizon U5).** `--serve --serve-dot --dot-cert
+  FILE --dot-key FILE [--dot-port 853]` wraps RFC 7858's own port in front of
+  the *same* stream protocol: the framing §3.3¶1 asks for is the framing TLS
+  delivers, so keepalive advertising, idle policy, responder hooks, MQTYPE
+  and every egress rule serve the encrypted port with no new class — DNS
+  over TLS is DNS. `namespy.server.dot_ssl_context` discharges the server's
+  whole TLS debt: present an identity the client's BCP 195 check (§3.2¶1,
+  already the stub client's posture) can accept, and hold the TLS 1.2 floor
+  so a strict client never succeeds against a server it should have
+  distrusted. The ALPN `"dot"` (RFC 9539 §4.4¶2) is *offered, never vetoed* —
+  the opportunistic client's audited reading travels to the listener, and a
+  test proves a handshake that negotiated no ALPN still gets its answer.
+  `StreamChannel` now marks TLS connections (judged by `ssl_object`, since
+  this server asks no client certificate and `peercert` is None by design),
+  which makes the reflex zone honest on the encrypted hop: `whoami` TXT over
+  the TLS port answers "over dot" — increment U2's unforgeable answer naming
+  the encryption. The symmetric flag `--serve --forward-dot ADDRESS#NAME`
+  makes namespy's own strict DoT client — `StubResolver`, with its BCP 195
+  verification, §3.4¶1 connection reuse and §3.1¶4 hour of refusal-memory —
+  the server's recursion: the special-use guards and bound names answer
+  before any upstream is asked, a REFUSED advances the list, universal
+  silence answers SERVFAIL carrying RFC 8914's No Reachable Authority, and
+  relayed answers lose `AA` in transit because authority is upstream's to
+  claim — what the relay vouches for is the transport, never the authorship.
+  There is no fallback to recursion behind a forward instruction: recursing
+  anyway would leak exactly the queries the operator chose to seal. The test
+  suite now runs both ends of TLS with one codebase — the closed loop has
+  namespy's pinned-CA client authenticating namespy's listener on real
+  handshakes while the reflex TXT names the encrypted hop (15 tests,
+  `tests/test_dot_server.py`, reusing the `tests/certs` fixture pair whose
+  checked-in rationale still holds).
 - **Dynamic responders, and the DNS calling-number announcement circuit
   (second-horizon U1 + U2).** `DnsServer.bind(name, handler,
   include_subdomains=...)` slots a handler between the validation gates and

@@ -91,7 +91,16 @@ reflexive zone (`namespy --forward 127.0.0.1 whoami TXT` answers the address,
 port, and transport your query arrived on — an answer only the socket can
 give), and `DnsServer.bind(name, handler)` is the same door for anything a
 callable can compute — see `examples/dynamic_responders.py`, which runs the
-reflex, a lambda die, a clock, and a suffix-bound mirror on one port.
+reflex, a lambda die, a clock, and a suffix-bound mirror on one port. TLS
+closes both remaining doors: `--serve --serve-dot --dot-cert FILE --dot-key
+FILE` answers RFC 7858's port 853 (settable with `--dot-port`) through the
+same pipeline — a `whoami` query that crossed TLS answers "over dot", because
+the reflex refuses to lie about the socket — and `--forward-dot ADDRESS#NAME`
+sends the server's own queries to encrypted upstreams instead of walking from
+the root: bound names answer first, one connection is reused per upstream
+(RFC 7858 §3.4), an upstream that refuses TLS is remembered for an hour
+(§3.1¶4), and universal silence explains itself with RFC 8914's "no reachable
+authority".
 exposing a recursive resolver to a network you do not control turns it into an
 amplification instrument (RFC 5358, RFC 9085). See [`SECURITY.md`](SECURITY.md).
 

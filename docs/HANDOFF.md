@@ -3023,6 +3023,66 @@ namespy authenticating namespy), then U3 (filtering with the EDE vocabulary);
 the reflex's NSID/TLS-scope sentence waits for U5 to have a TLS to name.
 
 
+### Follow-up: DNS over TLS both ways — the listener and the encrypted forwarder (increment W, row U5)
+
+The listener was one argument: RFC 7858 §3.3¶1 asks for the framing the
+stream protocol already speaks, so `--serve --serve-dot --dot-cert --dot-key`
+is `loop.create_server(..., ssl=dot_ssl_context(...))` in front of the *same*
+`DnsStreamServer` — keepalive advertisement, idle policy, responder hook,
+MQTYPE, and every egress rule serve the encrypted port with no new class.
+`dot_ssl_context` carries the server's whole TLS obligation: present an
+identity worth checking (§3.2¶1's duty is the client's, and its BCP 195
+posture was already the stub's) and hold the TLS 1.2 floor so a strict client
+never succeeds against a server it should have distrusted. ALPN `dot` is
+offered (the audited 9539 §4.4¶2 MUST) and never enforced — resolver.py's
+"offer, not a veto" audit travels with it, and a test that the handshake
+still answers with *no* ALPN negotiated is this increment's honesty proof.
+`ssl_handshake_timeout=10.0` bounds the half-open handshake farm the module
+docstring's third rule is about; asyncio's 60 s default is a client's
+patience, not a server's budget.
+
+TLS belongs in the reflex story too: `StreamChannel` now carries a `tls`
+mark — judged by `ssl_object`, not `peercert`, because this server asks no
+client certificate and a TLS stream would report a peer cert of None — and
+`_consult_responders` turns the mark into `transport="dot"`, so `whoami` TXT
+over the TLS port says "over dot". U2's unforgeable answer finally names the
+encryption: the transport is the answer, and now it answers about the
+encryption too. (Windows note: `get_extra_info("peercert")` is None on a
+server that does not request client certs — the trap this walked into
+before walking out of.)
+
+The forwarder half (`--forward-dot ADDRESS#NAME`) is a decision to *not*
+write code: `DnsServer(dot_upstreams=...)` holds a plain `StubResolver`, so
+BCP 195 verification through `_tls_context`, §3.4¶1 reuse, §3.1¶4
+hour-memory of refused servers, and the REFUSED-advances walk are all the
+already-tested client behavior — no second implementation of the same RFC
+that the server side of the socket can drift from. Three decisions on the
+way out: the guards and bound names answer first, so what the operator bound
+is never a question for a stranger (tested against a dead upstream); the
+relayed answer's `AA` is cleared (authority is upstream's to claim about the
+names upstream holds — §4.1.1 ties the bit to the zone, and this relay
+vouches for the transport, never the authorship); and silence everywhere is
+SERVFAIL with EDE 22 No Reachable Authority, because the operator configured
+that path and the client deserves to know which link of it broke. No
+fallback to recursion behind a forward instruction: recursion would leak what
+the operator chose to seal.
+
+The tests run both ends of TLS from one codebase for the first time — and
+reused the fixture pair already living in `tests/certs` (its recorded
+rationale still holds: no CI job may skip a transport for the crypto extra),
+so the freshly minted `localhost` pair was deleted unused. Windows note: a
+connect to a just-closed loopback listener waits out the first SYN
+retransmission (~2 s) before refusing — the silence tests give `drain` 5.0;
+and the EDE assertion must send OPT, because withholding EDNS from a
+non-EDNS requestor (§7) is correct server behavior the test initially
+blamed on the relay. CLI guards fail before any bind: `--serve-dot` without
+a certificate pair and TLS flags outside `--serve` both exit 2 quoting the
+reason. 15 tests; full suite 1828 passed, 1 skipped. Next in the planned
+order: U3 (filtering with the EDE 15–18 vocabulary — W's EDE-22 relay is
+that vocabulary's first use on the server's own failures), then U4 (query
+log) riding the same pipeline.
+
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

@@ -118,6 +118,7 @@ that path carries an empty list rather than silence.
 import asyncio
 import ipaddress
 import logging
+import ssl
 import struct
 from dataclasses import dataclass
 
@@ -157,6 +158,7 @@ from .packet import (
 )
 from .rdata import RData_A, RData_AAAA, RData_TXT
 from .resolver import EDNS_PAYLOAD_SIZE, RecursiveResolver
+from .stub import StubResolver, Upstream
 
 LOGGER = logging.getLogger(__name__)
 
@@ -267,13 +269,20 @@ class StreamChannel:
     paragraph 1 obliges the server to ignore the option even when the
     query carried it, which it does, because ``None`` never reaches the
     option builder.
+
+    ``tls`` is for the responders: a query that arrived over a TLS-wrapped
+    stream arrived over *dot* (RFC 7858), and a reflex answer calling it
+    "tcp" would be the one kind of lie the honest services tell -- they
+    answer from the socket, and the socket knows it is encrypted. It is
+    judged by :func:`_transport_is_tls` at response time.
     """
 
-    __slots__ = ("keepalive", "send")
+    __slots__ = ("keepalive", "send", "tls")
 
-    def __init__(self, send, keepalive=None):
+    def __init__(self, send, keepalive=None, tls=False):
         self.send = send
         self.keepalive = keepalive
+        self.tls = bool(tls)
 
 
 #: The three RR sections of a message, as the attribute that holds each one and
@@ -326,6 +335,11 @@ class ResponderRequest:
     and *cd* ride along because an answer's shape may legitimately depend
     on whether the client validates; the full *packet* is there for a
     handler that needs more, at its own risk of coupling.
+
+    *transport* names the socket, not the protocol's mood: ``udp``,
+    ``tcp``, or ``dot`` when the stream rides TLS -- the reflex answer's
+    whole claim is about the transport, so a TLS stream must not report
+    itself as its cleartext twin.
     """
 
     name: DomainName
@@ -433,6 +447,7 @@ class DnsServer(asyncio.Protocol):
         nsid=None,
         max_qtypes: int | None = MQTYPE_RECOMMENDED_QTX_LIMIT,
         tcp_idle: int | None = DEFAULT_TCP_IDLE_S,
+        dot_upstreams=(),
     ):
         """
         :param nsid: the RFC 5001 name-server identifier to advertise when a
@@ -483,6 +498,25 @@ class DnsServer(asyncio.Protocol):
             server whose resources cannot hold connections, carried
             honestly -- and each stream closes once the messages it already
             delivered have been answered.
+        :param dot_upstreams:
+            recursive servers to forward every query to over DNS over TLS
+            (RFC 7858) instead of walking from the root --
+            :class:`~namespy.stub.Upstream` objects or strings parsed with
+            the ``dot`` transport, which makes the ``#<name>`` identity
+            exactly as mandatory as the client requires it to be. The
+            forwarder is a plain :class:`~namespy.stub.StubResolver`, so
+            every encrypted-upstream obligation is the stub's, already
+            written and already tested: BCP 195 authentication through
+            ``_tls_context``, one reused connection per upstream
+            (RFC 7858 section 3.4 paragraph 1), and section 3.1 paragraph
+            4's hour of silence for an upstream that refused the
+            handshake. Bound responders and the special-name guards answer
+            *before* forwarding -- what the operator bound is the
+            operator's, never a question for a stranger -- and a query
+            that outruns every upstream is SERVFAIL, not a fallback to
+            recursion: the operator said forward, and recursing anyway
+            behind that instruction would leak exactly the queries the
+            operator chose to seal.
 
         """
         if not isinstance(resolver, RecursiveResolver):
@@ -511,6 +545,23 @@ class DnsServer(asyncio.Protocol):
         # nothing of its own, and every query walks the resolver as it always
         # did. See :meth:`bind`.
         self._responders: list[tuple[DomainName, bool, object]] = []
+        # Forwarding over TLS, when the operator configured upstreams (see
+        # :param dot_upstreams): the encrypted-client half is StubResolver's
+        # whole story -- walk, refusal-advance, reuse, hour-memory -- and an
+        # empty list means no forwarder is built and no behavior changes.
+        # The DO stance mirrors this server's resolver so a forwarding server
+        # asks upstreams for what it would have fetched itself, no more.
+        self._dot_upstreams = tuple(
+            Upstream.parse(u, transport="dot") if isinstance(u, str) else u for u in dot_upstreams
+        )
+        self._forwarder = (
+            StubResolver(
+                self._dot_upstreams,
+                dnssec_ok=bool(getattr(resolver, "dnssec_ok", False)),
+            )
+            if self._dot_upstreams
+            else None
+        )
 
     def connection_made(self, transport):
         self.transport = transport
@@ -579,7 +630,9 @@ class DnsServer(asyncio.Protocol):
             qtype=int(question.qtype),
             qclass=int(question.qclass),
             address=addr,
-            transport="udp" if channel is None else "tcp",
+            transport=(
+                "udp" if channel is None else "dot" if getattr(channel, "tls", False) else "tcp"
+            ),
             dnssec_ok=bool(getattr(dns_packet, "dnssec_ok", False)),
             cd=bool(dns_packet.CD),
             packet=dns_packet,
@@ -635,6 +688,98 @@ class DnsServer(asyncio.Protocol):
             mqtype_answered=[] if asked is not None else None,
             channel=channel,
         )
+
+    async def _forward_dot(self, dns_packet, addr, asked, channel) -> None:
+        """Ask the configured upstreams and answer with whatever comes back.
+
+        The server half of the arrangement RFC 1035 section 5.3.1 paragraph 2
+        describes -- a list of servers "that will perform the recursive
+        requests" -- delegated wholesale to :meth:`StubResolver.forward`,
+        which owns the walk: a REFUSED advances the list because that
+        upstream declined the arrangement, any other answer comes back as it
+        arrived, and section 3.4 paragraph 1's reuse and section 3.1
+        paragraph 4's remembered refusal are the forwarder's standing
+        behavior on every repeat query. The semaphore is held across the
+        exchange because a forwarded query is upstream work -- the reflection
+        defense budgets work, not routes.
+
+        Two edits on the way out are framing rather than content: the ID and
+        the question echo are the *client's* (the forwarder composed its own
+        query, and an answer must match the question it was sent for), and AA
+        is cleared in transit -- authority is upstream's to claim about the
+        names upstream holds, and this server vouches for the transport it
+        sealed, never for an authorship it did not produce. CD echo, OPT
+        composition, the DNSSEC strip, truncation and the MQTYPE
+        empty-support list are then :meth:`_reply`'s standing obligations,
+        inherited structurally the way every answer in this module inherits
+        them.
+
+        Silence everywhere answers SERVFAIL carrying RFC 8914's No Reachable
+        Authority (:data:`EDE_NO_REACHABLE_AUTHORITY`): "the servers I was
+        configured to ask did not answer" is precisely the information that
+        INFO-CODE exists to convey, and it is the one place a forwarding
+        server can explain more than a recursive one -- here the failed path
+        is the operator's own configuration, and the client deserves to know
+        which link of it broke.
+        """
+        forwarder = self._forwarder
+        if forwarder is None:  # defensive: the only caller checks first
+            return
+        async with self._slots:
+            try:
+                response = await forwarder.forward(
+                    list(dns_packet.questions),
+                    rd=bool(dns_packet.RD),
+                    client_cd=bool(dns_packet.CD),
+                )
+            except Exception as exc:
+                # A forwarder that raises is silence with a reason, not a
+                # traceback on the wire: the responder contract's refusal to
+                # leak internals applies just as hard to network plumbing.
+                self.log.debug("server_forward_error(dst=%s err=%s)", addr[0], type(exc).__name__)
+                response = None
+        if response is None:
+            self._error(
+                dns_packet,
+                addr,
+                DnsResponseCode.SERVER_FAILURE,
+                mqtype_answered=[] if asked is not None else None,
+                channel=channel,
+                extended_errors=(
+                    extended_dns_error_option(
+                        EDE_NO_REACHABLE_AUTHORITY, b"namespy: no DoT upstream answered"
+                    ),
+                ),
+            )
+            return
+        response.ID = dns_packet.ID
+        response.questions = list(dns_packet.questions)
+        # AA does not survive the relay. Upstream's claim to be the authority
+        # is upstream's to make about names upstream holds; this server
+        # answers for them without holding them, and RFC 1035 section 4.1.1
+        # ties the bit to authority for the zone -- "only available in
+        # answers from authoritative name servers". A client that wants the
+        # authority's own answer can ask the upstream the operator named;
+        # what this relay vouches for is the transport, never the authorship.
+        response.AA = False
+        self.log.debug("server_forwarded(dst=%s rcode=%s)", addr[0], response.RCODE)
+        self._reply(
+            response,
+            addr,
+            request=dns_packet,
+            mqtype_answered=[] if asked is not None else None,
+            channel=channel,
+        )
+
+    async def aclose(self) -> None:
+        """Release the forwarder's held connections, if this server has one.
+
+        Cleartext sockets die with the listener; a held TLS session is state
+        an embedder's shutdown should hand back, and that is exactly what
+        :meth:`StubResolver.aclose` does.
+        """
+        if self._forwarder is not None:
+            await self._forwarder.aclose()
 
     def _reply(
         self, response, addr, request=None, extended_errors=(), mqtype_answered=None, channel=None
@@ -1586,6 +1731,9 @@ class DnsServer(asyncio.Protocol):
         if verdict is not None:
             self._dynamic_reply(dns_packet, addr, verdict, asked, channel)
             return
+        if self._forwarder is not None:
+            await self._forward_dot(dns_packet, addr, asked, channel)
+            return
         async with self._slots:
             try:
                 response = await self.resolver.resolve(dns_packet)
@@ -1673,6 +1821,79 @@ class DnsServer(asyncio.Protocol):
             self.log.debug("server_overload_drop(src=%s:%s)", host, port)
             return
         self._spawn(self.respond_to_packet(dns_packet, addr))
+
+
+#: The port DNS over TLS listens on. RFC 7858 section 3.1 sends clients to
+#: 853 and warns that a negotiated alternative "MUST NOT be port 53" --
+#: namespy.stub reads the same sentences from the client side and defaults
+#: its ``dot`` transport there; a server defaulting to the same number is
+#: that arrangement's other half. Like 53 it is privileged on loopback too,
+#: which is why ``--serve-dot`` pairs with ``--dot-port`` for demos.
+DOT_DEFAULT_PORT = 853
+
+#: The ALPN token a DoT listener offers. RFC 9539 section 4.4 paragraph 2 is
+#: the obligation namespy.resolver's opportunistic client quotes at length
+#: ("DoT queries ... MUST target TCP port 853 using an ALPN of 'dot'"), and
+#: that audit's conclusion travels with the offer: the negotiation is "an
+#: offer, not a veto", so this server offers ``dot`` and rejects nothing
+#: over what it negotiated. A TLS stream that negotiated some other ALPN --
+#: or none -- is still a TLS stream carrying framed DNS, which is all
+#: RFC 7858 asks a listener to be.
+DOT_ALPN = "dot"
+
+
+def _transport_is_tls(transport) -> bool:
+    """Whether a server transport carries TLS, judged by its ssl_object.
+
+    Not ``peercert``: this server asks no client certificate -- client
+    authentication is its own deployment, not the transport's definition --
+    so a TLS-wrapped stream here would report a peer certificate of None
+    whatever its encryption. ``ssl_object`` is the presence of the wrapping
+    itself, and by the time a query has been parsed off the stream the
+    handshake that produced it has completed; no answer can arrive early
+    enough to wonder.
+    """
+    return transport is not None and transport.get_extra_info("ssl_object") is not None
+
+
+def dot_ssl_context(cert_path, key_path, *, alpn=(DOT_ALPN,)) -> ssl.SSLContext:
+    """The listener half of RFC 7858: a TLS context with an identity to prove.
+
+    The document puts the authentication duty on the client -- section 3.2
+    paragraph 1 sends it through [BCP195], and section 5 has the server
+    "authenticated based on its presented certificate" -- which leaves the
+    server exactly two obligations, both discharged here or in the files
+    handed to it:
+
+    * **Present an identity a strict client can check.** Everything that
+      makes the certificate acceptable lives in *cert_path*: its chain, its
+      names, its validity. The names must cover what clients put in the
+      ``#<name>`` of a DoT upstream; a self-signed pair is verifiable only
+      where the verifier pinned it -- namespy's own tests, a closed loop
+      where both ends were told about the same file -- and a real network
+      wants what a CA issued.
+    * **Hold the floor the clients' BCP 195 posture expects.** TLS 1.2
+      minimum: the same protocol floor :func:`ssl.create_default_context`
+      keeps on the stub's client side, stated on this side too so a strict
+      client never succeeds against a server it should have distrusted.
+
+    Everything above this context is DNS: the listener is an ordinary
+    :class:`DnsStreamServer` behind ``loop.create_server(..., ssl=...)``,
+    because the framing RFC 7858 section 3.3 paragraph 1 asks for is the
+    same two-octet-prefix conversation that class already speaks. The
+    keepalive advertisement, the idle policy, MQTYPE, the responder hook
+    and every egress rule arrive for free -- DNS over TLS is DNS, and this
+    module has treated it that way down to the class list.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_cert_chain(cert_path, key_path)
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError(f"cannot load DoT certificate/key pair ({cert_path!r}): {exc}") from None
+    if alpn:
+        context.set_alpn_protocols(list(alpn))
+    return context
 
 
 class DnsStreamServer(asyncio.Protocol):
@@ -1869,7 +2090,7 @@ class DnsStreamServer(asyncio.Protocol):
         # says 0, and 0 is what it says. Advertising thirty from a stream
         # about to end would be the one sentence the MUST forbids.
         advertised = 0 if self._closing else self._advertised
-        channel = StreamChannel(emit, keepalive=advertised)
+        channel = StreamChannel(emit, keepalive=advertised, tls=_transport_is_tls(self._transport))
         try:
             if dns_packet is None:
                 # Parse failed: the shared responder's no-OPT FORMERR, sent
