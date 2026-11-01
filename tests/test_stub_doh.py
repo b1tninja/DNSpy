@@ -18,7 +18,7 @@ import base64
 import ssl
 
 import pytest
-from test_stub_dot import TrustingStub, _make_cert
+from test_stub_dot import TrustingStub, _cert_paths
 
 from namespy.doh import DNS_MESSAGE_MEDIA_TYPE, H2_AVAILABLE, base64url, get_path
 from namespy.enums import DnsQClass, DnsQR, DnsQType, DnsRType
@@ -27,7 +27,7 @@ from namespy.packet import DnsPacket, DnsQuestion, DnsRecord, Response
 from namespy.stub import StubResolver, Upstream
 
 QNAME = DomainName("doh.example.")
-CERT_NAME = "dot.test"  # the name _make_cert's certificate is issued for
+CERT_NAME = "dot.test"  # the name _cert_paths' certificate is issued for
 
 
 def question():
@@ -64,8 +64,8 @@ def big_answer(query):
 
 
 @pytest.fixture(scope="module")
-def cert(tmp_path_factory):
-    return _make_cert(tmp_path_factory.mktemp("dohcerts"))
+def cert():
+    return _cert_paths()
 
 
 class DohServer:

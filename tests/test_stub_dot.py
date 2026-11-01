@@ -2,8 +2,9 @@
 
 These drive a real ``ssl`` server on loopback -- the handshake, the
 certificate check and the length-prefixed framing are the feature, and
-faking them would test the fake. The certificate is generated per session
-(the ``crypto`` extra; the module skips without it), and the client's trust
+faking them would test the fake. The certificate is a static, test-only
+fixture under ``tests/certs`` (nothing here needs a crypto backend -- the
+handshake speaks stdlib), and the client's trust
 is extended through the documented :meth:`StubResolver._tls_context` seam,
 the same door an enterprise CA walks through.
 
@@ -17,33 +18,23 @@ timeout, §3.2.2¶3's zero-means-close.
 """
 
 import asyncio
-import ipaddress
+import pathlib
 import ssl
 import struct
-from datetime import UTC, datetime, timedelta
 
 import pytest
 
-cryptography = pytest.importorskip(
-    "cryptography", reason="the TLS fixture's certificate needs namespy[crypto]"
-)
-
-from cryptography import x509  # noqa: E402
-from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
-from cryptography.x509.oid import NameOID  # noqa: E402
-
-from namespy.edns import (  # noqa: E402
+from namespy.edns import (
     KEEPALIVE_OPTION_CODE,
     EdnsOption,
     find_option,
     keepalive_of,
     keepalive_option,
 )
-from namespy.enums import DnsQR, DnsQType  # noqa: E402
-from namespy.names import DomainName  # noqa: E402
-from namespy.packet import DnsPacket, DnsQuestion, Response  # noqa: E402
-from namespy.stub import (  # noqa: E402
+from namespy.enums import DnsQR, DnsQType
+from namespy.names import DomainName
+from namespy.packet import DnsPacket, DnsQuestion, Response
+from namespy.stub import (
     _KEEPALIVE_DEFAULT_S,
     _KEEPALIVE_FLOOR_S,
     StubResolver,
@@ -53,39 +44,22 @@ from namespy.stub import (  # noqa: E402
 QNAME = DomainName("dot.example.")
 CERT_NAME = "dot.test"
 
+#: The certificate these servers serve and these clients trust: a
+#: hundred-year self-signed ECDSA pair issued for ``dot.test``/127.0.0.1,
+#: checked in as test material. Static rather than generated per session
+#: because the handshake, the check and the framing are what is under test
+#: and none of them needs a generator: when the fixture demanded the
+#: ``crypto`` extra, every CI matrix job outside the extras job skipped
+#: this file and ``namespy/doh.py`` whole -- an entire transport going
+#: unexercised and unmeasured wherever the extra was not installed. The
+#: private key has never protected anything real; treat it as the string
+#: constant it is.
+_CERTS = pathlib.Path(__file__).parent / "certs"
 
-def _make_cert(tmp_path):
-    """A day-long self-signed ECDSA certificate for ``dot.test``/127.0.0.1."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, CERT_NAME)])
-    now = datetime.now(UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(days=1))
-        .not_valid_after(now + timedelta(days=1))
-        .add_extension(
-            x509.SubjectAlternativeName(
-                [x509.DNSName(CERT_NAME), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
-            ),
-            critical=False,
-        )
-        .sign(key, hashes.SHA256())
-    )
-    cert_path = tmp_path / "dot-test.pem"
-    key_path = tmp_path / "dot-test-key.pem"
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
-    )
-    return str(cert_path), str(key_path)
+
+def _cert_paths():
+    """The loopback TLS fixture: ``(certificate, key)`` PEM paths."""
+    return str(_CERTS / "dot-test.pem"), str(_CERTS / "dot-test-key.pem")
 
 
 class DotServer:
@@ -163,9 +137,9 @@ def question():
 
 
 @pytest.fixture
-async def dot(tmp_path):
+async def dot():
     """A running DoT server plus factories for upstreams and trusting stubs."""
-    cert, key = _make_cert(tmp_path)
+    cert, key = _cert_paths()
     server = DotServer(cert, key)
     await server.start()
 

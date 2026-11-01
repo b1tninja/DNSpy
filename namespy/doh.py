@@ -51,7 +51,11 @@ try:  # the optional extra, probed at import the way namespy probes crypto
 
     H2_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    h2 = None  # type: ignore[assignment]
+    # The name stays unbound: every reference to h2 below the import sits
+    # behind an H2_AVAILABLE check (open_doh_session raises the install
+    # sentence before a session is built), so rebinding it to None here
+    # only taught mypy a lie -- on a minimal install the import resolves
+    # to Any, and the None assignment was the unused-ignore CI caught.
     H2_AVAILABLE = False
 
 LOGGER = logging.getLogger("namespy.stub")

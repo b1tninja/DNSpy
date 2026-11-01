@@ -47,10 +47,16 @@ jobs:
       # checker stops being read.
       - run: mypy namespy
 
-  # The optional backends, exercised where they exist. The Test matrix deliberately runs
-  # without them -- that is the configuration most people install, and the no-backend path is
-  # what must stay clean -- so without this job the [crypto] and [doh] extras would ship
-  # untested and the integration points their transports rest on would be assumptions.
+  # The optional backends, exercised where they exist. The Test matrix runs
+  # without a crypto backend -- that is the configuration most people install, and the
+  # no-backend path is what must stay clean -- so without this job the [crypto] extra
+  # would ship untested and the integration points its transports rest on would be
+  # assumptions. The [doh] extra (pure Python, no wheels to advise against) does ride
+  # the matrix, because an optional transport the matrix cannot run is a transport the
+  # matrix cannot cover either: the TLS fixtures are static stdlib material, so with
+  # h2 present every DoT and DoH line is exercised in all four matrix jobs -- and the
+  # coverage floor is the proof: when the dot/doh tests skipped for lack of a
+  # certificate generator, doh.py measured 15% and the floor broke the commit.
   crypto_extra:
     name: Crypto extra
     runs-on: ubuntu-latest
@@ -88,7 +94,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev,doh]"
 
       # The coverage floor is fail_under in pyproject.toml, not duplicated here,
       # so the threshold and the explanation for it stay in one file. The --cov

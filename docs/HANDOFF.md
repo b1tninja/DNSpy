@@ -138,6 +138,14 @@ cd D:\code\namespy
 9. **Coverage floor is a ratchet**: raise it with tests, never ahead of them — and it
    is only ever *read* when something passes `--cov`, so check the flag is present
    before believing the gate fired.
+10. **Transport test fixtures need no backends, and the matrix must see them**: the
+    DoT/DoH TLS fixture is the static self-signed pair under `tests/certs`, and the
+    CI matrix installs the pure-Python `doh` extra — an optional transport must be
+    exercised *and measured* in every matrix job, or the floor goes blind there
+    (the DoH commit failed at 78.76% exactly this way: the whole of `doh.py`
+    skip-gated on a certificate *generator*). Only the crypto backend stays out
+    of the matrix, for the no-backend guarantee; `test_stub_doh.py`'s h2 tests
+    keep their own `skipif(not H2_AVAILABLE)` for local runs without the extra.
 
 ## Known gaps (deliberate, documented in README/CHANGELOG)
 
