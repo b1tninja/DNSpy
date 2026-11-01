@@ -1279,6 +1279,15 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Fixed
 
+- **Two documentation-hygiene strays, found while running the definition-of-done
+  checklist against increments X and Y.** `SECURITY.md` named
+  `namespy.server.Server`, a class that has never existed in the package (the
+  door is `DnsServer`); the same section now names the two surfaces increments
+  X and Y added — the filter list as a disclosure decision rather than a
+  control, and the query log's client addresses as the reason it is
+  default-off. And `docs/HANDOFF.md` ended in a stray `ved.` — the corpse of
+  some past edit's line ending, deleted.
+
 - **The serve-stale answer announced itself with the wrong extended error
   code.** RFC 8914 §4.4 registers Stale Answer as code 3; §4.3's code 2 is
   Unsupported DS Digest Type — a different fault entirely — and the server

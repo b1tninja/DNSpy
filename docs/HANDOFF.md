@@ -3486,4 +3486,3 @@ volunteered address.
 Definition of done for any of these: focused tests + full suite green under
 `-O`; roadmap row flipped in the same commit; README/CHANGELOG updated if
 the gap list changes; ratchet coverage if it moved.
-ved.

@@ -107,13 +107,23 @@ such glue is visible without lowering anyone's defenses to count it.
 
 ### The bundled server and CLI demo
 
-`namespy.server.Server` and `namespy --serve` exist to exercise the codec against a
+`namespy.server.DnsServer` and `namespy --serve` exist to exercise the codec against a
 loopback peer. **They are not a name server product and must not be exposed to a
 network you do not control.** An unauthorised recursive resolver on a reachable
 address is an amplification and cache-poisoning instrument; RFC 5358 and RFC 9085
 are the documents that explain why, and BCP 140 covers the operational side. The
 CLI binds `127.0.0.1:53`; anything broader is a deliberate edit you are making,
 and should come with an ACL, a rate limit, and a version-caching plan.
+
+Two serve-time features add operator-chosen surfaces. `--filter` answers are
+policy acts, and they are composed to be legible as such — no AA, no AD even
+for a DO client, an RFC 8914 explanation for any client that reads extended
+errors — but a client that reads neither signal sees only a refusal, so the
+list is a disclosure decision, not a security control. `--serve-query-log`
+appends one JSON-lines record per answer, and every record contains a client
+address; that is the whole reason the log is default-off (the server module's
+first rule, applied to a file) and why retention, rotation, and the file's
+permissions stay the filesystem's problem, outside this library.
 
 ### Outbound fetching
 
