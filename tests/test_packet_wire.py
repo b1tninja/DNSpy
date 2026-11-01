@@ -334,7 +334,7 @@ def test_opt_ad_flag_and_payload_size() -> None:
     parsed, _ = DnsPacket.parse(_with_opt(ttl=1 << 15))
     assert parsed.opt() is not None
     assert parsed.dnssec_ok
-    assert not parsed.cd
+    assert not parsed.compact_answers_ok
     assert parsed.requestor_payload_size == 1232
 
 

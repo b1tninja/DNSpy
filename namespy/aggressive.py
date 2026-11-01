@@ -28,6 +28,15 @@ What conditions the licence, and where each guard lives here:
   rests on an Opt-Out record is refused -- the same refusal that keeps AD off
   those answers, read here on the proof in hand rather than on the entry's
   stamp, because the flag belongs to the covering record, not to the file.
+* Compact Answers deny synthesis entirely (RFC 9824 §6¶3): "Protocol
+  optimizations that enable DNS resolvers to synthesize NXDOMAIN or wildcard
+  responses, like those described in [RFC8020] and [RFC8198], cannot be
+  realized from responses that use Compact Denial of Existence." A bundle
+  holding a record that asserts NXNAME is discarded here outright -- not
+  believed false, but stripped of the multi-name reach the geometry would
+  otherwise grant it, because its span (a name to its null-labeled successor,
+  a hash to that hash plus one) is empty by construction and its one-name
+  claim is already cached as itself.
 * Signatures count as well as TTLs ("until the effective TTLs or signatures
   expire", §7): the entry's own expiry is the TTL half and the caller's honour;
   the RRSIG windows are read here -- a timestamp, not a re-verification, which
@@ -65,6 +74,7 @@ from .nsec import (
     nsec_proves_wildcard_answer,
     nsec_record_is_from_proper_zone,
     proof_entries,
+    record_asserts_nonexistent,
     wildcard_at,
 )
 from .packet import DnsRecord, Response
@@ -254,6 +264,22 @@ def synthesize_denial(
         # Appendix B ¶2 in one line: unverified means discarded. Not believed
         # false -- just never the basis for a proof this resolver did not make.
         return None
+    for record in entry.proofs:
+        rdata = getattr(record, "rdata", None)
+        if (
+            int(record.rtype) in (int(DnsRType.NSEC), int(DnsRType.NSEC3))
+            and hasattr(rdata, "has_type")
+            and record_asserts_nonexistent((record.name, rdata))
+        ):
+            # RFC 9824 §6¶3: denials "cannot be realized" from compact
+            # responses at all -- and the inference this entry could otherwise
+            # feed is the specific lie §2¶1 rules out: an entry written for
+            # `www A` whose matching record asserts NXNAME would happily
+            # synthesise `www TXT` NODATA for the same name, lending the shape
+            # of "exists, no such type" to a name the zone says is gone. The
+            # one honest answer, the name itself, is already in the cache as
+            # the denial it is.
+            return None
     if entry.soa is None:
         return None
     if remaining is None:

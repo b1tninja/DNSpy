@@ -189,6 +189,13 @@ EDE_DNSSEC_BOGUS = 6
 #: not still gets the >0 short TTL that makes it retry rather than settle.
 EDE_STALE_ANSWER = 2
 
+#: RFC 9824 section 3.5 para 3: a query for the NXNAME Meta-TYPE earns a
+#: FORMERR (section 3.5 para 2's MUST) and this code MAY explain it. The MAY
+#: is taken, because FORMERR says the message failed to parse when what is
+#: wrong is the question -- and section 9's Table 3 registered the code for
+#: nothing else.
+EDE_INVALID_QUERY_TYPE = 30
+
 #: The Extended DNS Errors this server reports about *itself*.
 #:
 #: Only its own failures are listed, and that is the deliberate half of RFC 8914
@@ -471,9 +478,21 @@ class DnsServer(asyncio.Protocol):
             channel.send(wire)
 
     def _error(
-        self, dns_packet, addr, rcode: DnsResponseCode, mqtype_answered=None, channel=None
+        self,
+        dns_packet,
+        addr,
+        rcode: DnsResponseCode,
+        mqtype_answered=None,
+        channel=None,
+        extended_errors=None,
     ) -> None:
         """Reply with *rcode*, echoing the question so the client can match it.
+
+        ``extended_errors`` overrides the self-failure mapping below: an
+        ``None`` lets ``_own_failure_errors`` decide, and an explicit tuple is
+        for the rejections whose explanation is not a property of the RCODE
+        alone -- RFC 9824 section 3.5¶3's EDE 30 beside a FORMERR, for one.
+        Pass an empty tuple to force silence.
 
         ``mqtype_answered`` is the list to put in a MQTYPE-Response option --
         empty on this path, but *present*, because RFC 10029 section 3.4 opens by
@@ -503,7 +522,9 @@ class DnsServer(asyncio.Protocol):
             ),
             addr,
             request=dns_packet,
-            extended_errors=self._own_failure_errors(rcode),
+            extended_errors=(
+                self._own_failure_errors(rcode) if extended_errors is None else extended_errors
+            ),
             mqtype_answered=mqtype_answered,
             channel=channel,
         )
@@ -1119,6 +1140,28 @@ class DnsServer(asyncio.Protocol):
             # The resolver models one Sname at a time, and answering one of N
             # questions without saying which is worse than refusing.
             self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
+            return
+
+        if int(dns_packet.questions[0].qtype) == int(DnsRType.NXNAME):
+            # RFC 9824 section 3.5 para 2, in the server's words: "If an
+            # explicit query for the NXNAME RR type is received, the DNS
+            # server MUST return a Format Error (response code FORMERR)."
+            # The Meta-TYPE stores no data in a zone (section 2 para 3), so
+            # there is no answer to compose -- and section 3.5 para 3's MAY
+            # rides along, because FORMERR would otherwise say the datagram
+            # was unreadable when what is wrong is the question itself.
+            self.log.debug("server_nxname_query(src=%s)", addr[0])
+            self._error(
+                dns_packet,
+                addr,
+                DnsResponseCode.FORMAT_ERROR,
+                channel=channel,
+                extended_errors=(
+                    extended_dns_error_option(
+                        EDE_INVALID_QUERY_TYPE, b"namespy: NXNAME is not a queryable type"
+                    ),
+                ),
+            )
             return
 
         if DnsOpCode.QUERY != dns_packet.OPCODE:

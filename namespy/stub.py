@@ -296,6 +296,21 @@ class StubResolver(Resolver):
         asks the upstream authoritatively instead, which is what a forwarder
         feeding a walk would want and nothing else.
         """
+        for question in questions:
+            if int(question.qtype) == int(DnsRType.NXNAME):
+                # RFC 9824 section 3.5 para 2: "A resolver MUST NOT forward
+                # these queries upstream or attempt iterative resolution."
+                # The walk has its own guard for the second half; forwarding
+                # is this class's entire repertoire, so the refusal belongs
+                # here too -- raising rather than inventing a local FORMERR
+                # packet, because a forwarder that answers questions itself
+                # has stopped being one.
+                raise ValueError(
+                    "NXNAME (128) must not be forwarded: it is a Meta-TYPE "
+                    "that signals a nonexistent name inside NSEC bitmaps, and "
+                    "RFC 9824 section 3.5 forbids asking it of anyone (the "
+                    "served answer would have to be FORMERR)"
+                )
         refused = None
         now = asyncio.get_running_loop().time()
         for upstream in self.upstreams:

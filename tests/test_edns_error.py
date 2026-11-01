@@ -110,10 +110,12 @@ def test_a_registry_name_is_the_one_the_registry_gives_it() -> None:
 
 
 def test_a_code_with_no_entry_prints_as_its_number() -> None:
-    """Unassigned (25-49151) and private-use (49152-65535) space per section 5.2
-    Table 2. A code from either is somebody else's meaning, so it renders as a
-    number and :attr:`private_use` says which kind of unknown it is."""
-    assert "25" == extended_error_name(25)
+    """Unassigned and private-use space per section 5.2 Table 2 -- codes
+    beyond the registry's live Table 3 (which now runs to 31, RFC 9824
+    included) and the private-use range from 49152. A code from either is
+    somebody else's meaning, so it renders as a number and
+    :attr:`private_use` says which kind of unknown it is."""
+    assert "32" == extended_error_name(32)
     assert "49151" == extended_error_name(49151)
     assert "49152" == extended_error_name(EXTENDED_ERROR_PRIVATE_USE_MIN)
     assert ExtendedDNSError(EXTENDED_ERROR_PRIVATE_USE_MIN).private_use

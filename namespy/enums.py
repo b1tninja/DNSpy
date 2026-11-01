@@ -281,6 +281,7 @@ class DnsRType(_TypeMixin, IntEnum):
     LP = 107  # RFC 6742
     EUI48 = 108  # RFC 7043 section 3
     EUI64 = 109  # RFC 7043 section 4
+    NXNAME = 128  # RFC 9824 section 2 -- Meta-TYPE, a bitmap signal only; see DnsQType
     TKEY = 249  # RFC 2930 -- key establishment, not a stored RR
     TSIG = 250  # RFC 8945 -- transaction signature, not a stored RR
     IXFR = 251  # RFC 1995 -- incremental zone transfer
@@ -303,6 +304,8 @@ class DnsQType(_TypeMixin, IntEnum):
     the RTYPE table so they cannot drift apart. ``AXFR``, ``MAILB``, ``MAILA``
     and ``ANY`` exist only in a question (RFC 1035 sections 3.2.3, 6), and
     ``IXFR``/``TKEY``/``TSIG``/``OPT`` are RR-adjacent but not zone data.
+    ``NXNAME`` is listed only to be refused: it is a question no resolver may
+    ask (RFC 9824 section 3.5), and every boundary here says so.
     """
 
     A = 1
@@ -380,6 +383,11 @@ class DnsQType(_TypeMixin, IntEnum):
     LP = 107
     EUI48 = 108
     EUI64 = 109
+    #: RFC 9824 section 3.5¶2: "A resolver MUST NOT forward these queries
+    #: upstream or attempt iterative resolution", and a server MUST answer
+    #: FORMERR (§3.5¶2). Listed here so the number parses -- refused at every
+    #: boundary (CLI, stub, walk, server) rather than at the enum.
+    NXNAME = 128
     TKEY = 249
     TSIG = 250
     IXFR = 251  # query-only: RFC 1995

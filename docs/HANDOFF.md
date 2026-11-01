@@ -2123,6 +2123,135 @@ leg's DoH answer (a dohpath-bearing `_dns` record is already parsed and
 declined -- wiring `namespy/doh.py` to the same seam is the small
 remainder when wanted).
 
+### Follow-up: the denial that denies the name — RFC 9824, and the citation audit that preceded it
+
+The deferred-work list said "6841" first. It should not have been trusted at
+all. Before choosing increment H, every remaining row's citation was re-opened
+against the corpus itself (roadmap row 194's standing obligation, four months
+overdue), and the audit found three wrong pointers, two of them naming
+documents unrelated to the feature they justified. The first: **RFC 6841 is
+"A Framework for DNSSEC Policies and DNSSEC Practice Statements"**,
+Informational, nothing to do with QNAME case — and the 0x20 mechanism has no
+published specification anywhere (searched exact-phrase, semantic, and by
+subject: the corpus's only trace is the expired `draft-vixie-dnsext-dns0x20`
+as an informative reference inside RFC 8555). The row is closed unspecifiable
+rather than implemented from memory; this track cites sections, and there is no
+section to cite. The rest of the list checked out — 9824 compact denial, 10001
+dual-family (§4.2 is real and recent, BCP 91), 9471 glue, 9364 umbrella — and
+the HANDOFF's own "8145 §5 (padding)" was a third wrong pointer: 8145 §5 is
+edns-key-tag signaling, padding policy is **RFC 8467**, which roadmap row 95
+already cited correctly with its trigger condition ("the day the P4 transports
+exist") now fired. The second wrong document lived in code, not prose, and is
+told below where the bit itself is told.
+
+9824 itself reads small and is a validator rewrite in disguise, because its
+central move is against the implication every §5.3.2 validator trusts: an
+NSEC/NSEC3 whose owner matches QNAME proves the name *exists*. Compact denial
+signs exactly that shape for names that do not exist and adds NXNAME (128) to
+the bitmap to say so (§2, §7.1/§7.2 amending 4034/4035 to let the pseudo-type
+bit ride). The validator change is therefore deliberately narrow: the NOERROR
+branch's mechanics are untouched — the matching record still proves QTYPE
+absent, which is *true* even when the shape is a half-lie about existence —
+and the increment only reads the bit beside the proof (`via_compact` on the
+verdict, the `via_opt_out` pattern a second time), plus one NAME_ERROR branch
+for §5.1's CO-restored RCODE 3. The refusals were the design work:
+
+* NXDOMAIN + CO + a matching record **without** the bit → Incomplete, not
+  Bogus, not believed: the signed body contradicts the header, and 9824 says
+  nothing that licenses calling that forgery — the zone may be mid-deployment
+  and sign the shape it always signed beside an RCODE it should not have
+  moved. Re-ask.
+* NXNAME beside a real type in one bitmap → on the NAME_ERROR branch, Bogus
+  (§3.1¶2's "MUST only" read as the record contradicting itself); on the
+  NOERROR branch, merely no signal — the NODATA proof stands on QTYPE's
+  absence and the rest is pseudo-type noise RFC 4034 §4.1.2's ignore-rule was
+  written for. Asymmetric on purpose: RCODE 3 *needs* the bit to mean
+  anything; NOERROR never needed it at all.
+* CO beside a conventional covering proof → inert. §5.1 adds a shape the
+  server MAY send; it demotes nothing §5.3.1 already accepts.
+
+§6¶3's ban ("[8020/8198 synthesis] cannot be realized from responses that use
+Compact Denial of Existence") turned out to be mostly *structural* — the
+successor forms are empty spans by construction, `\0.owner` sorts immediately
+after `owner` and hash+1 immediately after hash, and the covering predicates
+already refuse an empty span for every neighbour — tested that way rather than
+asserted from prose. Two guards were still needed where the structure does not
+reach: the walk caches a compact NXDOMAIN (restored by the zone over CO) as a
+**Nodata-shaped entry** — the delivered packet keeps the zone's RCODE 3,
+honest and AD-set on the verdict, but a `Nxdomain` cache entry is the shape
+that cuts descendants, and 8020 synthesis from compact evidence is the exact
+thing §6¶3 names; and `synthesize_denial` discards whole bundles carrying the
+bit, because a cached matching record is otherwise NODATA-synthesis fuel for
+every other type at a name declared gone. (The bundle-wide discard rather than
+record-wide: one lie inside a proof bundle means the bundle describes no world
+— differential-tested, one bitmap bit changes the synthesis to `None`.)
+
+**The CO bit nearly landed on the wrong bit number, and its landing site was
+already squatted.** §5.1's drawing shows CO beside DO; §9's IANA table says
+"Bit 1". Fetched live (`dns-parameters.xml`, 2026-10-16): the EDNS Header Flags
+registry numbers from the top — its "Bit 0" *is* DO, the 6891 drawing's bit 15
+— so §9 and §5.1 agree and CO is 0x4000... which is exactly where this
+codebase had, since the earliest EDNS rounds, a constant `EDNS_CD_BIT`
+documented as "Checking Disabled — OPT FLAGS bit 14 (RFC 6891 §6.1.3, RFC 6955
+§4)". Both citations are fiction: 6891 §6.1.3 assigns nothing there, and
+**RFC 6955 is Diffie-Hellman Proof-of-Possession**. No EDNS registry ever
+listed CD (6840 §5.5 is key-tag arithmetic; the CD that DNSSEC speaks of is
+the *header's* bit 4 — untouched here, correctly cited, correctly plumbed
+through §3.2.2's copy rules). The property had exactly one consumer, the CLI's
+EDNS-flags print — which against any modern CO-speaking server would have
+printed "cd" for a flag that has never existed. Retired: `EDNS_CO_BIT` and
+`compact_answers_ok` now own the bit, the CLI prints `co`, and the removal is
+documented at the constant, in the CHANGELOG, and in roadmap row 194 as the
+fourth audit round's second new class of wrong (a wire constant justified by a
+document from another protocol entirely). The same fetch refreshed the EDE
+table (25–31 all registered since RFC 8914; 30 is 9824's, verbatim names
+per the table's own policy).
+
+§3.5's prohibition — a resolver MUST NOT forward or attempt an NXNAME query; a
+server MUST FORMERR — is enforced at all four doors this package owns (CLI
+parse, walk entry, stub forward, served question with EDE 30), with the enum
+registered in `DnsQType` *precisely so the refusal can name the number*; the
+TYPE-3597 spelling bounces the same way. The walk honors a compact signal it
+never asked for — what vouches for the bit is the signature, not the request —
+while `--compact-answers` remains the opt-in to negotiate §5.1's restoration,
+whose downstream-querier half (§5¶2, §5.1¶5) is left unimplemented by scope:
+namespy serves no downstream clients, and inventing a RCODE-rewriting egress
+for a library would put this resolver's word where §5.1¶3 puts the zone's.
+
+A find from the pre-work, tested but not touched: `validate_denial`'s NOERROR
+branch has no 5155 §8.7 fallback for **NSEC3** wildcard-NODATA responses —
+`_nsec3_no_data` reaches its "the covering record asserts rather than opts
+out" contradiction for a perfectly signed §8.7 answer, verdict BOGUS, walk
+SERVFAILs. Proven with a live fixture (apex + `*.zone.test.` chain, query
+`deep.zone.test. AAAA` → bogus "denies the very existence the No Data response
+claims"). `aggressive.py` knows the shape (`nsec3_proves_wildcard_no_data`,
+its §5.2 fallback), which is why the whole suite passes — the wire path alone
+is blind. Pre-existing, orthogonal to 9824 (compact answers route around it —
+their proofs always match), and it deserves its own increment with 5155 §8.7,
+errata 3441/4622, and a NSEC3 wire scenario in `test_dnssec_wiring` that today
+only exists in NSEC dress. Recorded in roadmap row 155 and here.
+
+**Verified**: 1651 passed, 1 skipped (+23: registry rows, the §4¶8 digest and
+its hash-plus-one successor, the empty-span proofs, the bitmap-shape matrix,
+eight validator scenarios, two scripted-walk scenarios (event, RCODE, AD,
+cache-entry rcode, descendant-not-cut), the synthesis differential, the four
+§3.5 doors, the flag-matrix property; 3 existing assertions re-pinned from the
+fictional OPT-CD to CO, 1 EDE-table test re-pinned from code 25 to 32).
+`ruff`/`format`/`mypy` clean, coverage 91.38%. Roadmap: the 9824 row ⬜→✅
+(wording corrected against the document it cites), the 0x20 row closed
+unspecifiable, row 194's audit round recorded, row 155 carries the §8.7/NSEC3
+finding.
+
+**Next, in order**: (1) **the §8.7-over-NSEC3 wire gap above** — it turns a
+correct signed answer into SERVFAIL and predates this increment; smallest
+correctness win on the board; (2) RFC 10001 §4.2 dual-family upstream
+selection (roadmap row 58 🟡, citation verified); (3) RFC 8467 padding for the
+encrypted legs (row 95's condition met — the codec `edns.padding_option`
+exists, the policy does not); (4) RFC 9471 §3 server-side glue completeness
+(row 181 ⬜, small); (5) 8509/9535 anchor maintenance (row 157 🟡); (6) DoQ
+(9250) deferred as ever on the `aioquic`-sized conversation; (7) the
+authority-leg DoH answer, same small remainder as before.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

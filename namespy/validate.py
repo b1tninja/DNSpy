@@ -53,6 +53,8 @@ from .names import DomainName
 from .nsec import (
     ContradictoryProofError,
     IncompleteProofError,
+    find_nsec3_matching,
+    find_nsec_matching,
     name_order_key,
     nsec3_proves_no_data,
     nsec3_proves_no_ds,
@@ -62,6 +64,8 @@ from .nsec import (
     nsec_proves_nxdomain_response,
     nsec_proves_wildcard_answer,
     proof_entries,
+    record_asserts_nonexistent,
+    record_is_compact_denial,
     usable_nsec3,
 )
 from .verify import (
@@ -119,6 +123,16 @@ class ValidationVerdict:
     #: cryptographically verified". A resolver reads this to withhold the bit it
     #: otherwise earns from :attr:`secure`.
     via_opt_out: bool = False
+    #: True when a SECURE denial is a Compact Answer -- its owner-matching
+    #: NSEC/NSEC3 record carries the NXNAME signal (RFC 9824 §2¶3), so the
+    #: name itself, not merely the queried type, is what the zone denies.
+    #: The walk reads this to withhold two optimizations §6¶3 forbids on
+    #: compact data -- the RFC 8020 subtree cut and RFC 8198 synthesis --
+    #: because a compact record proves exactly one name and nothing around
+    #: it: its span runs from the name to the name with a null label
+    #: prefixed (§3.1¶2) or from a hash to that hash plus one (§4¶5), which
+    #: is an empty span by construction.
+    via_compact: bool = False
 
     @property
     def secure(self) -> bool:
@@ -849,7 +863,9 @@ class Validator:
             # -- the wildcard answer stands, the AD claim does not.
         )
 
-    def validate_denial(self, qname, qtype: int, *, rcode, zone) -> ValidationVerdict:
+    def validate_denial(
+        self, qname, qtype: int, *, rcode, zone, co_signaled: bool = False
+    ) -> ValidationVerdict:
         """Is this denial of existence proved -- and proved by the right zone?
 
         ``zone`` is the apex of the zone that answered (its servers, its SOA), which the
@@ -857,6 +873,13 @@ class Validator:
         built for -- RFC 5155 §8.4 for a Name Error, §8.5 for No Data, RFC 4035 §5.4 for
         their NSEC originals -- and only a response whose proofs both *name* the denial
         and *verify* under authenticated keys comes back SECURE.
+
+        ``co_signaled`` says the response came back with RFC 9824 §5.1's Compact Answers
+        OK flag set, which licenses one extra shape under NAME_ERROR: the §5.1¶3 promise
+        is a NODATA-style proof -- the record *matching* QNAME, its bitmap carrying
+        NXNAME -- wearing an NXDOMAIN RCODE. That is checked first, and CO is inert
+        against everything else: §5.1 adds an option for the server, it does not
+        demote the conventional covering proof the same server may hand instead.
 
         Two refusals stay distinct because a resolver treats them differently, which is
         the whole lesson of RFC 8020 §2¶3 for the NXDOMAIN cut: a denial whose chain
@@ -887,21 +910,33 @@ class Validator:
             )
         error = DnsResponseCode(int(rcode))
         via_opt_out = False
+        via_compact = False
         try:
             if error is DnsResponseCode.NAME_ERROR:
-                if entries3:
-                    via_opt_out = nsec3_proves_nxdomain(
-                        qname, usable_nsec3(entries3), zone
-                    ).via_opt_out
-                else:
-                    nsec_proves_nxdomain_response(qname, entries1)
+                via_compact = co_signaled and self._compact_nxdomain(
+                    qname, entries1, entries3, zone
+                )
+                if not via_compact:
+                    if entries3:
+                        via_opt_out = nsec3_proves_nxdomain(
+                            qname, usable_nsec3(entries3), zone
+                        ).via_opt_out
+                    else:
+                        nsec_proves_nxdomain_response(qname, entries1)
             elif error is DnsResponseCode.NO_ERROR:
                 if entries3:
-                    via_opt_out = nsec3_proves_no_data(
-                        qname, int(qtype), usable_nsec3(entries3), zone
-                    ).via_opt_out
+                    proof3 = nsec3_proves_no_data(qname, int(qtype), usable_nsec3(entries3), zone)
+                    matching = getattr(proof3, "matching", None)
                 else:
-                    nsec_proves_no_data(qname, int(qtype), entries1)
+                    proof1 = nsec_proves_no_data(qname, int(qtype), entries1)
+                    matching = getattr(proof1, "matching", None)
+                # The NXNAME signal rides only on the record that matches QNAME --
+                # and a badly shaped signal degrades to no signal here rather
+                # than to Bogus: §5.3.2's NODATA proof stands on QTYPE being
+                # absent from the bitmap, and it is absent; the extra bits that
+                # spoil §3.1¶2's shape are pseudo-type noise the pre-existing
+                # RFC 4034 §4.1.2 read rule already tells a validator to ignore.
+                via_compact = matching is not None and record_is_compact_denial(matching)
             else:
                 raise ValueError(
                     f"validate_denial takes NAME_ERROR or NO_ERROR answers, got {error!r}"
@@ -923,11 +958,63 @@ class Validator:
                 f"the proof of denial from {zone} could not be verified: {reason}",
                 zone=zone,
             )
+        if via_compact:
+            reason = (
+                f"{error.name} for {qname} is a Compact Answer proved by {zone}: the "
+                f"record matching the name asserts NXNAME and every proof signature "
+                f"verifies under key tag {zv.matched_key_tag} (RFC 9824 §2¶3"
+                + (", §5.1" if error is DnsResponseCode.NAME_ERROR else "")
+                + ")"
+            )
+        else:
+            reason = (
+                f"{error.name} for {qname} is proved by {zone} and every proof signature "
+                f"verifies under key tag {zv.matched_key_tag}"
+            )
         return ValidationVerdict(
             SecurityStatus.SECURE,
-            f"{error.name} for {qname} is proved by {zone} and every proof signature "
-            f"verifies under key tag {zv.matched_key_tag}",
+            reason,
             zone=zone,
             matched_key_tag=zv.matched_key_tag,
             via_opt_out=via_opt_out,
+            via_compact=via_compact,
         )
+
+    def _compact_nxdomain(self, qname, entries1, entries3, zone) -> bool:
+        """Does this NXDOMAIN arrive as the shape RFC 9824 §5.1¶3 promises CO senders?
+
+        True only for a well-formed Compact Answer: the record *matching* QNAME,
+        its bitmap carrying NXNAME and nothing a nonexistent name may claim
+        (§3.1¶2 for NSEC, §4¶6 for NSEC3). A matching record *without* the bit
+        is refused as incomplete rather than believed -- the matching record is
+        the shape that proves a name exists (§5155 §8.5, §4035 §5.4¶3), so an
+        NXDOMAIN riding on it without the signal that flips its meaning is a
+        claim left unproved, which is a question to re-ask, not a verdict.
+        A malformed signal (NXNAME beside real types) is a contradiction: the
+        same bitmap asserting the name is gone and listing what lives on it.
+        No matching record at all returns False -- the response is the
+        conventional geometry with a flag echoed, and CO changes nothing that
+        §5.3.1 does not already check.
+        """
+        if entries3:
+            matching = find_nsec3_matching(qname, usable_nsec3(entries3), zone)
+        elif entries1:
+            matching = find_nsec_matching(qname, entries1)
+        else:
+            return False
+        if matching is None:
+            return False
+        if not record_asserts_nonexistent(matching):
+            raise IncompleteProofError(
+                f"NXDOMAIN for {qname} arrived with the Compact Answers flag set, but "
+                f"the record matching the name carries no NXNAME assertion: a matching "
+                f"record is the proof a name exists, and §5.1¶3's restoration needs "
+                f"the bit that says otherwise (RFC 9824 §3.1¶1)"
+            )
+        if not record_is_compact_denial(matching):
+            raise ContradictoryProofError(
+                f"the record matching {qname} asserts NXNAME beside types a Compact "
+                f"Answer must not list -- nonexistence and a type inventory in one "
+                f"bitmap (RFC 9824 §3.1¶2, §4¶6)"
+            )
+        return True

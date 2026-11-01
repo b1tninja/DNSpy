@@ -102,6 +102,7 @@ from .opportunistic import (
     learn_dot_endpoint,
 )
 from .packet import (
+    EDNS_CO_BIT,
     EDNS_DO_BIT,
     OPT_RTYPE,
     DnsPacket,
@@ -379,6 +380,19 @@ class Resolver(asyncio.Protocol):
     #: occasionally a TCP fallback, so it is a decision rather than a default.
     dnssec_ok = False
 
+    #: Whether to ask each authority for RFC 9824's Compact Answers by setting
+    #: the CO flag (OPT bit 14) alongside DO. A server that implements compact
+    #: denial then answers nonexistent names with the §5.1 shape: the
+    #: owner-matching proof whose bitmap asserts NXNAME, and -- when it
+    #: implements §5.1's signaling -- the RCODE restored to NXDOMAIN. Off by
+    #: default: it asks servers to sign on demand, §8¶2 being candid about
+    #: what that costs an authority, and the walk accepts and records the
+    #: signal (§2¶4) whether or not it asked -- the validator's judgment of
+    #: the shape is the same either way, and no cached compact denial ever
+    #: cuts a subtree or feeds §8198 synthesis, because §6¶3 forbids both.
+    #: Meaningful only with DNSSEC on (DO), which trust anchors force anyway.
+    compact_answers = False
+
     #: EDNS(0) options to attach to the OPT record of every outbound query --
     #: :class:`~namespy.edns.EdnsOption` instances, or ``(code, value)`` pairs.
     #: Asking for a Name Server Identifier (RFC 5001) is the intended use: an
@@ -506,7 +520,7 @@ class Resolver(asyncio.Protocol):
             dns_packet.add_edns(
                 self._advertised_payload(ip),
                 options=options,
-                flags=EDNS_DO_BIT if self.dnssec_ok else 0,
+                flags=self._edns_flags,
             )
         else:
             # No OPT record, so nothing can carry an option: RFC 10029 section 3.1's
@@ -663,7 +677,7 @@ class Resolver(asyncio.Protocol):
                 dns_packet.add_edns(
                     self._advertised_payload(ip),
                     options=options,
-                    flags=EDNS_DO_BIT if self.dnssec_ok else 0,
+                    flags=self._edns_flags,
                 )
                 bundle_in_flight = False
                 continue
@@ -679,6 +693,20 @@ class Resolver(asyncio.Protocol):
     #: a memo reaches a thousand servers, the oldest entries have long stopped
     #: describing a path anyone is still taking.
     _SERVER_MEMO_MAX = 1024
+
+    @property
+    def _edns_flags(self) -> int:
+        """The OPT FLAGS field for outbound queries: DO when validating, CO
+        when asked (RFC 9824 section 5.1¶3 makes CO a promise *under* DNSSEC --
+        a compact denial is a signed thing, so the flag travels with DO and
+        means nothing without it).
+        """
+        if not self.dnssec_ok:
+            return 0
+        flags = EDNS_DO_BIT
+        if self.compact_answers:
+            flags |= EDNS_CO_BIT
+        return flags
 
     def _advertised_payload(self, ip) -> int:
         """The UDP payload size to advertise to *ip* on this query.
@@ -1815,6 +1843,26 @@ class NxdomainCut:
 
 
 @dataclass(frozen=True)
+class CompactDenial:
+    """A validated denial arrived as a Compact Answer -- its signed proof asserting
+    NXNAME at the queried name (RFC 9824 §2¶3).
+
+    Reported for the same reason :class:`NxdomainCut` is: what the packet says and
+    what happened are separable here. *restored* is the §5.1 case -- the zone
+    carried an NXDOMAIN RCODE because this resolver asked with CO and the server
+    implements the signaling; when it is False the RCODE stayed NOERROR and only
+    the signed bit says the name is gone (§5¶2's tools-and-bits problem, §8¶3's
+    note that the signed body is the more secure half). Either way the walk
+    records the denial name-level only: §6¶3 forbids both the RFC 8020 cut and
+    the RFC 8198 synthesis the ordinary shapes earn, because a compact record
+    proves one name and its span proves nothing around it.
+    """
+
+    name: str
+    restored: bool
+
+
+@dataclass(frozen=True)
 class AggressiveDenial:
     """A cached, validated proof denied this name and the resolver wrote the answer (RFC 8198 §5).
 
@@ -2787,6 +2835,20 @@ def resolve_steps(
     hop combines is not read: the caller harvests the bundle from the terminal answer,
     which is the only response in the walk that is an answer about those types at all.
     """
+    # RFC 9824 §3.5¶2, the walk's half of the meta-type refusal: "A resolver
+    # MUST NOT forward these queries upstream or attempt iterative resolution."
+    # NXNAME stores no data in any zone and "cannot be usefully queried"
+    # (§2¶3) -- it is a signal that rides in NSEC(3) bitmaps -- and an
+    # iterative descent is exactly the attempt the sentence forbids. The
+    # stub's half lives in namespy.stub; a served query bounces at
+    # namespy.server with FORMERR (§3.5¶2) and EDE 30 (§3.5¶3).
+    if int(sname.qtype) == int(DnsRType.NXNAME):
+        raise ValueError(
+            "NXNAME (128) is a Meta-TYPE a resolver MUST NOT ask about: it "
+            "exists only in NSEC type bitmaps to signal a nonexistent name "
+            "(RFC 9824 sections 2, 3.5); a server answering the question must "
+            "reply FORMERR, so there is nothing to walk toward"
+        )
     # Alias state lives here, not in classify: a CNAME in one response can point
     # at a name that another response aliases again, so only the loop spanning
     # responses can tell a long chain from a loop. `seen` catches the two-name
@@ -3314,9 +3376,17 @@ def resolve_steps(
                     # when a server has answered for a name it does not control.
                     sec_zone = soa.name if soa is not None else entry.zone
                     sec_verdict = yield from _fetch_chain(
-                        lambda sec_zone=sec_zone, denial_rcode=denial_rcode: (
+                        lambda sec_zone=sec_zone, denial_rcode=denial_rcode, response=response: (
                             sec_validator.validate_denial(
-                                sname.qname, int(sname.qtype), rcode=denial_rcode, zone=sec_zone
+                                sname.qname,
+                                int(sname.qtype),
+                                rcode=denial_rcode,
+                                zone=sec_zone,
+                                # The response's own CO echo, not this resolver's
+                                # knob: §5.1's shape stands on what the server
+                                # said back, and an unsolicited one is no less
+                                # signed for not having been asked.
+                                co_signaled=response.compact_answers_ok,
                             )
                         )
                     )
@@ -3363,10 +3433,27 @@ def resolve_steps(
                 and not (sec_validator is not None and client_cd)
             ):
                 validated_flag = bool(sec_verdict is not None and sec_verdict.ad_worthy)
+                cache_step = step
+                if (
+                    sec_verdict is not None
+                    and sec_verdict.via_compact
+                    and isinstance(step, Nxdomain)
+                ):
+                    # RFC 9824 §6¶3, in the walk's own words: no NXDOMAIN
+                    # synthesis "in the style described by [RFC8020]" survives
+                    # compact denial, because the evidence here is a record
+                    # that asserts exactly one name -- its successor form
+                    # (§3.1¶2's null-label prepend, §4¶5's hash plus one) is
+                    # the empty span §8¶4 counts on. A Nxdomain entry is the
+                    # shape that cuts subtrees at read time, so the restored
+                    # RCODE the client may see in the packet is not a license
+                    # for the cache: stored as the name-level denial the
+                    # proof actually is.
+                    cache_step = Nodata(soa=soa)
                 _write_cache(
                     cache,
                     sname,
-                    step,
+                    cache_step,
                     response,
                     validated=validated_flag,
                 )
@@ -3423,6 +3510,13 @@ def resolve_steps(
                 # Before the event it judged: the verdict is why the NXDOMAIN below
                 # may cut, and a reader should meet the reason before the fact.
                 yield DnssecVerdict(str(sec_zone), sec_verdict.status.value, sec_verdict.reason)
+                if sec_verdict.secure and sec_verdict.via_compact:
+                    # Between the verdict and the denial it judged: this line
+                    # is the only place the trace says why an NXDOMAIN from
+                    # here will not cut, and the word `restored` separates
+                    # §5.1's moved RCODE from the NOERROR shape that carries
+                    # the signal alone.
+                    yield CompactDenial(str(sname.qname), restored=isinstance(step, Nxdomain))
             yield step
             if isinstance(step, (Done, Fail)):
                 # Fail is terminal for the same reason Done is: classify emits it
@@ -4135,6 +4229,7 @@ class RecursiveResolver(Resolver):
         aggressive_nsec: bool = False,
         serve_stale: float = 0.0,
         dnssec_ok: bool = False,
+        compact_answers: bool = False,
         trust_anchors=(),
         opportunistic_dot: bool = False,
         opportunistic_discover: bool = True,
@@ -4266,6 +4361,12 @@ class RecursiveResolver(Resolver):
         self.query_timeout = max(0.05, float(query_timeout))
         self.edns_payload_size = 0 if edns_payload_size is None else max(0, int(edns_payload_size))
         self.dnssec_ok = bool(dnssec_ok)
+        # CO rides with DO by construction (see Resolver.compact_answers and
+        # _edns_flags), so a resolver with this on and DNSSEC off asks nothing
+        # different -- and the walk still reads and honors a server's unsolicited
+        # compact signal, because what makes it trustworthy is the signature,
+        # not the ask.
+        self.compact_answers = bool(compact_answers)
         # Frozen into a tuple: the value is read once per outbound query and a
         # caller who mutates the list they passed in would otherwise be
         # changing the wire format of queries already in flight.

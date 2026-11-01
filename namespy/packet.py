@@ -302,15 +302,26 @@ OPT_RTYPE = 41
 
 #: EDNS(0) OPT FLAGS, carried in the low 16 bits of OPT's TTL field (RFC 6891 section 6.1.3
 #: lays that field out as EXTENDED-RCODE | VERSION | FLAGS). DO is section 6.1.4's "DNSSEC OK";
-#: CD is checking-disabled, from the same section and RFC 2931.
+#: CO is RFC 9824 section 5.1's "Compact Answers OK".
 #:
 #: Named constants because the pair is constantly mistaken for the *header* bits of similar name.
 #: AD is header bit 5 (RFC 6895) and asserts "this responder validated the answer"; DO is an OPT
 #: flag and asks "please include DNSSEC records". A server echoes DO back whether or not anything
 #: was authenticated, so a flag read from the wrong place reports a granted request as verified
 #: data -- which is precisely the confusion the property below used to fall into.
+#:
+#: CO sits at 1 << 14, which wants a sentence because two numbering schemes meet here. RFC 9824
+#: section 9 registers it as "Bit 1", while its section 5.1 drawing shows it beside DO at the
+#: top of the field; both are the physical 0x4000, because the live IANA "EDNS Header Flags"
+#: registry numbers down from the top -- its "Bit 0" is DO, the 6891 drawing's bit 15 (checked
+#: 2026-10-16: Bit 0 DO, Bit 1 CO, Bit 2 DE temporary, Bits 3-15 reserved). RFC 6891's own
+#: drawing numbers the same field from the bottom; the wire does not care, the mask does.
+#: This bit was once claimed here for an "OPT CD" flag on a citation to RFC 6955 section 4 --
+#: which is Diffie-Hellman proof-of-possession, and no CD entry exists in the EDNS registry or
+#: in RFC 6891 or RFC 6840. The CD bit this protocol speaks of is the header's (bit 4,
+#: RFC 4035 section 3.2.2), and it lives in :attr:`DnsPacket.CD` alone.
 EDNS_DO_BIT = 1 << 15
-EDNS_CD_BIT = 1 << 14
+EDNS_CO_BIT = 1 << 14
 
 
 class DnsPacket:
@@ -400,8 +411,9 @@ class DnsPacket:
         #: withhold data over a validation failure (§3.2.2¶3) and MUST copy the bit
         #: back in the response (§3.2.2¶2). A stub sets it on queries (§4.6¶1); a
         #: resolver takes it off responses it fetched, whose copy means nothing
-        #: over UDP (§4.6¶3). Distinct from OPT FLAGS bit 14, readable as
-        #: :attr:`cd`, which shares the name and sits in a different field.
+        #: over UDP (§4.6¶3). This is a *header* bit; EDNS's neighbouring bit 14
+        #: is now RFC 9824's CO flag, readable as :attr:`compact_answers_ok`,
+        #: and no EDNS CD flag exists to confuse it with (see EDNS_CO_BIT).
         self.CD = bool(CD)
         self.Z = int(Z) & 0b1
         self.RCODE = (
@@ -488,15 +500,19 @@ class DnsPacket:
         return record is not None and bool(int(record.ttl) & EDNS_DO_BIT)
 
     @property
-    def cd(self) -> bool:
-        """Checking Disabled -- OPT FLAGS bit 14 (RFC 6891 section 6.1.3, RFC 6955 section 4).
+    def compact_answers_ok(self) -> bool:
+        """Compact Answers OK (CO) -- OPT FLAGS bit 14 (RFC 9824 sections 5.1, 9).
 
-        Same FLAGS-in-low-16-bits layout as :attr:`dnssec_ok`; CD is the flags field's bit 14.
-        Note this *is* an OPT flag, unlike the header's CD of RFC 2931 memory: the two share a
-        name and a purpose while sitting in different fields.
+        Same FLAGS-in-low-16-bits layout as :attr:`dnssec_ok`. A resolver sets
+        it to say it will accept a NODATA answer carrying a signed NXNAME "for
+        a nonexistent name, together with the response code field set to
+        NXDOMAIN" (§5.1¶3); a server that implements both compact denial and
+        §5.1 sets it back in its response (§5.1¶4). EDNS is hop-by-hop, so the
+        reply's flag describes this exchange only -- §5.1¶5 makes a resolver
+        remember it alongside the cached data for that reason.
         """
         record = self.opt()
-        return record is not None and bool(int(record.ttl) & EDNS_CD_BIT)
+        return record is not None and bool(int(record.ttl) & EDNS_CO_BIT)
 
     @property
     def requestor_payload_size(self) -> int | None:

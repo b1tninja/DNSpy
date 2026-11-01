@@ -310,6 +310,54 @@ def find_nsec3_covering(name, entries: Iterable[Nsec3Entry], zone) -> Nsec3Entry
     return None
 
 
+def record_asserts_nonexistent(entry) -> bool:
+    """Whether this NSEC/NSEC3 carries the NXNAME signal -- a Compact Answer.
+
+    RFC 9824 section 2 defines NXNAME (128) as a synthetic Meta-TYPE placed
+    in the Type Bit Maps field of the proof record for a *nonexistent* name,
+    which is what distinguishes a compact denial from the No Data an
+    empty-bitmap ENT also gets (section 2¶1: the two bitmaps are otherwise
+    identical, and it is the bit that says "this name does not exist at
+    all"). Only the record whose owner name matches the queried name carries
+    the assertion (sections 3.1, 4¶6); on any other record the bit is a
+    pseudo-type bit read as nothing, exactly as RFC 4034 section 4.1.2
+    prescribes for pseudo-types -- RFC 9824 section 7.1 carves the NXNAME
+    exception out of that rule only for the matching record's own response.
+    """
+    _, record = _entry(*entry)
+    return record.has_type(int(DnsRType.NXNAME))
+
+
+def record_is_compact_denial(entry) -> bool:
+    """Whether this matching record is a well-formed Compact Answer (RFC 9824 §3.1, §4¶6).
+
+    The signal must be there -- but so must the shape: for NSEC, the bitmap's
+    only members may be RRSIG, NSEC and NXNAME; for NSEC3, NXNAME is "the sole
+    entry in the Type Bit Maps field". A record that pairs NXNAME with a real
+    type contradicts itself, asserting nonexistence and existence in the same
+    bitmap, and a CNAME bit alongside it means a CNAME answer was due; both
+    are refusals, not signals. (RRSIG and NSEC ride along uninvited by
+    convention -- RFC 4035 §5.4¶7 already tells validators to read nothing
+    from their absence or presence -- so they are permitted, not required.)
+    """
+    from .rdata import RData_NSEC3
+
+    if not record_asserts_nonexistent(entry):
+        return False
+    _, record = _entry(*entry)
+    if record.has_type(int(DnsRType.CNAME)):
+        return False
+    claimed = {int(value) for value in record.types}
+    allowed = {
+        int(DnsRType.RRSIG),
+        int(DnsRType.NSEC),
+        int(DnsRType.NXNAME),
+    }
+    if isinstance(record, RData_NSEC3):
+        allowed = {int(DnsRType.NXNAME)}
+    return claimed <= allowed
+
+
 def usable_nsec3(entries: Iterable[Nsec3Entry], *, strict_parameters: bool = True) -> list:
     """The records a validator may build a proof from (RFC 5155 §8.1, §8.2).
 

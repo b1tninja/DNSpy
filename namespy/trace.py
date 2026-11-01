@@ -110,6 +110,16 @@ class Trace:
                 body.append(
                     f"    Note over C: aggressive {ev.kind}: {ev.name} proven by {ev.proven_by}"
                 )
+            elif cn == "CompactDenial":
+                # The one denial whose RCODE and its story can differ: restored
+                # says whether the zone itself moved the code to NXDOMAIN under
+                # the §5.1 signal or left it NOERROR with only the bit to say
+                # so -- which is precisely what a reader of the trace line
+                # cannot tell from the packet afterwards.
+                body.append(
+                    f"    Note over C: compact denial: {ev.name}"
+                    f"{' (NXDOMAIN restored)' if ev.restored else ' (NOERROR + NXNAME)'}"
+                )
             elif cn == "WildcardSynthesis":
                 body.append(f"    Note over C: wildcard answer: {ev.name} via {ev.via}")
             elif cn == "ServeStale":

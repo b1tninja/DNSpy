@@ -128,7 +128,7 @@ def test_add_edns_places_version_in_bits_16_to_23_and_flags_in_the_low_half() ->
     packet = parse_sent(bytes(query))
     assert packet.edns_version == 2
     assert packet.dnssec_ok  # DO is TTL bit 15 (RFC 3225 section 3)
-    assert not packet.cd
+    assert not packet.compact_answers_ok
 
 
 def test_advertised_payload_floors_at_512() -> None:
@@ -248,9 +248,9 @@ def test_version_and_flags_round_trip() -> None:
     parsed, _ = DnsPacket.parse(bytes(query))
     assert 2 == parsed.edns_version
     assert parsed.dnssec_ok is True
-    assert parsed.cd is False
-    cd = Query().add_edns(1232, flags=0x4000)  # RFC 6955 section 4
-    assert DnsPacket.parse(bytes(cd))[0].cd is True
+    assert parsed.compact_answers_ok is False
+    co = Query().add_edns(1232, flags=0x4000)  # CO is flags bit 14 (RFC 9824 section 5.1)
+    assert DnsPacket.parse(bytes(co))[0].compact_answers_ok is True
 
 
 def test_badvers_round_trips() -> None:
@@ -404,7 +404,7 @@ def test_do_is_written_and_read_by_the_same_named_bit() -> None:
     assert wire.endswith(b"\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00")
     packet = parse_sent(wire)
     assert packet.dnssec_ok
-    assert not packet.cd, "DO is bit 15; CD is bit 14 and must stay clear"
+    assert not packet.compact_answers_ok, "DO is bit 15; CO is bit 14 and must stay clear"
 
 
 def test_a_plain_edns_query_asks_for_no_dnssec_data() -> None:

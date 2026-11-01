@@ -249,11 +249,14 @@ _OPTION_NAMES = {
 }
 
 #: The "Extended DNS Error Codes" registry as RFC 8914 section 5.2 Table 3
-#: populates it, with the Purpose column's wording kept verbatim -- a code that
+#: populated it, with the Purpose column's wording kept verbatim -- a code that
 #: prints as something other than the name the registry gives it is a code whose
-#: meaning this project invented. Codes 25-49151 are "Unassigned" and 49152-65535
-#: "Reserved for Private Use" (§5.2 Table 2), so they are absent here on purpose
-#: and print as their number.
+#: meaning this project invented. Codes 25 onward arrived after RFC 8914 and are
+#: included as the live registry registers them (checked 2026-10-16):
+#: 25 and 29 by vendor registration, 26 by RFC 9250, 27 by RFC 9276, 28 and 31
+#: by their drafts, and 30 by RFC 9824 section 9 (Table 3, used at
+#: section 3.5¶3). Unlisted codes print as their number, which is also what
+#: the 49152-65535 private-use range does by rule (§5.2 Table 2).
 _EXTENDED_ERROR_NAMES = {
     0: "Other Error",
     1: "Unsupported DNSKEY Algorithm",
@@ -280,6 +283,13 @@ _EXTENDED_ERROR_NAMES = {
     22: "No Reachable Authority",
     23: "Network Error",
     24: "Invalid Data",
+    25: "Signature Expired before Valid",
+    26: "Too Early",
+    27: "Unsupported NSEC3 Iterations Value",
+    28: "Unable to conform to policy",
+    29: "Synthesized",
+    30: "Invalid Query Type",
+    31: "Rate Limited",
 }
 
 

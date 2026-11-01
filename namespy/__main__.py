@@ -132,10 +132,21 @@ def _parse_qtype(token):
     """
     s = str(token).upper()
     try:
-        return DnsQType[s]
+        value = DnsQType[s]
     except KeyError:
-        pass
-    return _parse_field(s, token, DnsQType, "record type")
+        value = _parse_field(s, token, DnsQType, "record type")
+    if int(value) == int(DnsQType.NXNAME):
+        # RFC 9824 section 3.5 para 2, the CLI's door: a resolver "MUST NOT
+        # forward these queries upstream or attempt iterative resolution",
+        # and the stub's and walk's own guards behind this one agree. The
+        # name parses (DnsQType carries it precisely so it can be refused
+        # by name) and dies here as a sentence.
+        raise argparse.ArgumentTypeError(
+            "NXNAME (128) is a Meta-TYPE that exists only in NSEC/NSEC3 type "
+            "bitmaps to signal a nonexistent name; RFC 9824 section 3.5 "
+            "forbids asking it, and servers MUST answer such a query FORMERR"
+        )
+    return value
 
 
 def _parse_qclass(token):
@@ -333,8 +344,8 @@ def _opt_flags(response):
     out = []
     if response.dnssec_ok:
         out.append("do")
-    if response.cd:
-        out.append("cd")
+    if response.compact_answers_ok:
+        out.append("co")
     return out
 
 
@@ -518,6 +529,19 @@ def build_parser():
         "the records stripped (RFC 4035 section 3.2.1), and a client that did can only be "
         "served proofs this server asked for: without this flag none are fetched, so none are "
         "cached and none echoed (RFC 8020 section 2)",
+    )
+    p.add_argument(
+        "--compact-answers",
+        dest="compact_answers",
+        action="store_true",
+        help="ask each authority for RFC 9824's Compact Answers by setting EDNS(0)'s CO "
+        "flag alongside --dnssec's DO: online-signing zones deny nonexistent names with "
+        "an owner-matching NSEC(3) whose bitmap asserts the NXNAME meta-type instead of "
+        "an NXDOMAIN RCODE, and a server implementing the signalling (section 5.1) also "
+        "restores NXDOMAIN in the reply. Off by default because it asks a zone to sign "
+        "on demand (section 8 para 2 says so plainly). The walk reads and honors the "
+        "signal whether or not it asked -- and never cuts a subtree or synthesizes from "
+        "a compact denial, because section 6 para 3 forbids both",
     )
     p.add_argument(
         "--validate",
@@ -926,6 +950,7 @@ async def cli_query(args) -> int:
             edns_options=_outbound_options(args),
             qname_min=args.qname_min,
             dnssec_ok=args.dnssec,
+            compact_answers=args.compact_answers,
             glue_policy=_glue_policy(args),
             failure_cache=_failure_cache(args),
             nxdomain_cut=_nxdomain_cut(args),

@@ -8,6 +8,63 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- Compact Denial of Existence, validator-side: RFC 9824 lands with a correction to
+  this project's own deferred-work list (the row that queued it as "the compact
+  NSEC3 digest formats are themselves RRs" — 9824 adds no RR format; it adds
+  **NXNAME (128)**, a Meta-TYPE whose bit in the type bitmap of an NSEC/NSEC3
+  record *matching* the queried name is the zone's signed assertion that the name
+  does not exist at all, delivered across a NODATA-shaped, minimally-covering,
+  online-signed proof (§2, §3.1, §4 — the §7.1/§7.2 amendments to RFC 4034 §4.1.2
+  and RFC 4035 §2.3 are exactly the two rules this codebase already enforced, and
+  the increment honours both: the NXNAME bit is read only on the matching record,
+  the matching record's existence-in-zone implication is what §5.1's branch
+  replaces). The registry work is three lines: `DnsRType.NXNAME`, EDE code 30
+  ("Invalid Query Type", §9 Table 3, taken as the §3.5¶3 MAY beside a served
+  FORMERR), and `EDNS_CO_BIT` at OPT flags bit 14 — the last of these outranking
+  a years-old local claim that bit belonged to an EDNS CD flag, which the live
+  IANA registry has never carried (see *Changed*). `nsec.py` grew
+  `record_asserts_nonexistent` and `record_is_compact_denial` — §3.1¶2's
+  "RRSIG, NSEC and NXNAME, nothing else" for NSEC, §4¶6's "NXNAME as the sole
+  entry" for NSEC3 — and the successor forms (§3.1¶2's null-label prepend,
+  §4¶5's hash-plus-one) are tested where they bite: `name_between` finds nothing
+  between a name and `\0.name`, nothing between a hash and the hash plus one, so
+  the empty span §6¶3 leans on is proven rather than quoted, RFC 9824 §4¶8's
+  worked example (`a.example.com` → `H64KFA4P1ACER2EBPS9QSDK6DNP8B3JQ`, next
+  `…JR`) pinning the arithmetic. `validate_denial` grows `via_compact` on its
+  verdict (the `via_opt_out` pattern) and a `co_signaled` parameter: under
+  NOERROR the signal is extracted from the matching record the §8.5/§5.4¶3 proof
+  already selects — a malformed pairing (NXNAME beside a real type) degrades to
+  *no signal*, the answer standing on QTYPE's absence while this resolver
+  declines to restore anything from a bitmap that contradicts itself — and under
+  NAME_ERROR with CO the §5.1¶3 shape is accepted (NODATA proof wearing RCODE 3,
+  bit required) while NXDOMAIN over a matching record *without* the bit is
+  refused as unproved rather than believed, and CO stays inert against the
+  conventional covering proof, which §5.1 demotes nowhere. §6¶3's two bans are
+  kept where each lives: the walk caches a compact denial — restored NXDOMAIN
+  included — as a name-level entry, never the cut-capable `Nxdomain` shape, and
+  `aggressive.py` discards any proof bundle carrying the NXNAME bit before the
+  synthesis geometry reads it, with a differential test (one bit, `None`) for the
+  `www TXT` NODATA that would otherwise be fabricated beside a name declared
+  gone. Asking for any of it is opt-in: `--compact-answers` sets CO alongside
+  DO (`RecursiveResolver(compact_answers=True)`; §8¶2 is candid that CO asks
+  zones to sign on demand), but the walk honors a signal it never requested,
+  because what vouches for it is the signature. And §3.5's refusal of the
+  question itself is enforced at every door this package owns: the CLI's type
+  parser exits with a sentence on `NXNAME`/`TYPE128` (it parses the number
+  precisely so the refusal can name it), `resolve_steps` raises rather than
+  walking (§3.5¶2's "MUST NOT ... attempt iterative resolution"),
+  `StubResolver.forward` raises rather than forwarding, and the demo server
+  answers FORMERR with EDE 30. The `CompactDenial(name, restored)` event
+  separates §5.1's zone-restored NXDOMAIN from the NOERROR shape whose only
+  denial is the signed bit — the distinction the packet itself no longer
+  carries. `tests/test_compact_denial.py`, 23 tests, reusing the signed fixture
+  tree through `test_dnssec_wiring`'s harness. Not done, deliberately: the
+  serving side of compact answers (the fixture zone signs nothing — online
+  signing is out of this repo's scope) and §5¶2/§5.1¶5's downstream-querier
+  RCODE surgery, which belongs to a recursive *server* product and namespy
+  serves no downstream.
+
+
 - IDNA2008 at the boundary: `namespy/idna.py` turns a name a human typed into a name the wire can carry, so `namespy münchen.de` works and `DomainName.from_unicode` gives library callers the same door that the CLI walks through (RFC 3492, RFC 5891, RFC 5890 §2.3 — the roadmap's "callers must pre-encode today" line, closed). The punycode codec is a line-by-line transcription of RFC 3492 §6.1-§6.3 with §5's parameters, and the test file says so: all eighteen §7.1 sample strings are pinned in both directions, the §7.2 traces check §6.1's bias values (21 … 84 … 90) and the insertion-order lesson of example L, and example S pins the delimiter-after-literals rule at the codec level where it lives — IDNA proper never encodes a pure-ASCII label, which is also why an A-label that decodes to one is a Fake A-label (RFC 5890 §2.3.1 ¶5) and gets rejected. §6.2's failure modes are §6.2 ¶3's completeness argument, so the decoder distinguishes them by name — unexpected end of input, no-digit-value character, non-ASCII encoded string, and the three overflow checks done as §6.4 ¶2's `B > maxint − A (div C)` comparisons against a 26-bit maxint, §6.4 ¶1's own bound for IDNA labels read through verified erratum 265 ("the maximum value of an integer variable" — in Python that is a choice, and the spec names the width). The decoder is case-insensitive over digits (§5 ¶6) and emits lowercase (§5 ¶6 + RFC 5890 §2.3.1 ¶4). Above the codec sits the label protocol: U-label candidates pass NFC (§4.1/§5.4), the hyphen restrictions (§4.2.3.1), the leading-combining-mark test (§4.2.3.2), and the table-decidable subset of the character tests — unassigned (`Cn` in *this Python's* Unicode, exactly §5.4 ¶9's semantics) and a conservative DISALLOWED slice (controls, separators, private use) — while RFC 5892's derived tables stay a stated, cited deferral that §5.4 ¶13 explicitly legitimises for a lookup application: "if they are registered, they are presumed to be valid". A-labels arriving off the wire are lowercased, decoded, tested, and — §5.3 ¶1 — must re-encode to exactly what they came as or are rejected; the presentation direction, `to_unicode`, answers zone data's fakes with the lowercased label as written rather than an exception, because §5.3 ¶2 asks only that a bad label be recognized as not-one. `DomainName.from_unicode` folds ASCII case by default — the DNS's own equivalence (RFC 5890 §2.3.2.4), deliberately ASCII-only, so `MÜNCHEN` still punycodes to the label for `mÜnchen` and not the one for `münchen`, and `map_ascii_case=False` gets the strict IDNA2008 reading that maps nothing at all; the CLI's walk and stub entry points both use the folded form and answer nonsense with one sentence on stderr instead of a traceback. 78 tests in `tests/test_idna.py`. Also in this pass: the priority table in `docs/roadmap.md` caught up with the feature tables it had drifted from — wildcard synthesis (4592), DNSSEC validation, serve-stale (8767), and walk-side TCP reuse (7828/9210) are all struck through as shipped, as they have been for three increments.
 
 - The SVCB half of opportunistic encryption: `--dot-authority` now asks RFC 9461's question before RFC 9539's. Before the walker first probes an authority address over TLS, it resolves `SVCB` at `_dns.<NS name>` (Port Prefix Naming, §3; `_9953._dns....` for a non-default binding, §3.1) and probes the port the answer names — §4.2¶1's 853 when the record states none. `namespy.opportunistic.learn_dot_endpoint` runs RFC 9460 §3's selection procedure (via the existing `select_records`) over a supplied fetcher, so the whole policy is testable over canned records: alpn must carry `dot` (§4.1), an explicit `port` is honored unless it sits on the confusion-risk list — FETCH §2.9's bad-ports enumeration with 443 argued back in, since 9461 itself names 443 as DoH's default and TLS payloads belong at a TLS port (§4.2¶3-¶4, auto-mandatory §4.2¶2) — a foreign TargetName is accepted only when an ipv4/ipv6hint vouches for the very address being probed (§4.3, §6¶3), AliasMode chains are followed up to five hops (§2.4.2¶10's MUST, the spec's own `ns.example` example as the test), and the answer's minimum TTL bounds how long the verdict is remembered. The verdict memo is keyed by (name, address), RFC 9539 §4.2's per-IP discipline applied to discovery, and misses are remembered briefly so a silent authority costs one walk, not one per query. Discovery never vetoes encryption: an absent, incompatible, or forged record leaves the blind 853 probe in place, because the record arrives over the very channel it describes (§6¶2) and proves less than a handshake does — and the discovery walk itself runs cleartext-only under a guard flag, which both bounds the recursion and forecloses a deadlock between the probe and the lookup that configured it. `RecursiveResolver(opportunistic_discover=False)` keeps the 9539 behavior pure. 21 tests added to `tests/test_opportunistic.py` (the policy over pages of records — default and explicit ports, the decline of 6667, DoH-only records, hints, priorities, aliases, caps — and the seam's memoization, guard, and per-address keying against a page-table walk).
@@ -894,6 +951,40 @@ nothing has been tagged or published yet, so `master` is the only version.
   MQTYPE in both directions, SVCB parameters, and the QNAME minimisation schedule.
 
 ### Changed
+
+- **EDNS OPT flags bit 14 is CO, not CD — a wire constant retired against the live
+  registry.** `packet.py` documented `EDNS_CD_BIT = 1 << 14` as "Checking Disabled,
+  OPT FLAGS bit 14 (RFC 6891 section 6.1.3, RFC 6955 section 4)" — and neither
+  citation holds: RFC 6891 §6.1.3 draws the flags field as fifteen reserved bits
+  under DO's bit 15, and RFC 6955 §4 is *Static DH Proof-of-Possession*, a
+  document in no DNS registry. The IANA "EDNS Header Flags (16 bits)" registry
+  (fetched 2026-10-16, checked against `dns-parameters.xml`) has never held a CD
+  entry: its rows are Bit 0 DO, Bit 1 CO (RFC 9824 — registered 2025-03-06), Bit 2
+  DE (temporary, draft-ietf-dnsop-delext), Bits 3-15 Reserved; its numbering runs
+  from the top, so "Bit 0" is the 6891 drawing's bit 15 and CO's "Bit 1" is the
+  same physical 0x4000 as RFC 9824 §5.1's `|DO|CO|` picture — §9's table and §5.1's
+  drawing agree once the registry's direction is known. `EDNS_CD_BIT` and the
+  `cd` property are replaced by `EDNS_CO_BIT` and
+  `DnsPacket.compact_answers_ok`; the response's *header* CD (bit 4, RFC 4035
+  §3.2.2 — the CD this protocol actually speaks of) was always a separate
+  attribute and is untouched, as is everything that reads it. The property's only
+  consumer, the CLI's OPT-flags print, now prints `co` where it would have printed
+  `cd` — against a real server, that print would have been reporting RFC 9824
+  signaling under a flag that does not exist. Three assertions in
+  `tests/test_edns.py`/`tests/test_packet_wire.py` re-pinned to CO. The same
+  registry pass refreshed `edns.py`'s EDE table, whose comment claimed codes
+  25-49151 unassigned since RFC 8914: seven have registered since (25 and 29 by
+  vendor procedure, 26 by RFC 9250, 27 by RFC 9276, 30 by RFC 9824, 28 and 31 by
+  their drafts); the names are copied verbatim from the live registry, and the
+  test's sample "unassigned" code moved to 32.
+- **The roadmap's 0x20 row closed unspecifiable.** The deferred-work list queued
+  "0x20 encoding | 6841" on the strength of a title remembered; RFC 6841 is *A
+  Framework for DNSSEC Policies and DNSSEC Practice Statements* (INFORMATIONAL),
+  and no RFC — current, obsolete, or anywhere in between — specifies the
+  case-randomization mechanism, whose only text was `draft-vixie-dnsext-dns0x20`
+  (expired 2010; the corpus preserves just its bibliography entry, in RFC 8555).
+  The row now says so and is closed; roadmap row "Every RFC citation checked"
+  records the audit.
 
 - **The coverage floor was not enforced anywhere.** `fail_under` in `pyproject.toml` is
   read by pytest through pytest-cov, and pytest-cov measures only when `--cov` is passed;

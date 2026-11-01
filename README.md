@@ -14,7 +14,7 @@
 An asyncio DNS library: a wire codec that survives malformed input, an iterative
 resolver that follows RFC 1034 section 5.3.3 literally, and a `dig`-flavoured
 inspector. No runtime dependencies — one optional extra, `namespy[crypto]`, for the
-signature arithmetic DNSSEC validation will need.
+signature arithmetic DNSSEC validation runs on.
 
 - **Python:** 3.12+ · **one name everywhere:** `pip install namespy`,
   `import namespy`, `namespy example.com`
@@ -25,7 +25,7 @@ signature arithmetic DNSSEC validation will need.
   distribution, the import and the console script, which is the only arrangement
   that cannot surprise anyone.
 - **Status:** the codec, resolver and CLI are tested and usable, EDNS(0)
-  included; there is no DNSSEC validation — see
+  included, with DNSSEC validation opt-in (`--validate`, RFC 4035 §4.3) — see
   [What it does not do](#what-it-does-not-do)
 - **Spec anchors:** [`docs/roadmap.md`](docs/roadmap.md) is the completeness
   matrix — every protocol obligation this code could take on, with an honest
@@ -151,22 +151,30 @@ asks a receiver to do with a type it has never heard of.
 Listing these is more useful than a promise of completeness, because three of
 them change the security properties of anything built on top.
 
-- **No DNSSEC validation.** The `AD` bit is read and exposed, but nothing
-  verifies an RRSIG and there is no trust anchor (RFC 4033/4034/4035). Answers
-  are unauthenticated: anyone who can deliver a well-formed response that matches
-  the question — same source address, same ID, echoed question — is believed.
-  `DNSKEY`, `DS`, `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` all decode now — key tag,
-  DS digest, type bit maps and the NSEC3 hash included (`namespy/dnssec.py`; RFC 4034
-  §2–§5, Appendix B, RFC 5155) — that being the half that needs no cryptographic
-  dependency. What is missing is the canonical-RRset rule of §6.2, the signatures
-  themselves, and a trust anchor to check them against. The arithmetic has a home now —
-  the `namespy[crypto]` extra and the probe in `namespy/crypto.py`, which also encodes
-  RFC 9904's table of what a validator must implement — but nothing calls it yet.
+- **DNSSEC validation is opt-in, and opt-in is not the same as complete.**
+  `--validate` composes the DS→DNSKEY chain from the walk's own referrals,
+  fetches what the chain lacks (RFC 4035 §5.2¶6), judges every RRset a response
+  stands on, sets `AD` only on what its configured anchors vouched for
+  (RFC 5155 §9.2¶1 subtracting Opt-Out), and refuses Bogus answers unless the
+  client asked for CD (RFC 4035 §3.2.2¶3); RFC 9824's compact denials and the
+  aggressive-NSEC and wildcard cache reuse ride the same verdicts. What is
+  *not* there: validation runs only when anchors are configured (the IANA root
+  document is fetched on `--validate` unless a file is given — RFC 8509-style
+  rollover maintenance is an open roadmap row), the walk cannot yet speak to
+  DNS-over-QUIC servers at all, and a signed **NSEC3** zone's RFC 5155 §8.7
+  wildcard No Data answer is currently judged Bogus on the wire path — a
+  defect with a written-up row in [docs/roadmap.md](docs/roadmap.md) and its
+  own fix queued. With no anchors configured nothing is verified, and answers
+  are unauthenticated: anyone who can deliver a well-formed response that
+  matches the question — same source address, same ID, echoed question — is
+  believed.
 - **EDNS(0) options are partial: NSID, Extended DNS Errors and MQTYPE are put to
   use.**
   Outbound queries advertise a 1232-octet UDP payload (RFC 6891 §6.1.2, disable with
   `--no-edns` or the constructor knob), arriving OPT records yield `extended_rcode`,
-  `ad`, `cd` and `requestor_payload_size`, and a FORMERR/BADVERS/NOTIMP answer
+  the DNSSEC-request and compact-answers flags (`dnssec_ok`, `compact_answers_ok`,
+  RFC 6891 §6.1.4 and RFC 9824 §5.1) and `requestor_payload_size`, and a
+  FORMERR/BADVERS/NOTIMP answer
   *without* an OPT alongside it triggers the §6.2.2 unextended re-ask. Option TLVs
   (§6.1.2) are carried in both directions: `--nsid` asks each server the walk touches
   who it is and prints the answers as hex (RFC 5001 §2.4), and what a server advertises
