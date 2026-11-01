@@ -140,6 +140,7 @@ from .edns import (
     nsid_of,
 )
 from .enums import DnsOpCode, DnsQR, DnsQType, DnsResponseCode, DnsRType
+from .filtering import FilterPolicy
 from .mqtype import (
     MQTYPE_RECOMMENDED_QTX_LIMIT,
     mqtype_query_rejection,
@@ -450,6 +451,7 @@ class DnsServer(asyncio.Protocol):
         max_qtypes: int | None = MQTYPE_RECOMMENDED_QTX_LIMIT,
         tcp_idle: int | None = DEFAULT_TCP_IDLE_S,
         dot_upstreams=(),
+        filter_policy: FilterPolicy | None = None,
     ):
         """
         :param nsid: the RFC 5001 name-server identifier to advertise when a
@@ -519,6 +521,15 @@ class DnsServer(asyncio.Protocol):
             recursion: the operator said forward, and recursing anyway
             behind that instruction would leak exactly the queries the
             operator chose to seal.
+        :param filter_policy:
+            a :class:`~namespy.filtering.FilterPolicy` refusing policy
+            answers before the cache, the forwarder, and the walk --
+            after the binds, because what the operator bound is a
+            statement and what the policy fires on is a subject, and
+            the statement was written about that subject on purpose.
+            The composed answers carry their RFC 8914 explanation, no
+            AA and no AD, and never reach any cache: see the module's
+            docstring for why each of those is the same decision.
 
         """
         if not isinstance(resolver, RecursiveResolver):
@@ -564,6 +575,9 @@ class DnsServer(asyncio.Protocol):
             if self._dot_upstreams
             else None
         )
+        # Policy filtering, judged after the binds and before anything
+        # that could remember or leak: see :param filter_policy.
+        self._filter = filter_policy
 
     def connection_made(self, transport):
         self.transport = transport
@@ -687,6 +701,33 @@ class DnsServer(asyncio.Protocol):
             response,
             addr,
             request=dns_packet,
+            mqtype_answered=[] if asked is not None else None,
+            channel=channel,
+        )
+
+    def _filtered_reply(self, dns_packet, addr, asked, channel, rule) -> None:
+        """Send a policy refusal (or substitution) for a filtered name.
+
+        Deliberately minimal, which is the composition saying what the
+        answer is: no AA, no AD, no RA-era promises, and no records
+        unless the operator substituted some -- see
+        :mod:`namespy.filtering` for the stances, the RCODE pairings,
+        and why none of it may ever be cached. A MQTYPE query still
+        gets the support signal as the empty list: the server answered
+        this name policy-side, and combination was never on the table
+        any more than it is for a bound name.
+        """
+        self._reply(
+            Response(
+                ID=dns_packet.ID,
+                QR=DnsQR.RESPONSE,
+                RCODE=(DnsResponseCode.NO_ERROR if rule.substitute else rule.action.rcode),
+                questions=list(dns_packet.questions),
+                answers=list(rule.substitute),
+            ),
+            addr,
+            request=dns_packet,
+            extended_errors=(extended_dns_error_option(rule.action.value, rule.action.extra_text),),
             mqtype_answered=[] if asked is not None else None,
             channel=channel,
         )
@@ -1733,6 +1774,17 @@ class DnsServer(asyncio.Protocol):
         if verdict is not None:
             self._dynamic_reply(dns_packet, addr, verdict, asked, channel)
             return
+        if self._filter is not None and dns_packet.questions:
+            rule = self._filter.evaluate(dns_packet.questions[0].name)
+            if rule is not None:
+                self.log.debug(
+                    "server_filtered(src=%s name=%s rule=%s)",
+                    addr[0],
+                    dns_packet.questions[0].name,
+                    rule.action.name.lower(),
+                )
+                self._filtered_reply(dns_packet, addr, asked, channel, rule)
+                return
         if self._forwarder is not None:
             await self._forward_dot(dns_packet, addr, asked, channel)
             return

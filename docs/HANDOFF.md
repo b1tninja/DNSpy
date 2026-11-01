@@ -3083,6 +3083,63 @@ that vocabulary's first use on the server's own failures), then U4 (query
 log) riding the same pipeline.
 
 
+### Follow-up: the server that says why it refuses — policy filtering with RFC 8914's four codes (increment X, row U3)
+
+`namespy.filtering` is the new data module: `FilterAction` carries the
+four stances of §4.16–§4.19 as their registry codes — Blocked 15,
+Censored 16, Filtered 17, Prohibited 18 — each with the RCODE its own
+section's sentence implies (block/censor "unable to respond to the
+request" → NXDOMAIN; filter's "you requested that we filter domains like
+this one" withholds records, not the name → NODATA; §4.19 says its
+message is a REFUSED). The pairing is legal because §2 leaves it to the
+operator, verbatim in the CHANGELOG; it is honest because each choice
+comes from the code's own section, not from taste. `FilterRule.parse`
+reads `action:trigger` with the leading-dot zone form (apex-or-below
+matching shared with `bind()`), the root is a legal deliberate zone, and
+`FilterPolicy` is the ordered first-match-wins list.
+
+The hook sits in `respond_to_packet` after the bind consult and before
+the forwarder — which is also before the cache and the walk, both of
+which live behind `resolver.resolve` — so the ladder is bind > filter >
+forwarder > recursion, tested with the resolver welded shut.
+`_filtered_reply` composes through `_reply` (EDNS rules, truncation, and
+OPT suppression are the shipped ones), sets nothing the answer has not
+earned: no AA, no AD even under DO, question echoed, EDE with §3's short
+attributed text, and no path to any cache — composed bytes are never
+learned bytes, so a filter cannot poison the RFC 8020 cut or aggressive
+NSEC. Substitutes force NOERROR without ever claiming AA. CLI:
+`--serve --filter ACTION:NAME`, validated in `main()` before the port
+opens; the TCP and DoT ports share the protocol instance and inherit the
+policy for free.
+
+Fixed on the way in: `EDE_STALE_ANSWER` was **2**, which §4.3 registers
+as Unsupported DS Digest Type; §4.4's Stale Answer is **3**. The comment
+quoted a sentence the document does not contain (the phantom-citation
+class again), the consumer half — label table, CLI printer, resolver
+logs — already said 3, and the two producer-side tests had pinned the
+bug rather than the registry. Both halves now agree with the document.
+
+Tests: 24 in `tests/test_filtering.py`. Two seams worth remembering: the
+server enforces `isinstance(resolver, RecursiveResolver)`
+(test_resolver_type_is_enforced), so welding the network means a real
+resolver with `.resolve` monkeypatched, not a stand-in object; and
+`DnsServer`'s constructor takes `filter_policy` as plain data, so unit
+and end-to-end layers share the same `FilterPolicy.from_cli` vocabulary
+the CLI parses. Catalog Zone distribution (RFC 9432) deliberately did
+not ship — it is a transport for these rules, and transports belong with
+U6's zone machinery.
+
+Tooling note from this session: the rfclib MCP server was fixed by
+editing `~/.cline/data/settings/cline_mcp_settings.json` — Cline wants
+flat `command`/`args`/`env` keys under the server name (the entry had a
+Cursor-style nested `"transport"` object, which the loader ignores), and
+the launch binary is still `rfclib.exe mcp`: the library split landed as
+the `rfclib[mcp]` extra, not a separate `rfclib-mcp` distribution.
+
+Full suite after this increment: 1852 passed, 1 skipped; mypy and ruff
+clean; `ruff format` now covers the new files.
+
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

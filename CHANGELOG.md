@@ -8,6 +8,45 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **Policy filtering: the four refusals, with honest signals
+  (second-horizon U3).** `namespy.filtering` makes RFC 8914 §4.16–§4.19
+  executable: `FilterAction` is Blocked (15), Censored (16), Filtered (17)
+  and Prohibited (18) as registry codes, each paired with the RCODE its own
+  section implies — block and censor answer NXDOMAIN (refusing "to respond
+  to the request" is refusing the name), filter answers NODATA (§4.18's
+  "you requested that we filter domains like this one" does not deny the
+  name, it withholds the records), and prohibit answers REFUSED because
+  §4.19's sentence says its message is a REFUSED — a pairing §2 explicitly
+  leaves to the operator ("does not allow or prohibit any particular
+  extended error codes and information to be matched with any particular
+  RCODEs"). `FilterRule.parse("action:trigger")` reads the CLI's shape,
+  the leading-dot zone form (`.ads.example` covers the apex and its
+  descent -- the same apex-or-below matching `bind()` does, so the two
+  configuration surfaces agree on what "under a name" means) included,
+  first match wins, and the root is a legal zone for an operator who means
+  to refuse everything with the flag in front of them.
+  `DnsServer(..., filter_policy=...)` consults the policy after the binds
+  and before the cache, the forwarder, and the walk — a bound name is a
+  statement written about the very subjects a policy fires on — and the
+  composed answer is deliberately minimal: the chosen EDE with §3's short
+  attributed text, the question echoed for RFC 5452 §4.2 correlation,
+  never AA (a policy act is not an authority claim), never AD (nothing was
+  validated; the DO bit asks for validation, not for a fiction), nothing
+  at all to a client that sent no OPT (RFC 6891 §7's MUST), and no entry
+  in any cache — these bytes are composed, never learned, which makes
+  poisoning the RFC 8020 cut or aggressive NSEC *by* a filter
+  structurally impossible. Optional substitute records answer NOERROR —
+  records beside an NXDOMAIN would contradict the one field every client
+  reads first — and still never earn AA. `--serve --filter ACTION:NAME`
+  (repeatable; rules are validated in `main()` before the port opens, and
+  the TCP and DoT ports inherit the policy because they share the protocol
+  instance). Catalog Zone distribution (RFC 9432) stays unshipped: the
+  policy is in-process config, and its transport can arrive with the
+  machinery that carries it. 24 tests, `tests/test_filtering.py`: the four
+  stances on the wire, the precedence ladder (bind > filter > forwarder >
+  walk) with the resolver welded shut, a DO client earning no AD, a
+  non-EDNS client earning no option, and a substitute that answers without
+  claiming authority.
 - **DNS over TLS in both directions — the listener, and the server that
   forwards encrypted (second-horizon U5).** `--serve --serve-dot --dot-cert
   FILE --dot-key FILE [--dot-port 853]` wraps RFC 7858's own port in front of
@@ -1206,6 +1245,17 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 
 ### Fixed
+
+- **The serve-stale answer announced itself with the wrong extended error
+  code.** RFC 8914 §4.4 registers Stale Answer as code 3; §4.3's code 2 is
+  Unsupported DS Digest Type — a different fault entirely — and the server
+  was sending 2 behind a comment quoting a sentence the document does not
+  contain. The consumer half of this house already knew better (the label
+  table and the CLI printer said 3, and the resolver logs said
+  `ede=3 (Stale Answer)`), and the two producer-side tests that pinned the
+  value were pinning the bug rather than the registry. Both halves now say
+  3, the comments quote §4.4 verbatim, and the tests pin the registry's
+  number.
 
 - **A fifth citation sweep cleared the encrypted-walk prose and caught one
   phantom — a citation increment P had introduced the same month.** Every

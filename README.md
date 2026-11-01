@@ -100,7 +100,11 @@ sends the server's own queries to encrypted upstreams instead of walking from
 the root: bound names answer first, one connection is reused per upstream
 (RFC 7858 §3.4), an upstream that refuses TLS is remembered for an hour
 (§3.1¶4), and universal silence explains itself with RFC 8914's "no reachable
-authority".
+authority". Policy answers too: `--serve --filter ACTION:NAME` (repeatable,
+first rule wins) refuses a name as block or censor (NXDOMAIN), filter
+(NODATA), or prohibit (REFUSED), each explained on the wire by its RFC 8914
+extended error code 15–18 — judged after bound names and before the cache,
+any forwarder, and the walk, and never carrying AA, AD, or a cache entry.
 exposing a recursive resolver to a network you do not control turns it into an
 amplification instrument (RFC 5358, RFC 9085). See [`SECURITY.md`](SECURITY.md).
 

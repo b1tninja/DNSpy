@@ -30,6 +30,7 @@ from .enums import (
     DnsResponseCode,
     is_data_rrtype,
 )
+from .filtering import FilterPolicy
 from .idna import IdnaError
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query, Response
@@ -604,6 +605,20 @@ def build_parser():
         "shape: cleartext on your own port 53, encryption from here to "
         "whoever recurses. Incompatible with --forward (that builds a "
         "client; this configures the server)",
+    )
+    p.add_argument(
+        "--filter",
+        action="append",
+        default=[],
+        metavar="ACTION:NAME",
+        help="with --serve: refuse one name by policy, repeatable, first rule "
+        "wins. ACTION is block or censor (NXDOMAIN), filter (NODATA), or "
+        "prohibit (REFUSED) -- each explained on the wire by its RFC 8914 "
+        "extended error code 15, 16, 17, or 18 -- and NAME is one exact name "
+        "or a zone with a leading dot (.ads.example covers the zone apex and "
+        "everything under it). Judged after bound names and before the cache, "
+        "any forwarder, and the walk; policy answers carry no AA, no AD, and "
+        "are never cached",
     )
     p.add_argument(
         "--qname-min",
@@ -1312,12 +1327,14 @@ async def serve(args) -> int:
                 dot_upstreams = [Upstream.parse(text, transport="dot") for text in args.forward_dot]
             except ValueError as exc:
                 raise SystemExit(f"namespy: --forward-dot: {exc}") from None
+        filter_policy = FilterPolicy.from_cli(args.filter) if args.filter else None
         _server_transport, _server_protocol = await loop.create_datagram_endpoint(
             lambda: DnsServer(
                 resolver_protocol,
                 nsid=args.advertise_nsid,
                 max_qtypes=args.max_qtypes,
                 dot_upstreams=dot_upstreams,
+                filter_policy=filter_policy,
             ),
             local_addr=("127.0.0.1", 53),
         )
@@ -1325,6 +1342,14 @@ async def serve(args) -> int:
             logging.info(
                 "server_forwarding=%s",
                 ", ".join(f"{u.host}:{u.port}#{u.server_name}" for u in dot_upstreams),
+            )
+        if filter_policy is not None:
+            logging.info(
+                "server_filtering=%s",
+                " ".join(
+                    f"{r.action.name.lower()}:{'.' if r.include_subdomains else ''}{r.trigger}"
+                    for r in filter_policy.rules
+                ),
             )
         if getattr(args, "serve_reflexive", False):
             # Bound after construction rather than passed in: bind() is the
@@ -1454,7 +1479,17 @@ def main(argv=None) -> int:
                 "section 3.2), and a listener without an identity serves "
                 "only the connection that section says to distrust"
             )
+        if args.filter:
+            try:
+                FilterPolicy.from_cli(args.filter)
+            except ValueError as exc:
+                parser.error(f"--filter: {exc}")
         return asyncio.run(serve(args))
+    if args.filter:
+        parser.error(
+            "--filter configures the --serve server's policy; run with --serve "
+            "(a one-shot lookup applies no policy -- it is the asking side)"
+        )
     if args.serve_dot or args.forward_dot:
         parser.error(
             "--serve-dot/--forward-dot configure the --serve server's TLS "
