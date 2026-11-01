@@ -210,9 +210,15 @@ them change the security properties of anything built on top.
   query asked — and keeps §7's silence for a query that had none. Truncation is fully
   handled: a `TC` answer is re-asked over TCP instead of being believed
   (RFC 1123 §6.1.3.2).
-- **No IDN or punycode.** Labels are octets end to end, which is what RFC 2181
-  §11 requires of a implementation, but it means RFC 5890 A-labels must be
-  encoded by the caller.
+- **The IDNA2008 character tables do not ship.** Conversion at the
+  boundary is complete — `namespy münchen.de`, `DomainName.from_unicode`,
+  punycode (RFC 3492 §6) and the U-label/A-label tests (RFC 5891 §4-§5) —
+  but RFC 5892's derived validity tables and IDNA2003-style or UTS-46
+  mapping do not belong in a zero-dependency package, so contextual
+  characters get the treatment RFC 5891 §5.4 ¶13 prescribes: ask the DNS,
+  where a registered label is presumed valid. Below the boundary labels
+  stay octets end to end, which is what RFC 2181 §11 requires of an
+  implementation; a bare `DomainName` still means exactly what it says.
 - **QNAME minimisation is opt-in** (`--qname-min`, `qname_min=True`). By
   default the full QNAME goes to every server on the way down, leaking the
   whole name to the root and TLD servers (RFC 9156 §4.1); with it on, each

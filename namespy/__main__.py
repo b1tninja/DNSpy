@@ -30,6 +30,7 @@ from .enums import (
     DnsResponseCode,
     is_data_rrtype,
 )
+from .idna import IdnaError
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query, Response
 from .rdata import generic_presentation, type_name_of
@@ -894,9 +895,21 @@ def _report_server_ids(resolver) -> None:
         print(f";; NSID {address} {nsid_presentation(identities[address])}", file=sys.stderr)
 
 
+def _qname_from_arg(text: str) -> DomainName:
+    """Turn the command-line name into a query name, punycoding it first if
+    it is written in Unicode (RFC 5891 section 5.3: a lookup application
+    converts U-labels to A-labels before asking the DNS).  A name that is
+    not one -- an unassigned code point, a hyphen where section 4.2.3.1
+    forbids one -- is a sentence, not a traceback."""
+    try:
+        return DomainName.from_unicode(text)
+    except IdnaError as exc:
+        raise SystemExit(f"namespy: {text}: {exc}") from None
+
+
 async def cli_query(args) -> int:
     loop = asyncio.get_running_loop()
-    qname = DomainName(args.name)
+    qname = _qname_from_arg(args.name)
     # Decided before the resolver is built, because it decides what the resolver sends on
     # every hop rather than on one: an empty tuple here means the walk below never carries
     # an MQTYPE-Query option and no server is asked to do anything new.
@@ -1001,7 +1014,7 @@ async def cli_stub(args) -> int:
     :class:`~namespy.stub.StubResolver` has asked down the list).
     """
     loop = asyncio.get_running_loop()
-    qname = DomainName(args.name)
+    qname = _qname_from_arg(args.name)
     try:
         upstreams = [Upstream.parse(text, transport=args.stub_transport) for text in args.forward]
     except ValueError as exc:

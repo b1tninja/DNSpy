@@ -2038,6 +2038,91 @@ probe table as a second E; (3) the authority leg's DoH answer (a
 dohpath-bearing `_dns` record is already parsed and declined -- wiring
 `namespy/doh.py` to the same seam is the small remainder when wanted).
 
+### Follow-up: the boundary that used to be the caller's job — IDNA2008 (RFC 3492, RFC 5891, RFC 5890 §2.3)
+
+Increment G, the first item off the earlier list and the roadmap's one
+remaining *correctness* gap ("callers must pre-encode today"):
+`namespy/idna.py`, with `DomainName.from_unicode` and the CLI's two
+query entry points as the boundary. `namespy münchen.de` now works.
+
+The codec is a line-by-line transcription of RFC 3492 §6.1-§6.3 with §5's
+parameters, and the tests read like the document: all eighteen §7.1
+sample strings pinned encode-and-decode (§6.2¶4: one encoding per
+sequence, so both directions must agree with the spec's own bytes), the
+§7.2 traces checking §6.1's bias checkpoints (21 … 84 … 90) and example
+L's insertion-order lesson, example S pinning the
+delimiter-after-literals rule at the codec level where it lives. The
+decoder distinguishes §6.2's failures by name -- unexpected end of input,
+no-digit-value, non-basic literal -- because §6.2¶3 makes that taxonomy
+the argument that no two inputs decode alike. Overflow is §6.4¶2's
+`B > maxint − A (div C)` arithmetic against a 26-bit maxint: §6.4¶1's own
+bound for IDNA labels, chosen because erratum 265 redefines maxint as
+"the maximum value of an integer variable" and Python has none -- the
+guard exists for inputs that are *not* valid labels.
+
+Above the codec, the label protocol is RFC 5891 §4/§5 as refined by the
+5890 §2.3 taxonomy. Three decisions carry reasons worth keeping. **Case
+has three answers, not one:** the decoder reads digits in any case (§5¶6),
+the encoder emits them lowercase (§5¶6 + RFC 5890 §2.3.1¶4 "A-labels
+should be produced only in lowercase"), and the *fold* a lookup
+application may apply first is ASCII-only -- `str.lower()` can grow a
+label (U+0130 becomes two characters), so `_fold_ascii_case` moves A-Z
+and nothing else, which is also the DNS's own equivalence (§2.3.2.4) and
+this package's identity convention. The distinction is load-bearing:
+`MÜNCHEN` folds to the label for `mÜnchen` (`xn--mnchen-psa`), *not* to
+`münchen` (`xn--mnchen-3ya`) -- a test pins it. IDNA2008 itself maps
+nothing (its founding departure from 2003, appendix A), so a U-label
+containing A-Z is rejected outright (the RFC 5892 tables put A-Z in
+DISALLOWED anyway) and `map_ascii_case=False` gets the strict reading.
+**The tables are a stated deferral, not a silent one:** RFC 5892's
+derived character sets ship nowhere in a standard-library package, so the
+tests run as far as `unicodedata` decides -- `Cn` unassigned (against
+*this Python's* Unicode, which is exactly §5.4¶9's semantics), controls,
+separators, private use -- and CONTEXTJ/CONTEXTO go to §5.4¶13's "rely
+on the presence or absence of labels in the DNS", which is what a lookup
+application owes anyway; declining to process a rule-conforming string
+would be the actual non-conformance. **Zone data cannot throw:** an
+A-label typed by a human is a question and gets rejected with a sentence
+when fake (§5.3¶1's round-trip test -- decode, run §5.4, re-encode, must
+be identical), but `to_unicode` is presentation, and §5.3¶2 asks of a
+broken label only that it be recognized as not-one; it comes back
+lowercased as written rather than raising.
+
+Two findings on the way, both kept as tests. The first scratch run of the
+overflow guard used `z`s -- but `z` is digit-value 25, which *breaks*
+every delta run against t=26, so `"z"*10` is not an overflow: it decodes
+cleanly, into four CJK code points, and is instead the cleanest
+demonstration of §6.2¶4's bijection (re-encoding reproduces it exactly);
+the overflow test uses 9's (value 35, never below any t). The second:
+an append to the growing module silently replaced `_adapt`'s `return`
+with the next function -- the vector tests caught it on first run, which
+is why the vectors went in before anything depended on them.
+
+**Verified**: 1628 passed, 1 skipped (+78: the §7.1 vectors both
+directions, §6.2/6.4 failure modes and the surrogate gate, §7.2 trace
+checkpoints and the bijection, the U-label rejection matrix, known
+answers `xn--mnchen-3ya`/`xn--bcher-kva` from the zones themselves,
+Fake-A-label rejections, presentation pass-through, and the
+from_unicode/CLI integration including its one-sentence SystemExit).
+`ruff`/`format`/`mypy` clean, coverage 91.3% (idna.py 94%; the uncovered
+lines are defense-in-depth guards -- encode-side overflow, the round-trip
+check -- that the other guards make unreachable, cited as such). Roadmap:
+§7 "Names beyond ASCII" row ⬜ → ✅, and the priority table finally
+caught up with the feature tables -- IDNA, wildcard synthesis (4592),
+DNSSEC validation, serve-stale (8767) and walk-side TCP reuse
+(7828/9210) are struck through as the shipped rows they have been since
+increment D.
+
+**Next, in order**: (1) the earlier list as it fits, IDNA now off it --
+6841, 9824, 10001, 8509/9535, 9364/9904/9905/9906, 9471, 8145 §5
+(padding would serve the opportunistic leg and 7858 alike); (2) DoQ
+(9250) stays deferred on the `aioquic`-sized conversation -- still the
+only missing transport in three documents' worth of transport rows, and
+it would ride the same probe table as a second E; (3) the authority
+leg's DoH answer (a dohpath-bearing `_dns` record is already parsed and
+declined -- wiring `namespy/doh.py` to the same seam is the small
+remainder when wanted).
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

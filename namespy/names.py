@@ -44,6 +44,7 @@ labels. Use :func:`escape_label` / :func:`unescape_label` to convert.
 
 from __future__ import annotations
 
+from .idna import to_ascii
 from .wire import (
     MAX_LABEL_OCTETS,
     MAX_NAME_OCTETS,
@@ -318,6 +319,28 @@ class DomainName:
         fabricate extra labels on the way back in.
         """
         return cls(".".join(escape_label(label) for label in labels) + ".")
+
+    @classmethod
+    def from_unicode(cls, text: str, *, map_ascii_case: bool = True) -> DomainName:
+        """Build a name from a name a human typed, punycoding as needed.
+
+        :class:`DomainName` itself is octet-transparent (RFC 2181 section 11):
+        handing it ``münchen.de`` stores raw U+00FC octets, not a DNS name
+        anyone can look up. This constructor runs the IDNA2008 lookup
+        boundary first -- each non-ASCII label is validated and punycoded to
+        its A-label (RFC 5891 sections 4.4, 5.4) -- so the name goes on the
+        wire as ``xn--mnchen-3ya.de``.
+
+        IDNA2008 maps nothing (that refusal is its main departure from
+        IDNA2003, RFC 5891 appendix A), so a strict conversion would reject
+        ``München``. ``map_ascii_case`` applies the DNS's own ASCII-only
+        equivalence (RFC 5890 section 2.3.2.4) before converting, on by
+        default here because a resolver typed toward is a lookup
+        application, not a registry; pass ``False`` for the strict reading.
+        Raises :class:`~namespy.idna.IdnaError` for labels no conversion can
+        rescue.
+        """
+        return cls(to_ascii(text, map_ascii_case=map_ascii_case))
 
     def is_subdomain_of(self, other, *, include_self: bool = True) -> bool:
         """Whether this name lies within *other*, compared label-wise from the root.
