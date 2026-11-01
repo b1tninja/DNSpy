@@ -911,6 +911,29 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Fixed
 
+- **A correctly signed RFC 5155 §8.7 wildcard No Data answer over NSEC3 was
+  judged Bogus, and the walk SERVFAILed it.** Where the chain held no record
+  matching QNAME and the next-closer record *asserted*, `_nsec3_no_data` read
+  §8.5 alone and convicted the response — but the assertion proves exactly
+  §8.7's precondition (the name does not exist; a wildcard at the closest
+  encloser, its matching record's bitmap lacking QTYPE and CNAME, is what makes
+  No Data the right answer instead of Name Error). The NSEC engine's
+  RFC 4035 §5.4¶6 branch has adjudicated that shape its whole life;
+  `aggressive.py` knew §8.7 for the cache path, which is why the suite stayed
+  green while the wire path was blind. The asserting span is now the hinge into
+  §8.7 — shared tail between the two entry points, refusals unchanged in kind:
+  a response denying its own wildcard holds the two records of a Name Error,
+  and a response proving neither way is truncation, a retry. §8.7 names no
+  QTYPE exception, so a DS NODATA at a denied name rides the shape too — what a
+  clear bit under a proven wildcard can never mean is a *secure* delegation,
+  and parity with the NSEC engine is what the chain builder's answers now hold.
+  Two refusal tests re-pinned to the reason §8.7 owns (same Bogus verdict,
+  truer citation), three shape tests, one validator scenario, and one scripted
+  walk added — the last is the defect's proof-of-death end to end: the answer
+  now arrives NODATA, SECURE, AD, cached and validated
+  (`namespy/nsec.py`; `tests/test_nsec_responses.py`,
+  `tests/test_dnssec_validate.py`, `tests/test_dnssec_wiring.py`).
+
 - A wire record whose RDATA is structurally well-formed but semantically impossible — an RRSIG whose signature field is zero octets, an empty DNSKEY public key, a zero-length DS digest, an NSEC3 hash the wrong length for its algorithm — escaped the parser as the codec constructor's bare `ValueError` instead of `DnsPacketParseError`, breaking the invariant the wire-fuzzing property is built to guard ("malformed input surfaces as one class the reader already catches, nothing else") and letting one corrupt octet crash the parse path. `DnsRecord.parse` now converts `ValueError` raised inside any codec's `parse_from` into `DnsPacketParseError` at the one boundary every codec crosses (namespy/packet.py; constructors keep raising `ValueError` for API callers, where a wrong field is a programming error, not a datagram). Found by `test_one_corrupt_octet_never_brings_down_the_parser` replaying a real counterexample; pinned by `test_an_rrsig_with_an_empty_signature_fails_the_parse_not_the_process`.
 
 - **The Indeterminate state was cited to the wrong RFC.** Documentation written while

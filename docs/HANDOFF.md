@@ -2252,6 +2252,81 @@ exists, the policy does not); (4) RFC 9471 §3 server-side glue completeness
 (9250) deferred as ever on the `aioquic`-sized conversation; (7) the
 authority-leg DoH answer, same small remainder as before.
 
+### Follow-up: the SERVFAIL that was — RFC 5155 §8.7 over NSEC3 (increment I)
+
+The defect increment H proved but did not touch, now closed. The research was
+one paragraph long once the paragraph was read instead of remembered: §8.7,
+"Validating Wildcard No Data Responses" — "The validator MUST verify a closest
+encloser proof for QNAME and MUST find an NSEC3 RR present in the response that
+matches the wildcard name ... Furthermore, the bits corresponding to both QTYPE
+and CNAME MUST NOT be set in the wildcard matching NSEC3 RR." No matching
+record at QNAME has ever appeared in that text; the *asserting* next-closer
+span that `_nsec3_no_data` read as a conviction is the section's own
+precondition — the chain denying QNAME is exactly why the name earned No Data
+through a wildcard rather than Name Error. Errata checked first: 5155's three
+verified corrections are 3441 (§7.2.3/§8.5's two-bracket form — already in the
+code), 3544 (base32hex terminology), and 4622 (§7.2.8's NSEC3-owner-name
+paradox, a server-behavior section, nothing for the validator); §8.7 itself
+carries no erratum, verified or otherwise.
+
+The DS question settled on the same reading. §8.7 names no QTYPE exception —
+"both QTYPE and CNAME", DS included — and §8.6 covers only the matching-record
+shape of a DS NODATA; 4592 §4.6 calls a synthesized DS "meaningless", which is
+about an answer's RDATA, not about a denial, and a name the chain denies can
+hold no secure delegation to misreport: the wildcard-shaped DS answer means
+*insecure*, which is also the right answer. The clincher was parity:
+`nsec_proves_no_data`'s §5.4¶6 branch has taken the wildcard shape for DS
+queries since the first DNSSEC commit, and `aggressive.py`'s §5.2 fallback for
+both kinds — the wire path's NSEC3 refusal was the lone outlier, not a policy.
+
+The change is one seam in `nsec.py`: `_nsec3_no_data`'s contradiction branch
+became `return _nsec3_wildcard_no_data(qname, qtype, closest, usable, zone)`,
+the adjudication extracted from `nsec3_proves_wildcard_no_data` so both entry
+points share it and neither re-derives the encloser proof. Nothing else about
+the refusals changed in kind: a response that *denies* its wildcard still
+convicts (the pair of records is the shape of a Name Error — §8.7 against
+§8.4, RFC 4035 §5.4¶6), a response that proves neither way is still
+truncation's Incomplete, and the Opt-Out early-return still stands ahead of
+the fallback, so the amended §8.5 keeps its insecure-delegation shape before
+§8.7 is consulted and §9.2¶1's AD prohibition rides `via_opt_out` as before.
+`validate.py` needed nothing: the NO_ERROR branch already caught both
+`ProofError` subclasses, reads `via_opt_out` off whatever proof returns, and
+takes `via_compact` through `getattr(proof, "matching", None)` — a
+`WildcardNodataProof` has no matching record, so §8.7 answers are never
+mistaken for §3.3.2's compact shape, which is right: compact wildcard No Data
+carries a record matching QNAME (§3.3.2), a different proof entirely.
+
+The tests re-pin two refusals and add the acceptances. `test_nsec_responses`:
+the asserting-span test keeps Bogus but moves to the reason that owns it
+("denies the existence of the wildcard" — the fixture's two-record chain covers
+the wildcard's hash, so it is the Name-Error pair), gains the same verdict
+through `nsec3_proves_no_ds`, and gains the acceptance pair — chain plus
+`*.example.com.` with a typeless bitmap proves No Data through §8.5's own entry
+point, DS included. `test_dnssec_validate`: `build_validator(nsec3=True,
+with_wildcard=True)` asked for TXT under the wildcard — the fixture the old
+code convicted — now SECURE, not compact, AD-worthy. `test_dnssec_wiring`:
+`nsec3_wire_chain()` builds the chain by the tree's own hash rules (zero
+iterations, empty salt, base32hex labels, wrap-around) and the scripted walk
+from root to NODATA comes back `secure`, `Nodata` in the events, no
+`CompactDenial`, no `AggressiveDenial`, RCODE NO_ERROR with AD set, cache entry
+stamped validated. Two referral helpers gained a `qtype` parameter on the way
+and lost it again when the FIFO driver proved it dead code — the file answers
+question-A referrals on TXT walks already, and an unused parameter is a
+promise nothing tests keep.
+
+**Verified**: 1655 passed, 1 skipped (+4 net: two refusals re-pinned, three
+shape tests, one validator scenario, one scripted walk). `ruff`/`format`/`mypy`
+clean. Roadmap row 155's cross-reference note rewritten to the past tense;
+README's defect bullet retired.
+
+**Next, in order**: (1) RFC 10001 §4.2 dual-family upstream selection (row 58
+🟡, citation verified); (2) RFC 8467 padding for the encrypted legs (row 95's
+condition met — the codec `edns.padding_option` exists, the policy does not);
+(3) RFC 9471 §3 server-side glue completeness (row 181 ⬜, small); (4)
+8509/9535 anchor maintenance (row 157 🟡); (5) DoQ (9250) deferred as ever on
+the `aioquic`-sized conversation; (6) the authority-leg DoH answer, same small
+remainder as before.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

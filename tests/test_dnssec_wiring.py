@@ -16,6 +16,7 @@ precedent of its live-root test -- restated as wire :class:`DnsRecord` so the wa
 can carry them inside :class:`Response` packets exactly as a server sends them.
 """
 
+import base64
 import ipaddress
 
 import pytest
@@ -31,6 +32,7 @@ from namespy.rdata import (
     RData_AAAA,
     RData_DS,
     RData_NS,
+    RData_NSEC3,
     RData_RRSIG,
     RData_SOA,
     RData_TXT,
@@ -1095,3 +1097,87 @@ def test_every_rrset_in_the_answer_judges_and_a_forged_one_poisons_them_all():
     assert response.RCODE == DnsResponseCode.SERVER_FAILURE
     assert response.dnssec_bogus is True
     assert cache.get(name, int(DnsQType.AAAA), int(DnsRClass.IN)) is None
+
+
+# ------------------------------------------------------------- wildcard No Data (§8.7)
+#
+# A signed zone may answer NO_ERROR/NODATA for a name that does not exist: the
+# chain's asserting record covers it -- correctly, it is gone -- and the record
+# matching the closest encloser's wildcard disposes of the type. RFC 5155 §8.7
+# validates that pair, and until the asserting span became that section's hinge
+# (increment I) the validator convicted its own wire answer: Bogus one layer
+# down, SERVFAIL at the head of the walk. The NSEC engine has accepted the same
+# shape (RFC 4035 §5.4¶6) its whole life; these are the NSEC3 side's records,
+# built by the same fixture rules, saying the same thing over the wire.
+
+
+def nsec3_wire_chain():
+    """The zone's whole NSEC3 chain in wire form, with a wildcard among the owners.
+
+    The fixture of ``tree.build_store``'s nsec3 branch restated here -- zero
+    iterations, empty salt, base32hex labels, hash order, last record wrapping to
+    first -- narrowed to three owners: the apex, ``www``, and ``*.zone.test.``
+    holding A alone, so a query under the wildcard for any other type earns
+    §8.7's answer.
+    """
+    owners = {
+        "zone.test.": [
+            int(DnsRType.SOA),
+            int(DnsRType.NS),
+            int(DnsRType.DNSKEY),
+            int(DnsRType.NSEC3),
+        ],
+        "www.zone.test.": [int(DnsRType.A)],
+        "*.zone.test.": [int(DnsRType.A)],
+    }
+    digests = {owner: tree.nsec3_hash(owner, iterations=0, salt=b"") for owner in owners}
+    order = sorted(owners, key=lambda owner: digests[owner])
+    records = []
+    for index, owner in enumerate(order):
+        nxt = order[(index + 1) % len(order)]
+        label = base64.b32hexencode(digests[owner]).decode("ascii").rstrip("=")
+        records += _signed(
+            "zone.test.",
+            f"{label}.zone.test.",
+            DnsRType.NSEC3,
+            [RData_NSEC3(1, 0, 0, b"", digests[nxt], owners[owner])],
+            "zone",
+        )
+    return records
+
+
+def test_walk_serves_a_wildcard_no_data_answer_over_nsec3():
+    """The SERVFAIL that was: §8.7's answer walks clean -- secure, AD, cached.
+
+    The zone is NSEC3-signed; the query asks for AAAA at a name the chain denies
+    and the wildcard's bitmap empties. Every record on the wire is the zone's
+    own and correctly signed; the only defect ever was the validator's reading.
+    """
+    cache = MemoryDnsCache(time_fn=Clock())
+    name = "deep.zone.test."
+    events = _walk(
+        cache,
+        name,
+        responses=[
+            root_referral(name),
+            tld_referral(name),
+            nodata(name, [soa(), *nsec3_wire_chain()]),
+            key_answer(".", root_keys()),
+            key_answer("test.", tld_keys()),
+            key_answer("zone.test.", zone_keys()),
+        ],
+        anchors=(_anchor(),),
+    )
+    verdict = _verdict(events)
+    assert verdict is not None
+    assert verdict.status == "secure", verdict.reason
+    kinds = [type(event).__name__ for event in events]
+    assert "Nodata" in kinds
+    assert "CompactDenial" not in kinds  # no NXNAME bit anywhere in this answer
+    assert "AggressiveDenial" not in kinds  # 8198 off; the proof is the zone's own
+    response = _done(events)
+    assert response.RCODE == DnsResponseCode.NO_ERROR
+    assert response.AD is True  # every RRset judged under the anchor, no Opt-Out span
+    entry = cache.get(name, int(DnsQType.AAAA), int(DnsRClass.IN))
+    assert entry is not None
+    assert entry.validated is True

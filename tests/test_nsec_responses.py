@@ -7,9 +7,13 @@ per RFC 5155 §8.3¶10). The chains are built the same way: names hashed with th
 own NSEC3 hash and chained in hash order, with the last record wrapping to the first.
 
 Two of the branches below exist only because of verified erratum 3441, and one test per
-branch says which paragraph of it it pins. As on the predicate side, nothing here is
-verified: these functions report what a set of records asserts about the response holding
-them, and forged records remain the verification leg's future problem.
+branch says which paragraph of it it pins. Since increment I a No Data response whose
+next closer *asserts* is adjudicated by §8.7 rather than convicted by §8.5 read alone:
+the asserting span has denied QNAME, which is the precondition of the wildcard No Data,
+and the tests below pin both the acceptance and the refusals that remain. As on the
+predicate side, nothing here is verified: these functions report what a set of records
+asserts about the response holding them, and forged records remain the verification
+leg's future problem.
 """
 
 import pytest
@@ -158,16 +162,48 @@ def test_erratum_3441_accepts_a_provable_encloser_through_an_opt_out_span():
     assert proof.via_opt_out
 
 
-def test_erratum_3441_refuses_an_asserting_span_for_a_name_that_exists():
-    """The same shape without the flag is not a weaker proof -- it is a lie.
+def test_erratum_3441_refuses_an_asserting_span_without_a_wildcard_behind_it():
+    """The asserting span no longer convicts on its own -- but this response is still a lie.
 
-    An asserting record covering QNAME proves QNAME does not exist, and a No Data response
-    is the type-specific answer for a name that does. §8.5 as amended accepts the encloser
-    proof only through an Opt-Out span; anything else is two claims that cannot both hold.
+    An Opt-Out-less covering record proves QNAME does not exist, which §8.5 read alone
+    treated as the end of the No Data procedure. Since increment I it is §8.7's
+    precondition instead: the response could still be the wildcard's, if the chain
+    matched ``*.example.com``. This chain denies the wildcard too -- the pair of records
+    is the shape of a Name Error (RFC 4035 §5.4¶6, RFC 5155 §8.7 against §8.4), so the
+    verdict stays Bogus, now named by the section that owns it.
     """
     chain = _nsec3_chain([ZONE, "a.example.com."])
-    with pytest.raises(ContradictoryProofError, match="erratum 3441"):
+    with pytest.raises(ContradictoryProofError, match="denies the existence of the wildcard"):
         nsec3_proves_no_data("b.example.com.", A, chain, ZONE)
+
+
+def test_a_wildcard_answer_proves_no_data_through_the_no_data_procedure():
+    """§8.7 through §8.5's own entry: no record at QNAME, the wildcard's bitmap disposes.
+
+    The response the old code SERVFAILed: chain denies b.example.com (the asserting
+    span is correct -- b does not exist), and ``*.example.com`` exists with a bitmap
+    that lacks MX and CNAME, so No Data is exactly what the wildcard owes. The proof
+    that lands is the wildcard's: no matching record, wildcard entry in hand.
+    """
+    chain = _nsec3_chain([ZONE, "a.example.com.", "*.example.com."], {"*.example.com.": [A]})
+    proof = nsec3_proves_no_data("b.example.com.", MX, chain, ZONE)
+    assert getattr(proof, "matching", None) is None  # the wildcard's shape has none to hold
+    assert proof.wildcard == DomainName("*.example.com.")
+    assert proof.wildcard_entry is not None
+    assert not proof.via_opt_out
+
+
+def test_a_ds_at_a_denied_name_rides_the_wildcard_shape_too():
+    """§8.7 names no QTYPE exception -- and a name the chain denies holds no delegation.
+
+    The NSEC engine's §5.4¶6 branch has answered a DS query through its wildcard shape
+    the whole time; §8.6 covers the matching-record shape and §8.7 supplies the rest,
+    DS included. What a clear bit under a proven wildcard can never mean is a *secure*
+    delegation, which is all the chain builder's DS logic asks of the answer.
+    """
+    chain = _nsec3_chain([ZONE, "a.example.com.", "*.example.com."], {"*.example.com.": [A]})
+    proof = nsec3_proves_no_ds("b.example.com.", chain, ZONE)
+    assert proof.wildcard == DomainName("*.example.com.")
 
 
 def test_a_matching_opt_out_record_still_asserts_at_its_own_name():
@@ -229,9 +265,14 @@ def test_ds_no_data_through_the_opt_out_span():
 
 
 def test_ds_no_data_refuses_an_asserting_next_closer():
-    """§8.6¶2's Opt-Out requirement is not decoration: assert-and-deny is contradiction."""
+    """§8.6¶2's Opt-Out requirement is not decoration -- and §8.7 finishes what it starts.
+
+    An asserting span is no longer the last word: a DS query rides the wildcard shape
+    like any other QTYPE (§8.7 names no exception). This chain denies the wildcard too,
+    so the refusal stands, now named by the section that owns the pair of records.
+    """
     chain = _nsec3_chain([ZONE, "a.example.com."])
-    with pytest.raises(ContradictoryProofError, match=r"§8\.6¶2"):
+    with pytest.raises(ContradictoryProofError, match="denies the existence of the wildcard"):
         nsec3_proves_no_ds("sub.example.com.", chain, ZONE)
 
 

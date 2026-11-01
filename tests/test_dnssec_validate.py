@@ -617,6 +617,29 @@ def test_a_proved_no_data_answer_is_secure():
     assert verdict.secure
 
 
+def test_a_wildcard_no_data_answer_over_nsec3_is_secure():
+    """The wire gap of increments E-H, closed: RFC 5155 §8.7 reached through §8.5.
+
+    ``deep.zone.test.`` exists in no owner set -- the chain's asserting record covers
+    it, correctly, because it does not exist -- and ``*.zone.test.`` exists holding A
+    and nothing else. That pair is a wildcard No Data answer, §8.7's, and until the
+    asserting span became the hinge into that section the validator convicted its own
+    fixture: Bogus, and a SERVFAIL one layer up. Verdict must now read secure, with
+    no compact bit involved and the AD flag still earned.
+    """
+    _needs_backend()
+    validator = build_validator(nsec3=True, with_wildcard=True)
+    verdict = validator.validate_denial(
+        "deep.zone.test.",
+        int(DnsRType.TXT),
+        rcode=DnsResponseCode.NO_ERROR,
+        zone="zone.test.",
+    )
+    assert verdict.status is SecurityStatus.SECURE, verdict.reason
+    assert not verdict.via_compact
+    assert verdict.ad_worthy
+
+
 def test_a_forged_proof_signature_refuses_the_denial():
     """The geometry is perfect here -- and it still comes back BOGUS.
 

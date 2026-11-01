@@ -586,17 +586,31 @@ class NodataProof:
         return self.closest is not None and self.closest.via_opt_out
 
 
-def _nsec3_no_data(qname, qtype: int, entries, zone) -> NodataProof:
-    """The machinery §8.5 and §8.6 share: one shape, two pairs of bits to check.
+def _nsec3_no_data(qname, qtype: int, entries, zone) -> NodataProof | WildcardNodataProof:
+    """The machinery §8.5 and §8.6 share: one procedure, three shapes of No Data.
 
     Erratum 3441 amended §8.5 into its two-bracket form, and §8.6 was built that way from
     the start: when the chain matches QNAME, its bitmap must leave QTYPE (or DS) and CNAME
-    clear; when it does not, only a closest provable encloser proof whose next-closer
-    record has Opt-Out set may stand in -- the shape RFC 5155 §6¶1 gives an insecure
+    clear; when it does not, a closest provable encloser proof whose next-closer record
+    has Opt-Out set stands in directly -- the shape RFC 5155 §6¶1 gives an insecure
     delegation that owns no NSEC3 of its own, which is what the erratum's "Empty
     Non-Terminal derived from an insecure delegation" answers to. The erratum's reporter
     called the case a multi-label Opt-Out delegation; the validator never needs the word,
     because it checks the shape.
+
+    And when the next closer *asserts*, §8.5 read alone convicted the response -- for
+    four increments, here -- but the assertion proves something §8.7 knows how to use:
+    QNAME does not exist, which is precisely the precondition of the wildcard No Data
+    this section validates. §8.7's own text names no QTYPE exception -- "the bits
+    corresponding to both QTYPE and CNAME MUST NOT be set in the wildcard matching
+    NSEC3 RR", DS included, and the NSEC engine's §5.4¶6 branch has read its wildcard
+    shape that way the whole time -- so the assertion is not the end of the procedure
+    but the hinge into §8.7: encloser proof in hand, the record matching
+    ``*.encloser`` decides. What it refuses is unchanged in kind: a response that
+    *denies* its own wildcard holds the two records of a Name Error (RFC 4035 §5.4¶6
+    names the pair; §8.7 against §8.4), and a response that proves neither way is
+    truncation, which §5.4¶6 answers by asking again -- never a shrug towards
+    existence the proofs contradict.
     """
     qname = DomainName(qname)
     usable = usable_nsec3(entries)
@@ -625,44 +639,43 @@ def _nsec3_no_data(qname, qtype: int, entries, zone) -> NodataProof:
         # has an empty Type Bit Maps field, and an empty bitmap clears every bit §8.5 reads.
         return NodataProof(qname=qname, qtype=int(qtype), matching=matching, closest=None)
 
-    # No matching record. What may stand in is an Opt-Out proof of insecurity and nothing
-    # else: an *asserting* record covering the next closer would prove QNAME does not
-    # exist, while the No Data response -- the type-specific answer to a name that exists
-    # -- says it does. The two claims cannot both stand, which is why the failed Opt-Out
-    # test is a contradiction rather than a shrug towards incompleteness.
+    # No matching record: the name is in the chain or it is not, and the encloser proof
+    # says which. Through an Opt-Out span the answer is §8.5's own (erratum 3441); on an
+    # asserting span the span has already denied QNAME, and §8.7 adjudicates from there.
     closest = closest_encloser_proof(qname, usable, zone)
-    if not closest.via_opt_out:
-        raise ContradictoryProofError(
-            f"no NSEC3 RR matches {qname}, and the record covering its next closer "
-            f"{closest.next_closer} asserts rather than opts out, so it denies the very "
-            f"existence the No Data response claims (RFC 5155 §8.5 as amended by erratum "
-            f"3441, §8.6¶2)"
-        )
-    return NodataProof(qname=qname, qtype=int(qtype), matching=None, closest=closest)
+    if closest.via_opt_out:
+        return NodataProof(qname=qname, qtype=int(qtype), matching=None, closest=closest)
+    return _nsec3_wildcard_no_data(qname, qtype, closest, usable, zone)
 
 
-def nsec3_proves_no_data(qname, qtype: int, entries, zone) -> NodataProof:
-    """RFC 5155 §8.5, as corrected by verified erratum 3441: No Data, QTYPE is not DS.
+def nsec3_proves_no_data(qname, qtype: int, entries, zone) -> NodataProof | WildcardNodataProof:
+    """RFC 5155 §8.5, as corrected by verified erratum 3441 and adjudicated through §8.7.
 
-    Erratum 3441 is what makes this function branch at all. As published, §8.5 demanded a
-    matching record unconditionally -- and an Opt-Out chain holds no record at an insecure
-    delegation (§6¶1: delegations may exist "without a corresponding NSEC3 RR at the hashed
-    owner name"), so the corrected text accepts the closest provable encloser proof with an
-    Opt-Out next closer for exactly that case, and only for it. DS queries belong to
-    :func:`nsec3_proves_no_ds`; handing this function a DS QTYPE works, because the shape is
-    identical, but §8.6 is where that case lives.
+    Erratum 3441 is what makes this branch at all. As published, §8.5 demanded a
+    matching record unconditionally -- and an Opt-Out chain holds no record at an
+    insecure delegation (§6¶1: delegations may exist "without a corresponding NSEC3
+    RR at the hashed owner name"), so the corrected text accepts the closest
+    provable encloser proof with an Opt-Out next closer for exactly that case, and
+    only for it. Where the next closer asserts -- QNAME is gone -- §8.7's wildcard
+    No Data decides the response, since increment I: see :func:`_nsec3_no_data` for
+    why the assertion is the hinge and not the verdict. DS queries belong to
+    :func:`nsec3_proves_no_ds`, which shares both; handing this function a DS QTYPE
+    works, because the shapes are identical, but §8.6 is where that case lives.
     """
     return _nsec3_no_data(qname, qtype, entries, zone)
 
 
-def nsec3_proves_no_ds(qname, entries, zone) -> NodataProof:
+def nsec3_proves_no_ds(qname, entries, zone) -> NodataProof | WildcardNodataProof:
     """RFC 5155 §8.6: No Data for a DS query -- the response that establishes an insecure delegation.
 
     This is the most load-bearing denial in the whole protocol: it is what tells a resolver
     to stop validating everything below QNAME. §6¶4 says the matching record's clear DS bit
     *is* that establishment, and it is why the matching branch accepts an Opt-Out record at
     QNAME where a covering one asserts nothing (§6¶3): a record asserts at its own owner
-    name whatever its flag says; it is the span that Opt-Out empties.
+    name whatever its flag says; it is the span that Opt-Out empties. A DS queried at a
+    name the chain itself denies rides §8.7's wildcard shape like any other QTYPE -- §8.7
+    names no exception, and a name that does not exist holds no secure delegation to
+    misreport: the NSEC engine's §5.4¶6 branch has answered DS that way all along.
     """
     return _nsec3_no_data(qname, int(DnsRType.DS), entries, zone)
 
@@ -683,19 +696,16 @@ class WildcardNodataProof:
         return self.closest.via_opt_out
 
 
-def nsec3_proves_wildcard_no_data(qname, qtype: int, entries, zone) -> WildcardNodataProof:
-    """RFC 5155 §8.7: No Data that a wildcard's existence explains, and its bitmap disposes of.
+def _nsec3_wildcard_no_data(qname, qtype: int, closest, usable, zone) -> WildcardNodataProof:
+    """The §8.7 adjudication from an encloser proof already in hand.
 
-    "MUST find an NSEC3 RR present in the response that **matches** the wildcard name" --
-    matches, not covers. §8.4 denies the wildcard to prove a Name Error; §8.7 rests on its
-    existence to explain why a name that does not exist earned No Data instead. A record
-    set that denies the wildcard outright contradicts the shape of the response handed with
-    it, so it is reported as a contradiction; a set holding neither record is what
-    truncation costs a resolver, and RFC 4035 §5.4¶6 answers that by asking again.
+    Reached two ways: by `_nsec3_no_data` when the chain holds no record at QNAME and
+    the next closer asserts (the name is gone -- §8.7's precondition), and by
+    :func:`nsec3_proves_wildcard_no_data`, the public entry the aggressive cache
+    drives directly. The Opt-Out guard rides in both: synthesis does not cross a
+    zone cut, so an encloser proof that reaches QNAME through an Opt-Out span can
+    only ever be §8.5's insecure-delegation shape, never this one.
     """
-    qname = DomainName(qname)
-    usable = usable_nsec3(entries)
-    closest = closest_encloser_proof(qname, usable, zone)
     wildcard = wildcard_at(closest.encloser)
     if closest.via_opt_out:
         raise ContradictoryProofError(
@@ -725,6 +735,26 @@ def nsec3_proves_wildcard_no_data(qname, qtype: int, entries, zone) -> WildcardN
             f"No Data response is not the answer its own proof describes (RFC 5155 §8.7)"
         )
     return WildcardNodataProof(qname, int(qtype), closest, wildcard, matching)
+
+
+def nsec3_proves_wildcard_no_data(qname, qtype: int, entries, zone) -> WildcardNodataProof:
+    """RFC 5155 §8.7: No Data that a wildcard's existence explains, and its bitmap disposes of.
+
+    "MUST find an NSEC3 RR present in the response that **matches** the wildcard name" --
+    matches, not covers. §8.4 denies the wildcard to prove a Name Error; §8.7 rests on its
+    existence to explain why a name that does not exist earned No Data instead. A record
+    set that denies the wildcard outright contradicts the shape of the response handed with
+    it, so it is reported as a contradiction; a set holding neither record is what
+    truncation costs a resolver, and RFC 4035 §5.4¶6 answers that by asking again.
+
+    Since increment I this is also the branch `_nsec3_no_data` reaches on its own --
+    the two entry points share the adjudication below, and neither re-derives what
+    the other already proved.
+    """
+    qname = DomainName(qname)
+    usable = usable_nsec3(entries)
+    closest = closest_encloser_proof(qname, usable, zone)
+    return _nsec3_wildcard_no_data(qname, qtype, closest, usable, zone)
 
 
 @dataclass(frozen=True)

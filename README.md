@@ -160,11 +160,9 @@ them change the security properties of anything built on top.
   aggressive-NSEC and wildcard cache reuse ride the same verdicts. What is
   *not* there: validation runs only when anchors are configured (the IANA root
   document is fetched on `--validate` unless a file is given — RFC 8509-style
-  rollover maintenance is an open roadmap row), the walk cannot yet speak to
-  DNS-over-QUIC servers at all, and a signed **NSEC3** zone's RFC 5155 §8.7
-  wildcard No Data answer is currently judged Bogus on the wire path — a
-  defect with a written-up row in [docs/roadmap.md](docs/roadmap.md) and its
-  own fix queued. With no anchors configured nothing is verified, and answers
+  rollover maintenance is an open roadmap row), and the walk cannot yet speak
+  to DNS-over-QUIC servers at all. With no anchors configured nothing is
+  verified, and answers
   are unauthenticated: anyone who can deliver a well-formed response that
   matches the question — same source address, same ID, echoed question — is
   believed.
