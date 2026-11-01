@@ -583,8 +583,10 @@ def build_parser():
         dest="dot_authority",
         action="store_true",
         help="encrypt the leg to authoritative servers when they support it (RFC 9539):"
-        " probe DoT to port 853, race it against cleartext until the outcome is known,"
-        " then prefer encryption while success is remembered (3 days) and stay on"
+        " ask each server's RFC 9461 _dns SVCB record for the port to try (853 without"
+        " one), probe that port with DNS over TLS, race the probe against cleartext"
+        " until the outcome is known, then"
+        " prefer encryption while success is remembered (3 days) and stay on"
         " cleartext while failure is (1 day). Certificates are accepted as they come --"
         " rejecting one would force a fallback to cleartext, which is the leak this"
         " avoids; the trust worth having is DNSSEC's. Off by default: it is OPTIONAL"

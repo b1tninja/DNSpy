@@ -29,10 +29,16 @@ from test_stub_dot import DotServer, _cert_paths
 
 from namespy.enums import DnsQR, DnsQType, DnsRClass, DnsRType
 from namespy.names import DomainName
-from namespy.opportunistic import AuthorityProbe, ProbeParams, ProbeStatus
+from namespy.opportunistic import (
+    MAX_ALIAS_HOPS,
+    AuthorityProbe,
+    ProbeParams,
+    ProbeStatus,
+    learn_dot_endpoint,
+)
 from namespy.packet import DnsPacket, DnsQuestion, DnsRecord, Query, Response
 from namespy.rdata import RData_A
-from namespy.resolver import Resolver
+from namespy.resolver import RecursiveResolver, Resolver
 
 QNAME = DomainName("ninefivesixthree.example.")
 
@@ -178,7 +184,15 @@ class RacingResolver(Resolver):
 
     opportunistic_dot = True
 
-    def __init__(self, *, dot_port, params=FAST, do53_answer=True, do53_delay=0.0):
+    def __init__(
+        self,
+        *,
+        dot_port,
+        params=FAST,
+        do53_answer=True,
+        do53_delay=0.0,
+        discovered_port=None,
+    ):
         self.log = logging.getLogger("namespy.test.opportunistic")
         self.opportunistic_dot_port = dot_port
         self.opportunistic_params = params
@@ -186,6 +200,15 @@ class RacingResolver(Resolver):
         self.do53_answer = do53_answer
         self.do53_delay = do53_delay
         self.tcp_calls = 0
+        self.discovered_port = discovered_port
+        self.endpoint_asks = 0
+
+    async def _dot_endpoint(self, ns_record, host):
+        """The discovery seam, stood in for: canned port or blind default."""
+        if self.discovered_port is None:
+            return await super()._dot_endpoint(ns_record, host)
+        self.endpoint_asks += 1
+        return self.discovered_port
 
     async def _query_do53(self, ip, dns_packet, port=53):
         self.do53_calls += 1
@@ -637,3 +660,373 @@ async def test_a_malformed_answer_retires_and_damps_the_session():
     finally:
         await resolver.dispose()
         await server.stop()
+
+
+# ------------------------------------------- RFC 9461 discovery: _dns.<name>
+#
+# learn_dot_endpoint takes a fetch callable and returns a port, so the
+# whole of §9461 §4's policy -- alpn, port, targets, hints, alias chains,
+# priorities -- is provable over canned records. The RecursiveResolver
+# integration fakes resolve() rather than walking: what is under test is
+# the seam's memoization and its re-entry guard, not the delegation walk,
+# which has its own suite.
+
+
+def svcb_record(owner, priority, target, params=(), ttl=7200):
+    """One answer-section SVCB record, RDATA assembled from wire-shaped params."""
+    from namespy.rdata import RData_SVCB
+    from namespy.svcb import SvcParams
+
+    return DnsRecord(
+        DomainName(owner),
+        DnsRType.SVCB,
+        DnsRClass.IN,
+        ttl,
+        rdata=RData_SVCB(target=target, priority=priority, params=SvcParams(tuple(params))),
+    )
+
+
+def alpn(*ids):
+    """The alpn SvcParamValue wire form: length-prefixed protocol ids."""
+    return b"".join(len(i).to_bytes(1, "big") + i for i in ids)
+
+
+def port_param(value):
+    return struct.pack("!H", value)
+
+
+def fetcher(pages):
+    """A stand-in fetch over ``{name: records}``, recording every question asked."""
+    asked = []
+
+    async def fetch(qname):
+        asked.append(str(qname).lower())
+        return pages.get(str(qname).lower())
+
+    return fetch, asked
+
+
+async def test_discovery_plain_dot_record_yields_the_default_port():
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record("_dns.ns9539.example.", 1, "ns9539.example.", (("alpn", alpn(b"dot")),))
+        ]
+    }
+    fetch, _asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is not None
+    port, ttl = learned
+    assert port == 853  # §4.2¶1: the per-transport default, unstated in the record
+    assert ttl == 7200
+
+
+async def test_discovery_root_target_is_the_binding_itself():  # SVCB §2.5
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record("_dns.ns9539.example.", 1, ".", (("alpn", alpn(b"dot")),))
+        ]
+    }
+    fetch, _asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is not None
+    assert learned[0] == 853
+
+
+async def test_discovery_explicit_safe_port_is_honored():
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record(
+                "_dns.ns9539.example.",
+                1,
+                "ns9539.example.",
+                (("alpn", alpn(b"dot")), ("port", port_param(8530))),
+            )
+        ]
+    }
+    fetch, _asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is not None
+    assert learned[0] == 8530  # the §7 port=8530 example
+
+
+async def test_discovery_unsafe_port_declines_the_whole_record():
+    """§4.2¶2 makes port auto-mandatory: a client that declines the value
+    (§4.2¶3's confusion argument) ignores the record, not just the key."""
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record(
+                "_dns.ns9539.example.",
+                1,
+                "ns9539.example.",
+                (("alpn", alpn(b"dot")), ("port", port_param(6667))),
+            )
+        ]
+    }
+    fetch, _asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is None
+
+
+async def test_discovery_doh_only_record_describes_no_dot_endpoint():  # §4.1¶2
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record(
+                "_dns.ns9539.example.",
+                1,
+                "ns9539.example.",
+                (("alpn", alpn(b"h2")), ("dohpath", b"/dns-query{?dns}")),
+            )
+        ]
+    }
+    fetch, _asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is None
+
+
+async def test_discovery_nodata_teaches_nothing():
+    fetch, asked = fetcher({})
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is None
+    assert asked == ["_dns.ns9539.example."]  # asked once, at §3's name
+
+
+async def test_discovery_port_prefix_naming_for_non_default_binding():  # §3.1
+    from namespy.opportunistic import dns_service_name
+
+    plain = str(dns_service_name("dns1.example")).lower()
+    assert plain == "_dns.dns1.example."
+    named = str(dns_service_name("dns1.example", 9953)).lower()
+    assert named == "_9953._dns.dns1.example."
+
+
+async def test_discovery_foreign_target_needs_a_hint_about_this_address():
+    foreign = svcb_record("_dns.ns9539.example.", 1, "cdn.example.", (("alpn", alpn(b"dot")),))
+    fetch, _asked = fetcher({"_dns.ns9539.example.": [foreign]})
+    assert await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1") is None
+    hinted = svcb_record(
+        "_dns.ns9539.example.",
+        1,
+        "cdn.example.",
+        (("alpn", alpn(b"dot")), ("ipv4hint", bytes([127, 0, 0, 1]))),
+    )
+    fetch, _asked = fetcher({"_dns.ns9539.example.": [hinted]})
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is not None
+    assert learned[0] == 853  # §4.3 passes hints through: they vouch for this address
+
+
+async def test_discovery_walks_past_a_bad_higher_priority_candidate():
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record(
+                "_dns.ns9539.example.",
+                1,
+                "ns9539.example.",
+                (("alpn", alpn(b"dot")), ("port", port_param(6667))),
+            ),
+            svcb_record("_dns.ns9539.example.", 2, "ns9539.example.", (("alpn", alpn(b"dot")),)),
+        ]
+    }
+    fetch, _asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is not None
+    assert learned[0] == 853  # §3 step 4's order: the first usable wins
+
+
+async def test_discovery_follows_the_spec_s_own_alias_example_once():
+    """§7's last example: ns.example's service configuration published at
+    another domain -- alias to _dns.ns.nic.example, where the real record
+    lives. One hop, the alias target verbatim (§2.4.2 step 3, "without
+    additional prefixes"), and the binding re-derived from the new name."""
+    pages = {
+        "_dns.ns.example.": [svcb_record("_dns.ns.example.", 0, "_dns.ns.nic.example.")],
+        "_dns.ns.nic.example.": [
+            svcb_record(
+                "_dns.ns.nic.example.",
+                1,
+                "ns.nic.example.",
+                (("alpn", alpn(b"dot")), ("port", port_param(443))),
+            )
+        ],
+    }
+    fetch, asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns.example", "127.0.0.1")
+    assert learned is not None
+    assert learned[0] == 443
+    assert asked == ["_dns.ns.example.", "_dns.ns.nic.example."]
+
+
+async def test_discovery_alias_loop_is_capped():  # §2.4.2¶10's MUST
+    pages = {
+        "_dns.a.example.": [svcb_record("_dns.a.example.", 0, "_dns.b.example.")],
+        "_dns.b.example.": [svcb_record("_dns.b.example.", 0, "_dns.a.example.")],
+    }
+    fetch, asked = fetcher(pages)
+    assert await learn_dot_endpoint(fetch, "a.example", "127.0.0.1") is None
+    assert len(asked) <= MAX_ALIAS_HOPS + 2  # bounded, and bounded loudly short
+
+
+async def test_discovery_ttl_is_the_answer_s_smallest():
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record(
+                "_dns.ns9539.example.", 1, "ns9539.example.", (("alpn", alpn(b"dot")),), ttl=3600
+            ),
+            svcb_record(
+                "_dns.ns9539.example.", 2, "ns9539.example.", (("alpn", alpn(b"dot")),), ttl=100
+            ),
+        ]
+    }
+    fetch, _asked = fetcher(pages)
+    learned = await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1")
+    assert learned is not None
+    assert learned[1] == 100
+
+
+async def test_discovery_unparseable_rdata_is_simply_not_an_endpoint():
+    junk = DnsRecord(
+        DomainName("_dns.ns9539.example."), DnsRType.SVCB, DnsRClass.IN, 60, rdata=b"\x00\x01"
+    )
+    fetch, _asked = fetcher({"_dns.ns9539.example.": [junk]})
+    assert await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1") is None
+
+
+async def test_discovery_root_alias_target_announces_nothing():
+    """A priority-0 record whose TargetName is the root is section 2.5's
+    "this service is not available" announcement -- an answer, not a hop."""
+    pages = {"_dns.ns9539.example.": [svcb_record("_dns.ns9539.example.", 0, ".")]}
+    fetch, _asked = fetcher(pages)
+    assert await learn_dot_endpoint(fetch, "ns9539.example", "127.0.0.1") is None
+
+
+async def test_discovery_naming_rejects_the_unconstructible():
+    from namespy.opportunistic import dns_service_name
+
+    with pytest.raises(ValueError, match="non-empty"):
+        dns_service_name("")
+    with pytest.raises(ValueError, match="outside"):
+        dns_service_name("x.example", 70000)
+
+
+class DiscoveryWalker(RecursiveResolver):
+    """A recursive resolver whose walk is a page table.
+
+    Only ``resolve`` is stood in for -- the seam's memoization, its
+    re-entry guard, and its blind fallbacks are what the tests below
+    watch; the delegation machinery a real discovery walk would exercise
+    is tested whole elsewhere.
+    """
+
+    def __init__(self, pages, **kwargs):
+        super().__init__(opportunistic_dot=True, **kwargs)
+        self.pages = pages
+        self.walks = []  # (qname, whether the guard was raised at the walk)
+
+    async def resolve(self, dns_packet):
+        qname = str(dns_packet.questions[0].name).lower()
+        self.walks.append((qname, self._dot_discovering))
+        if self._dot_discovering:
+            # Re-enter the seam exactly as the §4.6 hook would, from inside
+            # the discovery walk: the guard must answer blind, on the spot,
+            # without a second walk -- that no-recursive-walk is the whole
+            # deadlock story in one line.
+            again = await self._dot_endpoint(None, "127.0.0.1")
+            assert again == self.opportunistic_dot_port
+        records = self.pages.get(qname)
+        if records is None:
+            return None
+        response = Response(
+            ID=dns_packet.ID,
+            QR=DnsQR.RESPONSE,
+            questions=list(dns_packet.questions),
+        )
+        response.answers = list(records)
+        return response
+
+
+def ns_record(name="ns9539.example."):
+    return DnsRecord(DomainName("example."), DnsRType.NS, DnsRClass.IN, 0, rdata=DomainName(name))
+
+
+async def test_seam_learns_the_discovered_port_and_remembers_it():
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record(
+                "_dns.ns9539.example.",
+                1,
+                "ns9539.example.",
+                (("alpn", alpn(b"dot")), ("port", port_param(8530))),
+            )
+        ]
+    }
+    resolver = DiscoveryWalker(pages)
+    port = await resolver._dot_endpoint(ns_record(), "127.0.0.1")
+    assert port == 8530
+    assert resolver.walks == [("_dns.ns9539.example.", True)]  # the guard was raised
+    port = await resolver._dot_endpoint(ns_record(), "127.0.0.1")
+    assert port == 8530
+    assert len(resolver.walks) == 1  # memoized: the second ask walks nothing
+
+
+async def test_seam_miss_is_blind_and_briefly_remembered():
+    resolver = DiscoveryWalker({})
+    port = await resolver._dot_endpoint(ns_record(), "127.0.0.1")
+    assert port == 853  # the blind default, because discovery taught nothing
+    port = await resolver._dot_endpoint(ns_record(), "127.0.0.1")
+    assert port == 853
+    assert len(resolver.walks) == 1  # five minutes of quiet, not one walk per query
+
+
+async def test_seam_memo_is_per_address_as_well_as_per_name():
+    """RFC 9539 §4.2's per-IP discipline, applied to discovery: a hints
+    verdict about 127.0.0.1 says nothing about ::1."""
+    pages = {
+        "_dns.ns9539.example.": [
+            svcb_record(
+                "_dns.ns9539.example.",
+                1,
+                "cdn.example.",
+                (("alpn", alpn(b"dot")), ("ipv4hint", bytes([127, 0, 0, 1]))),
+            )
+        ]
+    }
+    resolver = DiscoveryWalker(pages)
+    v4 = await resolver._dot_endpoint(ns_record(), "127.0.0.1")
+    v6 = await resolver._dot_endpoint(ns_record(), "::1")
+    assert v4 == 853
+    assert v6 == 853
+    assert len(resolver.walks) == 2  # two keys: the hint vouched for one address only
+
+
+async def test_seam_silent_when_discovery_is_off():
+    resolver = DiscoveryWalker({}, opportunistic_discover=False)
+    port = await resolver._dot_endpoint(ns_record(), "127.0.0.1")
+    assert port == 853
+    assert resolver.walks == []  # the policy runs, but blind as RFC 9539 wrote it
+
+
+async def test_seam_blind_for_a_belt_without_a_name():
+    resolver = DiscoveryWalker({})
+    port = await resolver._dot_endpoint(None, "127.0.0.1")
+    assert port == 853
+    assert resolver.walks == []  # no NS name, no _dns question to ask
+
+
+async def test_discovered_port_outranks_the_blind_one(dot):
+    """The seam's answer is what the leg connects to. The blind port in
+    this test is a confirmed-dead one, so the encrypted leg succeeding at
+    all is the proof that the discovered port was used -- and the seam is
+    asked exactly once: at initiation, never while a session rides or a
+    table damps."""
+    dead = await _dead_port()
+    resolver = RacingResolver(dot_port=dead, discovered_port=dot.port, do53_delay=E_WINS_DELAY)
+    try:
+        await resolver.ask()
+        assert dot.connections == 1
+        assert resolver._dot_probe("127.0.0.1").status is ProbeStatus.SUCCESS
+        assert resolver.endpoint_asks == 1
+        await resolver.ask()  # the ride re-asks nobody
+        assert resolver.endpoint_asks == 1
+        assert dot.connections == 1
+    finally:
+        await resolver.dispose()

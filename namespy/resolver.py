@@ -92,7 +92,15 @@ from .enums import DnsQR, DnsQType, DnsRClass, DnsResponseCode, DnsRType, is_dat
 from .minimis import QnameMinimiser
 from .names import DomainName
 from .nsec import collect_proof_records, name_order_key
-from .opportunistic import AuthorityProbe, OpportunisticError, ProbeParams
+from .opportunistic import (
+    DISCOVERY_MAX_S,
+    DISCOVERY_MIN_S,
+    DISCOVERY_MISS_S,
+    AuthorityProbe,
+    OpportunisticError,
+    ProbeParams,
+    learn_dot_endpoint,
+)
 from .packet import (
     EDNS_DO_BIT,
     OPT_RTYPE,
@@ -449,6 +457,14 @@ class Resolver(asyncio.Protocol):
     opportunistic_dot = False
     opportunistic_dot_port = 853
     opportunistic_params = ProbeParams()
+    #: Raised while an RFC 9461 discovery walk owns the loop: the §4.6 hook
+    #: reads it to keep the bootstrap (which resolves SVCB through the very
+    #: authorities whose encryption is being discovered) from recursing
+    #: into itself. The conservative direction -- an unrelated concurrent
+    #: query may ride cleartext for the length of one discovery -- costs
+    #: nothing but a not-yet-encrypted exchange, which is the pre-policy
+    #: behavior everywhere, always correct, occasionally slower.
+    _dot_discovering = False
     _dot_probes: dict
     _dot_locks: dict
     _dot_sessions: dict
@@ -521,8 +537,19 @@ class Resolver(asyncio.Protocol):
         # and a non-default port is not the cleartext half of the (53, 853)
         # pair the policy is written around. The stub never arrives here
         # with the flag on: its forwarded leg names its transport outright.
-        if getattr(self, "opportunistic_dot", False) and port == 53:
-            return await self._query_authority(ip, dns_packet)
+        # While an RFC 9461 discovery walk is in flight the policy is off
+        # for everything, including this walk's own queries: discovery
+        # bootstraps over cleartext -- a nested opportunistic probe could
+        # re-enter the very host lock the initiating leg holds (the _dns
+        # name lives at the same authority), and an attacker who can lie
+        # about _dns records should not be able to steer or stall the
+        # probe that was meant to check them.
+        if (
+            getattr(self, "opportunistic_dot", False)
+            and port == 53
+            and not getattr(self, "_dot_discovering", False)
+        ):
+            return await self._query_authority(ip, dns_packet, nameserver_record)
         return await self._query_do53(ip, dns_packet, port=port)
 
     async def _query_do53(self, ip, dns_packet, port: int = 53):
@@ -1014,6 +1041,18 @@ class Resolver(asyncio.Protocol):
             locks = self._dot_locks = {}
         return locks.setdefault(host, asyncio.Lock())
 
+    async def _dot_endpoint(self, ns_record, host) -> int:  # noqa: ARG002 - seam shape
+        """Which port the encrypted leg targets on X: the discovery seam.
+
+        The base answer is RFC 9539's blind one -- §4.4¶2's 853 -- because
+        a bare :class:`Resolver` does not walk and so has no way to ask
+        ``_dns.<name>`` anything. :class:`RecursiveResolver` overrides
+        this with RFC 9461's discovery; the seam exists so the §4.6
+        policy never has to know which of the two documents fed it a port,
+        and so tests can hand it one directly.
+        """
+        return self.opportunistic_dot_port
+
     def _learning(self) -> set:
         """Strong references to background probes the race left running."""
         learning = getattr(self, "_probes_learning", None)
@@ -1068,7 +1107,7 @@ class Resolver(asyncio.Protocol):
         context.set_alpn_protocols(["dot"])
         return context
 
-    async def _query_authority(self, ip, dns_packet):
+    async def _query_authority(self, ip, dns_packet, ns_record=None):
         """The §4.6 decision, and the §4.6¶5 race when both transports may speak.
 
         The document's bolt-on hooks, expressed in the shapes this resolver
@@ -1116,15 +1155,19 @@ class Resolver(asyncio.Protocol):
         )
         if not dot_wanted:
             return await self._query_do53(ip, dns_packet)  # damped, or policy alone forbade E
+        # The port decision belongs to the initiation, not the race: a query
+        # riding an established session needs no port and must not pay for a
+        # discovery walk, and only _dot_query's initiate branch -- taken
+        # under the per-host lock, after a fresh look at the table -- asks.
+        wire = bytes(dns_packet)
         if not do53_ok:
             try:
-                return await self._dot_query(host, bytes(dns_packet), dns_packet)
+                return await self._dot_query(host, wire, dns_packet, ns_record)
             except OpportunisticError:
                 self.log.debug("resolver_opportunistic_fallback(dst=%s)", host)
                 return await self._query_do53(ip, dns_packet)  # §4.6.5's "and send over Do53"
-        wire = bytes(dns_packet)
         do53_task = asyncio.ensure_future(self._query_do53(ip, dns_packet))
-        dot_task = asyncio.ensure_future(self._dot_query(host, wire, dns_packet))
+        dot_task = asyncio.ensure_future(self._dot_query(host, wire, dns_packet, ns_record))
         answer = None
         finished = set()
         try:
@@ -1172,7 +1215,7 @@ class Resolver(asyncio.Protocol):
             return None
         return task.result()
 
-    async def _dot_query(self, host, wire, query_packet):
+    async def _dot_query(self, host, wire, query_packet, ns_record=None):
         """One query over X's DoT session, building it if the table says to.
 
         Raises :class:`~namespy.opportunistic.OpportunisticError` with the
@@ -1199,7 +1242,15 @@ class Resolver(asyncio.Protocol):
             if session is None:
                 if not probe.may_initiate(loop.time(), params):
                     raise OpportunisticError(f"{host}: initiation not allowed")
-                session = await self._dot_initiate(host, probe, params)
+                # The port is chosen here, under the lock and after the
+                # table has said *initiate*: a second query waiting on this
+                # lock may find the session built and never ask at all, and
+                # a discovery walk while this lock is held cannot re-enter
+                # _dot_query for X -- the query() hook bows out during
+                # discovery (the _dot_discovering flag), which is what
+                # keeps a _dns lookup about X from deadlocking on X.
+                port = await self._dot_endpoint(ns_record, host)
+                session = await self._dot_initiate(host, probe, params, port)
             elif not probe.session_established:
                 # Pending, and we hold the lock: the initiation that set it
                 # is gone (cancelled mid-handshake, its owner's task torn
@@ -1255,7 +1306,7 @@ class Resolver(asyncio.Protocol):
         else:
             session.arm_idle(_idle_seconds(timeout), asyncio.get_running_loop())
 
-    async def _dot_initiate(self, host, probe, params):
+    async def _dot_initiate(self, host, probe, params, port):
         """One §4.6.3 initiation: the marker first, the handshake, then the truth."""
         loop = asyncio.get_running_loop()
         probe.note_initiating(loop.time(), _HANDSHAKE_PENDING)  # §4.6.3¶9
@@ -1267,7 +1318,7 @@ class Resolver(asyncio.Protocol):
                 # section names.
                 asyncio.open_connection(
                     host,
-                    self.opportunistic_dot_port,
+                    port,
                     ssl=self._opportunistic_tls_context(),
                     server_hostname=None,
                 ),
@@ -4086,6 +4137,7 @@ class RecursiveResolver(Resolver):
         dnssec_ok: bool = False,
         trust_anchors=(),
         opportunistic_dot: bool = False,
+        opportunistic_discover: bool = True,
     ):
         """Build a resolver without touching the network.
 
@@ -4188,11 +4240,23 @@ class RecursiveResolver(Resolver):
             opportunistic` is the door). Off by default: §4.1¶1 makes the
             whole exercise OPTIONAL, it puts new egress connections on the
             network, and its privacy dividend is DNSSEC's to confirm.
+        :param opportunistic_discover: when the policy above is on, ask RFC
+            9461's question first -- SVCB at ``_dns.<NS name>`` -- and probe
+            the port the answer names (its own, or the §4.2¶1 default of
+            853) instead of the blind one. On by default with the policy,
+            because the record costs one cached lookup and says which port
+            the operator actually meant; discovery never vetoes encryption,
+            it only retargets the probe, since the unauthenticated record
+            (§9461 §6¶2) proves less than a completed handshake does. Walks
+            made for discovery run cleartext-only, so this can never
+            recurse into itself.
         """
         self.queue: dict[tuple, tuple] = {}
         self.queue_v6: dict[tuple, tuple] = {}
         self._tcp_sessions: dict = {}
         self.opportunistic_dot = bool(opportunistic_dot)
+        self.opportunistic_discover = bool(opportunistic_discover)
+        self._dot_memo: dict = {}
         self.transport_v6 = None
         self._v6_ready = None
         self.log = LOGGER
@@ -4694,6 +4758,67 @@ class RecursiveResolver(Resolver):
             if isinstance(step, Fail):
                 return None
             sent = None
+
+    async def _dot_endpoint(self, ns_record, host) -> int:
+        """The RFC 9461 answer for this authority: probe which port, if any.
+
+        The seam's recursive implementation: consult the memo, and on a
+        miss run :func:`~namespy.opportunistic.learn_dot_endpoint` over a
+        fetcher that walks the ``_dns.<NS name>`` SVCB question through
+        this resolver's own machinery. Three properties the code must keep
+        and each other's reasons:
+
+        * the discovery walk runs while ``_dot_discovering`` is raised, so
+          every query that walk makes -- including one to X itself, since
+          the ``_dns`` name lives at the authority being probed -- goes
+          straight cleartext (the ``query`` hook's gate); no recursion, no
+          host-lock re-entry, and an unusable or forged answer can at
+          worst make the blind probe, never silence encryption (§6¶2's
+          first bullet read as a design rule: the record that arrives over
+          the very channel it describes proves less than the handshake);
+        * the memo is keyed by (name, address) -- RFC 9539 §4.2's "keep
+          this state per IP address", applied to the discovery half of
+          the row -- because a hints-checked verdict about one address of
+          a multihomed NS says nothing about another;
+        * misses are remembered too, briefly: an authority with no ``_dns``
+          record should cost one walk, not one per query.
+        """
+        blind = self.opportunistic_dot_port
+        if not self.opportunistic_discover or self._dot_discovering or ns_record is None:
+            return blind
+        ns_name = ns_record.rdata
+        if not isinstance(ns_name, DomainName):
+            return blind  # a caller seeded the belt with something else: probe blind
+        key = (ns_name.canonical_text, str(host))
+        now = asyncio.get_running_loop().time()
+        remembered = self._dot_memo.get(key)
+        if remembered is not None and remembered[0] > now:
+            return remembered[1]
+
+        async def fetch(qname):
+            probe_query = Query(questions=[DnsQuestion(qname, DnsRType.SVCB)], RD=False)
+            try:
+                response = await self.resolve(probe_query)
+            except Exception as exc:
+                self.log.debug(
+                    "resolver_dot_discovery_failed(qname=%s err=%s)", qname, type(exc).__name__
+                )
+                return None
+            return list(response.answers) if response is not None else None
+
+        self._dot_discovering = True
+        try:
+            learned = await learn_dot_endpoint(fetch, str(ns_name), host)
+        finally:
+            self._dot_discovering = False
+        if learned is None:
+            self._dot_memo[key] = (now + DISCOVERY_MISS_S, blind)
+            self.log.debug("resolver_dot_undiscovered(dst=%s name=%s)", host, ns_name)
+            return blind
+        port, ttl = learned
+        self._dot_memo[key] = (now + min(max(float(ttl), DISCOVERY_MIN_S), DISCOVERY_MAX_S), port)
+        self.log.debug("resolver_dot_discovered(dst=%s name=%s port=%s)", host, ns_name, port)
+        return port
 
     async def resolve(self, dns_packet):
         """Resolve the first question of *dns_packet* iteratively.

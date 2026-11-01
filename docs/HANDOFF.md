@@ -1958,6 +1958,86 @@ leg and 7858); (3) DoQ (9250) stays deferred on the `aioquic`-sized
 conversation, blocking §4.4's second SHOULD and this row's third
 transport.
 
+### Follow-up: the walker asks the authority where its TLS lives (RFC 9461)
+
+Increment F, completing the transport track's last row: the SVCB
+discovery that upgrades RFC 9539's blind probe. `--dot-authority` now
+resolves `SVCB` at `_dns.<NS name>` (Port Prefix Naming, 9461 §3, with
+§3.1's `_9953._dns....` form constructed too) before its first TLS
+attempt to an address, and probes the port the answer names -- §4.2¶1's
+853 when the record states none.
+
+`learn_dot_endpoint` in `namespy/opportunistic.py` is the whole §9460 §3
+procedure over a supplied fetch callable -- selection through the
+existing `select_records(client_alpn=(b"dot",))`, capped AliasMode
+following (§2.4.2¶10's MUST: five hops, with the spec's own
+`_dns.ns.example -> _dns.ns.nic.example` example as a test), then
+§9461 §4's policy per candidate: alpn must carry `dot` (§4.1); an
+explicit `port` is honored unless it appears on the confusion-risk list
+-- which is where a copied citation and an understood one diverge, and
+this one was re-derived: the first cut was a two-port allowlist that
+rejected 9461's *own §7 example port 8530*, so the rule is now FETCH
+§2.9's bad-ports enumeration (fetched from the living standard, 83
+numbers) with 443 argued back in (FETCH blocks it as a browser HTTP
+alternative; 9461 §4.2¶1 names it DoH's default, and TLS bytes belong at
+a TLS port) and 53 left out (encrypted bytes at a cleartext server is
+this whole document's confusion); a foreign TargetName survives only when
+an ipv4/ipv6hint vouches for the very address being probed (§4.3, §6¶3's
+self-target steer); root targets mean the binding itself (§2.5). The
+verdict memo lives on RecursiveResolver keyed by **(name, address)** --
+§9539 §4.2's per-IP discipline applied to discovery, because a hints
+verdict about one address of a multihomed NS says nothing about
+another -- sized by the answer's minimum TTL clamped to [60, 86400],
+misses remembered five minutes so a silent authority costs one walk and
+not one per query.
+
+Two standing rules of the composition are worth the reason, not just the
+rule. **Discovery never vetoes:** every unusable outcome -- NODATA,
+incompatible, alias exhaustion -- retargets the probe to blind 853
+rather than silencing encryption, because the record arrives over the
+very channel it describes (§6¶2's first bullet concedes this explicitly)
+and a forged answer must not be able to force cleartext; only the
+handshake itself proves a port. And **the discovery walk bootstraps over
+cleartext:** a guard flag (`_dot_discovering`) bows the §4.6 hook out of
+the way for its duration, which both bounds the recursion (a nested
+opportunistic probe would spawn its own discovery, whose walk spawns
+...) and forecloses a concrete deadlock -- the `_dns` name is served by
+the very authority whose lock the initiating leg holds while it asks.
+The flag's conservative direction -- a concurrent unrelated query may
+ride cleartext for the length of one discovery -- costs only a slower
+exchange, never a wrong one. The port question moved to where it belongs
+for all this: inside `_dot_query`'s initiate branch, under the host lock
+and after the table has said *initiate* -- a riding query never pays for
+a discovery walk, and a test (`endpoint_asks`) pins that the seam is
+consulted exactly once per fresh session.
+
+**Verified**: 1550 passed, 1 skipped (+21: 15 pure-policy -- default and
+explicit ports honored, 6667 declined whole-record, DoH-only records
+incompatible, foreign targets gated on hints, priority order walked
+past a bad first choice, the spec's alias example followed once, loops
+capped, TTL taken smallest, unparseable RDATA ignored, root-alias
+silence, naming validation -- and 6 seam tests on a page-table
+RecursiveResolver: memoized hit and miss, per-address keying, the
+discover=False knob, mid-walk re-entry answered blind without a second
+walk, plus the socket-level proof that a discovered port outranks a
+confirmed-dead blind one). Two real findings on the way: `labels()`
+yields wire bytes, so `str(label)` was comparing `b"'_dns'"` forever
+(until a shared `_label_text` decoder said so in one place), and the
+allowlist-versus-FETCH-list mistake above, caught by a test written from
+the spec's own example rather than from the implementation.
+`ruff`/`format`/`mypy` clean, coverage 91.25% (opportunistic.py 94%).
+Roadmap: the 9539/9460/9461 row 🟡 → ✅, with DoQ, resumption, and
+padding left as the cited carve-outs.
+
+**Next, in order**: (1) the earlier list as it fits -- 6841, 9824, 10001,
+8509/9535, 9364/9904/9905/9906, IDNA, 9471, 8145 §5 (padding would serve
+the opportunistic leg and 7858 alike); (2) DoQ (9250) stays deferred on
+the `aioquic`-sized conversation -- it is now the only missing transport
+in three documents' worth of transport rows, and it would ride the same
+probe table as a second E; (3) the authority leg's DoH answer (a
+dohpath-bearing `_dns` record is already parsed and declined -- wiring
+`namespy/doh.py` to the same seam is the small remainder when wanted).
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

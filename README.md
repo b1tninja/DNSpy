@@ -248,9 +248,10 @@ them change the security properties of anything built on top.
 - **The recursive walk speaks Do53** — UDP with TCP for truncation and
   timeouts, those streams held and reused (RFC 7766 §6.2.1, paced by RFC
   7828's keepalive) rather than opened per query — unless `--dot-authority`
-  opts it into RFC 9539 §4 opportunistic encryption: the walker then probes
-  DNS over TLS to port 853 of each authority, races it against cleartext
-  while the outcome is unknown, and remembers the verdict per address
+  opts it into RFC 9539 §4 opportunistic encryption: the walker then asks
+  each authority's RFC 9461 `_dns` SVCB record for the port to try, probes
+  it with DNS over TLS, races the probe against cleartext while the outcome
+  is unknown, and remembers the verdict per address
   (certificates accepted as they come — the trust here is DNSSEC's, and
   rejecting one would force a cleartext fallback, which is the leak).
   DNS over QUIC (RFC 9250) and
