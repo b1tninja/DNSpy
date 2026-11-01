@@ -2814,6 +2814,45 @@ RFC mentions the technique). What remains on the horizon is unchanged: the relea
 tag (human), DoQ (dependency decision), RFC 5011 (its own row when wanted).
 
 
+### Follow-up: anchors that replace themselves — RFC 5011 (increment Q)
+
+The queue said "its own row when wanted"; the row is written and the module
+shipped with it. RFC 5011 is a small document with one load-bearing sentence —
+§4¶2's "The table is a normative part of this specification" — so `maintenance.py`
+is a faithful transcription of the §4¶3 table and nothing else: six events, six
+states, an injected clock, no sockets. Three transcription decisions are the ones
+to review. (1) **Identity is (algorithm, key material), never the key tag** —
+§2.1¶4's aside that a revoked key "has a different fingerprint" is the whole
+mechanism's trap: flags are inside the digest that produces the tag, so a
+tag-indexed machine watches A revoke, forgets A, and re-adds A from its own
+revocation ceremony. (2) **RevBit runs as its own first pass** over the received
+RRSet — §3¶1's "permanently invalid for all purposes" outranks every other event,
+including §2.2¶2's validator-honesty test, which must therefore see revocations
+taken in the *same* observation (§6.4's compromise scenario is exactly this race,
+and a test drives it with the pending key listed first). (3) **Missing keys stay
+trusted.** §4.2¶4's "remains a valid trust-point key" reads like a leniency and is
+actually §2.1¶1's threat model made operational: if absence demoted an anchor, a
+compromised key B could retire honest key A by simply not listing it. Removal
+from the trust set happens only by self-signed REVOKE, immediately and permanently
+(§2.1¶2), with the hold-down machinery (§2.2¶2's three reset clauses, §2.4.1¶1's
+greater-of) gating only the *addition* direction — and the greater-of is what
+makes §2.4.1¶1's "at least two validated DNSKEY RRSets" a theorem rather than a
+hope, since AddTime can only fire inside an observation, and the first observation
+started the clock. §5 is exposed honestly: ¶1's deletion quantifies over anchors,
+not tracked rows (a pending key is no unrevoked anchor, so an all-revoked point
+with a candidate in flight reads deleted, which is exactly true at that instant),
+and ¶2's 180 days — "a local configuration decision" by its own words — ships as
+a predicate, not an action. §2.3's cadence formulas ship too (both MAX/MIN pairs,
+floors and ceilings tested) because the operator's cron has to compute them
+somewhere even though this module will not run itself. The managed-key document
+round-trips state and timers (format ours — the document specifies none, and JSON
+keeps the zero-dependency promise); §2.2¶4's until-explicitly-revoked promise does
+not survive a restart without it. 19 tests, full suite 1742 passed, 1 skipped.
+Not done, deliberately: no scheduler (the 8509 row's cron story stands), and no
+resolver fetch wiring — observe()'s contract is that the caller is the validation
+walk, and a deployment decides where its anchor fetches come from.
+
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

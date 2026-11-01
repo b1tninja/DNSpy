@@ -8,6 +8,38 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **RFC 5011: trust anchors that replace themselves — the managed-key state
+  machine shipped.** The rollover rows kept saying the acquisition story ended
+  at *fetching*; it now ends at *maintaining*. `namespy/maintenance.py` is
+  §4's state table as written — §4¶2 calls the table normative outright — with
+  §4.1's six events driving Start/AddPend/Valid/Missing/Revoked/Removed over an
+  injected clock. The details the document fights over are the ones pinned:
+  §3¶1's REVOKE bit (already the codec's `is_revoked`, and nothing had ever
+  consumed it) now demands §4.1¶6's self-signature as well, in a pass of its
+  own so no receive order can outrank "permanently invalid"; keys are tracked
+  by (algorithm, key material) because §2.1¶4 warns that revoking a key
+  changes its fingerprint — a tag-indexed machine would watch every revocation
+  resurrect the key it had just killed; §2.2¶2's hold-down remembers *which*
+  keys validated the RRSet that introduced a candidate and resets the timer on
+  the candidate's absence or on all-those-validators being revoked; §2.4.1¶1's
+  greater-of (30 days or the first RRSet's original TTL) enforces what the
+  paragraph states as its purpose — at least two validated RRSets spanning the
+  hold-down — while a Missing key stays trusted, because §2.1¶1's whole threat
+  model is that absence is not revocation, and Removed stays terminal, because
+  §4.2¶6 is the holding pen for exactly the bad practice of reuse. §5¶1's
+  deleted trust point is decided over *anchors*, not tracked rows (a pending
+  key is no unrevoked anchor); §5¶2's 180-day deletion of a subordinate point
+  is a predicate, since the paragraph itself calls the decision local. §2.3's
+  two cadence formulas ship as pure functions, and the managed-key document —
+  format ours, the specification fixes none — round-trips states and timers so
+  §2.2¶4's "until explicitly revoked" survives the process boundary it was
+  written to outlast. Declined with reasons: a background scheduler (the 8509
+  row's cron story stands; this is the body the cron calls) and resolver-side
+  fetch wiring. 19 tests in `tests/test_trust_maintenance.py` replay §6's
+  scenarios — §6.3's full rollover end to end — at injected-clock speed,
+  including the case where a revocation and a pending addition arrive in the
+  same observation and the addition must die against it.
+
 - **RFC 9905 and RFC 9906 landed — the algorithms DNSSEC deprecated after
   the table was set, and the state they name.** RFC 9904 says what a
   validator must be able to *compute*; these two November-2025 standards say

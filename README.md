@@ -164,7 +164,11 @@ them change the security properties of anything built on top.
   `root-key-sentinel-is-ta-20326.` is answered only if tag 20326 is in the
   trust store *right now*, refusal-as-SERVFAIL otherwise —
   `namespy.anchors` holds the arithmetic, `DnsServer` the table); nothing
-  re-fetches on a schedule, which stays an operator's cron-shaped decision,
+  re-fetches on a schedule, which stays an operator's cron-shaped decision —
+  though the cron now has an RFC 5011 body to call: `namespy.maintenance` runs
+  the managed-key state machine, hold-down-gated additions and immediate,
+  self-signed revocations included, so anchors replace themselves instead of
+  outliving their keys —
   and the walk cannot yet speak
   to DNS-over-QUIC servers at all. With no anchors configured nothing is
   verified, and answers
