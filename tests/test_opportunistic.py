@@ -36,9 +36,20 @@ from namespy.resolver import Resolver
 
 QNAME = DomainName("ninefivesixthree.example.")
 
-#: Table 1 scaled to test speed: persistence and damping the formulas
-#: compare against shrink to seconds, so a test can watch one expire.
-FAST = ProbeParams(persistence=30.0, damping=30.0, timeout=0.4)
+#: Table 1 scaled to test speed: persistence and damping shrink to seconds
+#: so a test can watch one expire. The handshake timeout is NOT shrunk much
+#: -- 2 s is already a tenth of the documented default -- because a loaded
+#: CI runner's loopback TLS is slower than an idle laptop's, and a
+#: correctness assert must never race a timeout that is only there to bound
+#: the wait. Tests assert the damping that follows a timeout, not the
+#: timeout's speed.
+FAST = ProbeParams(persistence=30.0, damping=30.0, timeout=2.0)
+
+#: The cleartext half's deliberate slowness in tests that expect the
+#: encrypted leg to win the race: the handshake measures in milliseconds,
+#: and this measures in multiples of them, so the winner is the policy's
+#: doing and not the runner's load.
+E_WINS_DELAY = 0.3
 
 
 def make_query(packet_id=0x9539):
@@ -198,14 +209,26 @@ class RacingResolver(Resolver):
             await asyncio.gather(*learners, return_exceptions=True)
 
     async def dispose(self):
-        """Settle the learners, then close every stream this resolver holds.
+        """Retire the learners, then close every stream this resolver holds.
 
         Fixture teardown depends on it: a DoT fixture ``stop()`` waits for
         its connection handlers, and those handlers wait for the client to
         hang up -- a deadlock inside one event loop if the client never
         puts its streams down.
+
+        The learners go *first*: cancelling is honest here -- a §4.6¶5
+        background initiation exists to inform future queries, and a
+        disposing resolver has no future to inform -- but the cancellation
+        must be awaited. A still-pending ``open_connection`` cancelled
+        without a wait leaves the kernel-side connect half-open: the server
+        accepts it, counts it, and a test that counts connections wakes up
+        to a number that grew after it stopped looking.
         """
-        await self.settle()
+        while getattr(self, "_probes_learning", None):
+            learners = list(self._probes_learning)
+            for task in learners:
+                task.cancel()
+            await asyncio.gather(*learners, return_exceptions=True)
         self._close_tcp_sessions()
 
 
@@ -276,7 +299,13 @@ class WrongIdDotServer(DotServer):
 
 
 class SinkServer:
-    """Accepts connections and never finishes the handshake: a filtered port."""
+    """Accepts connections and never finishes the handshake: a stalled port.
+
+    (A *filtered* port would answer nothing at all, SYN dropped into a
+    black hole; this fixture holds the connection open instead, which is
+    the stall shape. The §4.6.3¶4 timeout verdict arrives for either, and
+    the damping that follows does not ask which.)
+    """
 
     def __init__(self):
         self.connections = 0
@@ -372,7 +401,7 @@ async def _dead_port():
 
 
 async def test_first_query_races_both_and_encryption_wins(dot):
-    resolver = RacingResolver(dot_port=dot.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=dot.port, do53_delay=E_WINS_DELAY)
     try:
         answer = await resolver.ask()
         assert answer is not None
@@ -387,7 +416,7 @@ async def test_first_query_races_both_and_encryption_wins(dot):
 
 
 async def test_success_silences_cleartext_for_the_next_query(dot):
-    resolver = RacingResolver(dot_port=dot.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=dot.port, do53_delay=E_WINS_DELAY)
     try:
         await resolver.ask()
         await resolver.ask()
@@ -402,7 +431,7 @@ async def test_the_handshake_carries_no_sni_and_offers_alpn_dot():
     cert, key = _cert_paths()
     server = SnoopingDotServer(cert, key)
     await server.start()
-    resolver = RacingResolver(dot_port=server.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=server.port, do53_delay=E_WINS_DELAY)
     try:
         await resolver.ask()
         # §4.6.3.3¶4: nothing on the wire to correlate to a name; §4.4¶2:
@@ -417,7 +446,7 @@ async def test_a_self_signed_authority_certificate_is_accepted(dot):
     """§4.6.3.4's MUST, demonstrated by construction: this fixture's
     certificate is trusted by nothing, and a verifying handshake would have
     raised instead of resolving."""
-    resolver = RacingResolver(dot_port=dot.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=dot.port, do53_delay=E_WINS_DELAY)
     try:
         await resolver.ask()
         assert resolver._dot_probe("127.0.0.1").status is ProbeStatus.SUCCESS
@@ -456,7 +485,7 @@ async def test_a_stalled_handshake_loses_the_race_but_keeps_learning():
     try:
         answer = await resolver.ask()
         assert answer is not None  # cleartext, while the handshake goes nowhere
-        await resolver.settle()  # E-timeout (0.4 s under FAST) lands in the table
+        await resolver.settle()  # E-timeout (2 s under FAST) lands in the table
         probe = resolver._dot_probe("127.0.0.1")
         assert probe.status is ProbeStatus.TIMEOUT
         # Counted only once the learner has finished: the accept is the
@@ -477,7 +506,7 @@ async def test_a_server_that_drops_the_stream_falls_back_and_retries_promptly():
     cert, key = _cert_paths()
     server = SessionKiller(cert, key)
     await server.start()
-    resolver = RacingResolver(dot_port=server.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=server.port, do53_delay=E_WINS_DELAY)
     try:
         await resolver.ask()  # establishes
         server.kill_sessions()  # the authority gets tired of us
@@ -524,7 +553,7 @@ async def test_keepalive_zero_retires_the_session_without_blame():
     cert, key = _cert_paths()
     server = DotServer(cert, key, keepalive=0)
     await server.start()
-    resolver = RacingResolver(dot_port=server.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=server.port, do53_delay=E_WINS_DELAY)
     try:
         await resolver.ask()
         probe = resolver._dot_probe("127.0.0.1")
@@ -556,7 +585,7 @@ async def test_force_tcp_outranks_the_policy(dot):
 
 
 async def test_aclose_retires_the_encrypted_sessions(dot):
-    resolver = RacingResolver(dot_port=dot.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=dot.port, do53_delay=E_WINS_DELAY)
     await resolver.ask()
     session = resolver._dot_sessions["127.0.0.1"]
     assert not session.closed
@@ -573,7 +602,7 @@ async def test_a_session_that_stops_answering_is_treated_as_failure():
     cert, key = _cert_paths()
     server = OnceDotServer(cert, key)
     await server.start()
-    resolver = RacingResolver(dot_port=server.port, do53_delay=0.05)
+    resolver = RacingResolver(dot_port=server.port, do53_delay=E_WINS_DELAY)
     resolver.query_timeout = 0.3  # the exchange's own clock, shortened to test speed
     try:
         await resolver.ask()  # establishes; the server's one answer is spent
