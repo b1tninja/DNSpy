@@ -1115,6 +1115,22 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Fixed
 
+- **A fifth citation sweep cleared the encrypted-walk prose and caught one
+  phantom — a citation increment P had introduced the same month.** Every
+  section reference in `opportunistic.py` and the transport paths (RFCs 9461,
+  9460, 9539, 8467, 7830) was read against the documents themselves: the
+  §4.1¶1 "incompatible", §4.2¶1/¶3/¶4 port-key, §3¶1 `_dns.` naming, §6¶3
+  self-target, §2.4.2¶10 alias-limit, §2.2¶7/¶8 protocol-choice, §4.4¶2
+  port-853, §4.5¶7 retain-across-restart, §4.6.2¶4 already-processed, and
+  §4.6.8.1 pad-queries claims are all verbatim-correct — including §4.6.8.1,
+  which a depth-limited outline had made look phantom until the section was
+  read whole (the lesson: an outline is an index, not a check). The one defect:
+  the GOST DS digest-type registration cited as "RFC 5933 §4.1.2" in the
+  increment-P policy tables, tests, and handoff — RFC 5933 has no §4.1.2 (§4.1
+  is a worked example); the registration sentence is §4¶1: "The GOST R 34.11-94
+  digest algorithm is denoted in DS RRs by the digest type 3." Three sites
+  corrected to the right paragraph.
+
 - **`--trace` now shows the resolution steps, as they happen.** It never had:
   the flag wrote a Mermaid diagram to `last_resolution.md` and reported the
   file at INFO, which prints for nobody — so the flag the help text (and

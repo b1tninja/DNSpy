@@ -2786,7 +2786,7 @@ RFC 9904's table rather than inside it — §4¶2 of RFC 9905 says outright the
 Implement/Use columns are "not changing" — so the capability table stayed as it was
 and an accept-side policy layer went next to it: four sets in `crypto.py`, one per
 document per record kind, because 9905 deprecates by the DS's **Algorithm** octet and
-9906 by its **Digest Type** (3, the GOST hash as RFC 5933 §4.1.2 denotes it), and confusing the
+9906 by its **Digest Type** (3, the GOST hash as RFC 5933 §4¶1 denotes it), and confusing the
 two fields is the one way to get both documents wrong at once. The DS exclusion is
 unconditional in both documents and lands before any digest arithmetic runs; when
 deprecated records were all the trust point, the link answers the new
@@ -2879,6 +2879,27 @@ says where the diagram went, on stderr, dig-style. 6 new tests, full suite 1748
 passed, 1 skipped, mermaid pins untouched. The citation audit the earlier round
 began still stands as practice (roadmap row 194 stays 🟡): this session has now
 caught phantoms only by sweeping, never by the code failing.
+
+
+### Follow-up: the sweep that caught itself — fifth citation audit (increment S)
+
+The report-driven CLI fix interrupted this sweep; it is finished now, and the
+result is worth stating exactly because it cuts both ways. Cleared against the
+documents themselves (read, not indexed): every section anchor in
+`opportunistic.py` and the authority-leg transport code across RFCs 9461, 9460,
+9539, 8467, 7830 — including the quotations, which match verbatim (§4.1¶1's
+"incompatible", §4.2¶3's SNI sentence, §4.6.2¶4's "already processed", §2.2¶8's
+"does not pursue"), and including **§4.6.8.1**, which a depth-3 outline had made
+look like a phantom before the section itself was read whole. That near-miss is a
+method lesson worth keeping: *an outline is an index, not a check* — the tool's
+section listing truncates, and only the body answers "does this paragraph exist".
+The sweep's one defect was its own most recent prose: increment P had cited the
+GOST DS digest-type registration as "RFC 5933 §4.1.2" — RFC 5933 has no such
+subsection (§4.1 is a worked example); the registration sentence is §4¶1. Fixed
+in crypto.py, the deprecation test, and this file's increment-P section. An audit
+that catches a fault the same session introduced is the argument for row 194
+staying 🟡: prose fresh off a verified document is still prose someone typed from
+memory one paragraph later. Full suite re-run after the docstring edits: green.
 
 
 ### Follow-up: the promises the parser owed — help-text audit, live --trace (increment T)

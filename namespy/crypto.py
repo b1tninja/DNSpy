@@ -192,7 +192,7 @@ RETIRED_SIGNATURE_ALGORITHMS = frozenset({12})
 DEPRECATED_DS_ALGORITHMS = frozenset({5, 7})
 
 #: DS digest types RFC 9906 §2¶1 excludes: GOST R 34.11-94 -- Digest Type 3,
-#: the number RFC 5933 §4.1.2 assigns it ("The GOST R 34.11-94 digest algorithm
+#: the number RFC 5933 §4¶1 assigns it ("The GOST R 34.11-94 digest algorithm
 #: is denoted in DS RRs by the digest type 3") -- and RFC 9906 §2¶1's orders:
 #: "MUST NOT be used when creating Delegation
 #: Signer (DS) records. Validating resolvers MUST treat GOST R 34.11-94 DS
