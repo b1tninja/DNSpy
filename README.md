@@ -185,11 +185,15 @@ them change the security properties of anything built on top.
   processing" and calls it unauthenticated, so an attacker who can deliver a response
   can deliver an explanation with it. An upstream code is not forwarded to this
   resolver's own client, which §3 leaves to the implementation and this implementation
-  declines. COOKIE (RFC 7873) and
-  Padding (RFC 7830) encode and decode but are not yet *used*: there is no server-side
-  cookie state to validate a reply against — the server only refuses a COOKIE whose
-  length is impossible (§5.2.2) — and RFC 7830 §6 forbids padding over plaintext UDP,
-  which is all this code sends today. MQTYPE (RFC 10029) is answered and, since this round,
+  declines. COOKIE (RFC 7873) encodes and decodes but is not yet *used*:
+  there is no server-side cookie state to validate a reply against — the
+  server only refuses a COOKIE whose length is impossible (§5.2.2). Padding
+  (RFC 7830) is *used* where §6 allows it: queries leaving over an encrypted
+  leg — the stub's DoT and DoH upstreams, the walk's opportunistic DoT under
+  `--dot-authority` — are padded to RFC 8467 §4.1's 128-octet blocks
+  (`--no-query-padding` declines), and the plaintext legs never carry the
+  option whatever the knobs say. The server side stays silent by the same
+  section: its only front is cleartext UDP. MQTYPE (RFC 10029) is answered and, since this round,
   asked as well: both
   option codes compose and parse (`namespy/mqtype.py`), the bundled server refuses every
   malformed MQTYPE-Query §3.3 lists, and given a well-formed one it combines the extra
@@ -270,6 +274,10 @@ them change the security properties of anything built on top.
   is unknown, and remembers the verdict per address
   (certificates accepted as they come — the trust here is DNSSEC's, and
   rejecting one would force a cleartext fallback, which is the leak).
+  Queries leaving over that TLS leg are padded to RFC 8467 §4.1's
+  128-octet blocks (the SHOULD of RFC 9539 §4.6.8.1); the cleartext twin
+  of every race is never padded (RFC 7830 §6), and `--no-query-padding`
+  declines the padding on all encrypted legs.
   DNS over QUIC (RFC 9250) and
   mDNS/DNS-SD (RFC 6762, RFC 6763) are not spoken anywhere. The stub's
   forwarded leg offers more: UDP, TCP, TLS (RFC 7858) and HTTPS

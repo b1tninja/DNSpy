@@ -37,6 +37,17 @@ rules are too long for it and live in :mod:`namespy.mqtype`:
   same option, and DNS over plain UDP is not encrypted, so a UDP responder obeys
   section 6 by *not* padding. The conflict is documented at the point of use in
   :mod:`namespy.server` rather than resolved silently.
+  *How much* to pad is RFC 8467's subject: §4.1's Block-Length Padding is the
+  recommended strategy -- clients pad queries to a multiple of 128 octets
+  (:data:`QUERY_PAD_BLOCK_OCTETS`, §4.1¶2) and servers pad responses to a
+  multiple of 468 (§4.1¶3, which binds only a server with an encrypted front,
+  a thing :mod:`namespy.server` is not). Three mechanical rules ride along:
+  the option MUST be the last one applied before sending (§3¶1); the size is
+  computed on the DNS message, never counting TCP's 2-octet length prefix
+  (§3¶3); and even the zero-length option costs its 4-octet header, which
+  :func:`query_pad_octets` accounts for (§4.1¶5). RFC 9539 §4.6.8.1 quotes
+  this document back at the walk: a DoT client to an authoritative server
+  SHOULD pad, "a reasonable suggestion can be found in [RFC8467]".
 * **ERROR (15)**, RFC 8914. Two octets of INFO-CODE followed by EXTRA-TEXT, and
   the whole option is built to be read by a human: section 2 says the text "is
   intended for human consumption (not automated parsing)", that it "may be null
@@ -105,6 +116,7 @@ __all__ = [
     "MQTYPE_RESPONSE_OPTION_CODE",
     "NSID_OPTION_CODE",
     "PADDING_OPTION_CODE",
+    "QUERY_PAD_BLOCK_OCTETS",
     "EdnsOption",
     "ExtendedDNSError",
     "client_cookie_of",
@@ -124,6 +136,7 @@ __all__ = [
     "option_name",
     "pad_option",
     "parse_options",
+    "query_pad_octets",
     "serialize_options",
     "server_cookie_of",
 ]
@@ -705,6 +718,32 @@ def pad_option(size: int) -> EdnsOption:
     if size < 0:
         raise ValueError(f"padding size cannot be negative: {size}")
     return EdnsOption(PADDING_OPTION_CODE, b"\x00" * size)
+
+
+#: RFC 8467 §4.1¶2's block length for queries: "Clients SHOULD pad queries to
+#: the closest multiple of 128 octets." The response-side block the same
+#: section recommends (§4.1¶3, 468 octets, so that three blocks still fit a
+#: typical MTU per §4.1¶12) is a server's obligation toward padded queries;
+#: a resolver only ever owes the query side of that arithmetic.
+QUERY_PAD_BLOCK_OCTETS = 128
+
+
+def query_pad_octets(message_len: int, block: int = QUERY_PAD_BLOCK_OCTETS) -> int:
+    """Octets of PADDING payload that lift a *message_len* message to a block.
+
+    The arithmetic RFC 8467 asks for, with its two footnotes made code: the
+    option's own 4-octet header is inside the measurement (§4.1¶5, "even the
+    zero-length Padding option increases the length of the packet by 4
+    octets", so a message four short of a boundary is *on* it once the header
+    lands and takes no payload at all), and *message_len* is the DNS message,
+    not the TCP-framed byte count (§3¶3's Transport Protocol Independence --
+    otherwise the same query would pad to different sizes over UDP and TCP
+    and hand an observer the difference).
+
+    Returns the payload size only; the wire growth is this plus the header.
+    :meth:`namespy.packet.DnsPacket.padded_clone` is the caller-facing form.
+    """
+    return (block - (message_len + EDNS_OPTION_HEADER_OCTETS) % block) % block
 
 
 #: How much EXTRA-TEXT a single line of output will carry. RFC 8914 section 3

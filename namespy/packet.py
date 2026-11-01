@@ -27,11 +27,20 @@ raised as one class and caught as the other, so malformed datagrams escaped the
 
 from __future__ import annotations
 
+import copy
 import logging
 import secrets
 import struct
 
-from .edns import EdnsOption, parse_options, serialize_options
+from .edns import (
+    EDNS_OPTION_HEADER_OCTETS,
+    PADDING_OPTION_CODE,
+    EdnsOption,
+    pad_option,
+    parse_options,
+    query_pad_octets,
+    serialize_options,
+)
 from .enums import (
     DnsOpCode,
     DnsQClass,
@@ -623,6 +632,61 @@ class DnsPacket:
             self.additional_records = kept
             self.ARCOUNT = len(kept)
         return removed
+
+    def padded_clone(self, block: int, budget: int | None = None) -> DnsPacket:
+        """A copy of this message whose OPT carries a PADDING option to the block.
+
+        RFC 8467 §4.1's Block-Length Padding applied once, at the codec: the
+        clone's serialized length is the next multiple of *block* (the option
+        header counted per §4.1¶5, the measurement taken on the DNS message
+        and never on a transport frame per §3¶3), and the padding rides
+        *last* among the options -- §3¶1's "the Padding option MUST be the
+        last EDNS(0) option applied before a DNS message is sent", which is
+        why this runs at the egress and not wherever the other options were
+        chosen: everything a caller put on before this call stays ahead of
+        the pad.
+
+        *budget* is the sender's own advertised payload (RFC 7830 §4¶1:
+        "padded DNS messages MUST NOT exceed the number of octets specified
+        in the Requestor's Payload Size field"). A block boundary beyond it
+        is not a rule conflict but a skipped courtesy: the padded message
+        could not be delivered under the size this client said it could
+        reassemble, so the result is the untouched original.
+
+        The original is never mutated -- this is a *clone* because the
+        callers share packets between transports (the opportunistic race
+        hands the same query to cleartext and encrypted legs at once), and
+        RFC 7830 §6 forbids padding on the cleartext half. That is also why
+        no transport test lives here: this method knows sizes; only the
+        egress that calls it knows whether the wire is encrypted.
+
+        Returns ``self`` (no copy) when there is nothing to do: no OPT to
+        carry an option (an unextended exchange per RFC 6891 §7), padding
+        already present from a caller who padded first, or a budget that
+        refuses.
+        """
+        opt = self.opt()
+        if opt is None:
+            return self
+        options = list(self.edns_options())
+        if any(int(o.code) == PADDING_OPTION_CODE for o in options):
+            return self
+        wire = bytes(self)
+        pad_len = query_pad_octets(len(wire), block)
+        if budget is not None and len(wire) + EDNS_OPTION_HEADER_OCTETS + pad_len > budget:
+            return self  # 7830 §4¶1: the advertised size outranks the block
+        clone = copy.copy(self)
+        # add_edns rebinds additional_records with a fresh list, so the clone
+        # cannot reach back into the original's records through it; the
+        # explicit list copy below is belt for that same brace.
+        clone.additional_records = list(self.additional_records)
+        payload_size = max(self.EDNS_MINIMUM_PAYLOAD, int(opt.rclass))
+        version = (int(opt.ttl) >> 16) & 0xFF
+        flags = int(opt.ttl) & 0xFFFF
+        clone.add_edns(
+            payload_size, version=version, flags=flags, options=[*options, pad_option(pad_len)]
+        )
+        return clone
 
     # ---------------------------------------------------------------- output
 

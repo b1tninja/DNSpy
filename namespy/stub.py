@@ -49,7 +49,7 @@ import logging
 import ssl
 
 from .doh import _DohSession, doh_alpn, open_doh_session
-from .edns import keepalive_of, keepalive_option
+from .edns import QUERY_PAD_BLOCK_OCTETS, keepalive_of, keepalive_option
 from .enums import DnsRClass, DnsResponseCode, DnsRType
 from .names import DomainName
 from .packet import EDNS_DO_BIT, DnsRecord, Query
@@ -251,6 +251,7 @@ class StubResolver(Resolver):
         edns_payload_size: int | None = None,
         query_timeout: float | None = None,
         doh_method: str = "POST",
+        query_padding: bool = True,
     ) -> None:
         #: The pending-question tables and transports the inherited send/receive
         #: plumbing writes. Declared here because a stub never runs
@@ -267,6 +268,15 @@ class StubResolver(Resolver):
         if doh_method not in ("POST", "GET"):
             raise ValueError("doh_method is POST or GET (RFC 8484 §4.1's two methods)")
         self.doh_method = doh_method
+        #: RFC 8467 §4.1¶2 query padding for the encrypted upstreams: "Clients
+        #: SHOULD pad queries to the closest multiple of 128 octets." On by
+        #: default because a ``dot`` or ``doh`` upstream is a privacy choice,
+        #: and an unpadded query leaks name lengths to whoever owns the path
+        #: even though the bytes themselves are sealed. The udp and tcp
+        #: transports never see the option whatever this is set to (RFC 7830
+        #: §6): _stream_query, the only reader, serves the encrypted legs
+        #: alone.
+        self.query_padding = bool(query_padding)
         #: Held encrypted-stream sessions (``dot`` and ``doh``), keyed by the
         #: upstream they belong to. One connection per upstream: RFC 7858
         #: §3.4¶1-¶2 asks for exactly this reuse "to avoid excess TCP
@@ -413,6 +423,17 @@ class StubResolver(Resolver):
             )
         if upstream.transport == "doh":
             dns_packet.ID = 0  # RFC 8484 §4.1¶8: HTTP correlates; 0 unifies caches
+        if self.query_padding:
+            # Both transports this method serves are encrypted (§4.1's gate
+            # for RFC 7830 §6 is passed by arrival here), so the clone that
+            # goes on the wire is padded to RFC 8467 §4.1¶2's block, capped
+            # by our own advertised payload (RFC 7830 §4¶1). The DoH GET
+            # method pays for it in URL length, which is the point: the URL
+            # is what the path sees.
+            dns_packet = dns_packet.padded_clone(
+                QUERY_PAD_BLOCK_OCTETS,
+                int(self.edns_payload_size) if self.edns_payload_size else None,
+            )
         wire = bytes(dns_packet)
         for attempt in (1, 2):
             session = self._sessions.get(upstream)

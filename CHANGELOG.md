@@ -8,6 +8,35 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **Padding has a policy now: RFC 8467 §4.1 Block-Length Padding on every
+  encrypted leg.** The option carried a codec and a server-side refusal for
+  two rounds; it now leaves the box. Queries over the stub's `dot` and `doh`
+  upstreams and over the walk's opportunistic DoT leg are padded to the next
+  multiple of **128 octets** (§4.1¶2's client rule — the number RFC 9539
+  §4.6.8.1 points a DoT client at when it says "a reasonable suggestion can
+  be found in [RFC8467]"), with the three mechanical rules as code:
+  `packet.padded_clone` applies the option **last** (§3¶1) at the egress,
+  sizes it from the DNS message and never the TCP frame (§3¶3's worked
+  example, 59→64, is a test), and counts the option's own 4-octet header
+  (§4.1¶5 — a message four short of a boundary takes no payload at all).
+  It is a *clone* because the opportunistic race shares one packet between
+  the cleartext and encrypted halves, and RFC 7830 §6 governs the cleartext
+  wire whatever the knobs say — UDP and TCP legs structurally cannot receive
+  the option. The sender's own advertised payload is the ceiling (§4¶1: the
+  Requestor of a query is us), and a boundary beyond it refuses padding
+  entirely rather than clipping, because half a block anonymizes nothing.
+  **On by default** — an encrypted leg is a privacy choice already made —
+  with `--no-query-padding` (`query_padding=False` on both resolver classes)
+  as the §3¶2 resource-conservation exit. Not done, on purpose: §4.1¶3's
+  468-octet response block (a server's duty, and this server has no
+  encrypted front), §4.2's alternative strategies (§4.1 is the recommended
+  one), and RFC 9250 §5.4's DoQ counterpart, deferred with the transport.
+  `tests/test_padding_policy.py`, 12 tests, including the live-TLS stub leg
+  (padding arrives, after keepalive, last) and the race's untouched cleartext
+  twin.
+
+### Added earlier this round
+
 - **Both families stay in play, and no answer leaves as a fragment: RFC 10001
   §4.2 (BCP 91).** The document is young — published 2026-08, obsoleting
   RFC 3901 — and its §3 is a taxonomy of the way a resolver loses half the
@@ -949,6 +978,22 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 
 ### Fixed
+
+- **A citation audit of the encrypted-walk code cleared most of it and
+  killed two dangles.** The `§4.6.x` references through `opportunistic.py`
+  and `resolver.py` that looked like RFC 9461 phantoms (9461 has no §4.6)
+  are correctly attributed to **RFC 9539** — the published ADoT document
+  (EXPERIMENTAL, 2024-02), whose §4.6.1–§4.6.12 are the probing policy and
+  whose verified errata 7831 and 7832 are exactly the two the docstrings
+  cite; the suspicion was a false alarm and the audit trail is in the
+  handoff. What *was* phantom died: `opportunistic.py`'s "query padding
+  (§4.6.8.1's SHOULD — that is the RFC 8145 section 5 row)" ended a wrong
+  pointer (8145 is edns-key-tag; the padding row is RFC 8467 — the
+  correction this document's H round made elsewhere never reached this
+  sentence), and the handoff's increment-J note cited "RFC 8467 §7's
+  400-octet floor", a section of bibliography and a number the document
+  never wrote; both now say §4.1's 128-octet block, which is what §4.1¶2
+  actually recommends.
 
 - **The truncation-order citation in `resolver.py` pointed at RFC 1035
   §4.3.1 — and RFC 1035 has no §4.3.** That document's §4 (messages) runs

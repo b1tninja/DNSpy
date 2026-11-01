@@ -83,6 +83,7 @@ from .cache import FailureCache, MemoryDnsCache, NegativeEntry, PositiveEntry
 from .dnssec import DNSSEC_SECURITY_TYPES, signed_owner_name
 from .edns import (
     MQTYPE_QUERY_OPTION_CODE,
+    QUERY_PAD_BLOCK_OCTETS,
     extended_error_presentation,
     extended_errors_of,
     keepalive_of,
@@ -371,6 +372,17 @@ class Resolver(asyncio.Protocol):
     #: UDP payload advertised by the EDNS(0) OPT record on every outbound
     #: query (RFC 6891 section 6.2.3); ``0`` or ``None`` sends no OPT at all.
     edns_payload_size = EDNS_PAYLOAD_SIZE
+
+    #: RFC 8467 §4.1¶2 block-length padding for queries leaving over an
+    #: *encrypted* leg (the transport gate is RFC 7830 §6; RFC 9539 §4.6.8.1
+    #: is the sentence that asks a DoT client to authority servers for
+    #: exactly this). On by default because the encrypted legs are the ones
+    #: an operator chose for privacy, and an unpadded DoT query hands the
+    #: name lengths to whoever owns the path anyway; :meth:`...padded_clone`
+    #: skips padding when the block boundary would exceed this client's own
+    #: advertised payload (RFC 7830 §4¶1). Cleartext legs never see the
+    #: option, here or anywhere: §6 says MUST NOT.
+    query_padding = True
 
     #: Whether to set EDNS(0)'s DO bit on outbound queries, asking each server for the DNSSEC
     #: records alongside the answer (RFC 6891 section 6.1.4). Off by default: this package is a
@@ -1190,7 +1202,16 @@ class Resolver(asyncio.Protocol):
         # riding an established session needs no port and must not pay for a
         # discovery walk, and only _dot_query's initiate branch -- taken
         # under the per-host lock, after a fresh look at the table -- asks.
-        wire = bytes(dns_packet)
+        # The wire the encrypted leg carries is padded (RFC 9539 §4.6.8.1's
+        # SHOULD, sized by RFC 8467 §4.1¶2's 128-octet block); the *packet*
+        # stays unpadded, because the cleartext half of the race below reads
+        # it and RFC 7830 §6 forbids the option on that wire.
+        if self.query_padding:
+            wire = bytes(
+                dns_packet.padded_clone(QUERY_PAD_BLOCK_OCTETS, self._advertised_payload(ip))
+            )
+        else:
+            wire = bytes(dns_packet)
         if not do53_ok:
             try:
                 return await self._dot_query(host, wire, dns_packet, ns_record)
@@ -4290,6 +4311,7 @@ class RecursiveResolver(Resolver):
         trust_anchors=(),
         opportunistic_dot: bool = False,
         opportunistic_discover: bool = True,
+        query_padding: bool = True,
     ):
         """Build a resolver without touching the network.
 
@@ -4402,12 +4424,19 @@ class RecursiveResolver(Resolver):
             (§9461 §6¶2) proves less than a completed handshake does. Walks
             made for discovery run cleartext-only, so this can never
             recurse into itself.
+        :param query_padding: pad queries leaving over an *encrypted* leg to
+            RFC 8467 §4.1¶2's 128-octet block (RFC 9539 §4.6.8.1 asks a DoT
+            client to authority servers for exactly this SHOULD). True by
+            default -- the encrypted leg is the privacy choice, and RFC 7830
+            §6 keeps the option off cleartext whatever this is set to; False
+            is the resource-conservation exit of RFC 8467 §3¶2.
         """
         self.queue: dict[tuple, tuple] = {}
         self.queue_v6: dict[tuple, tuple] = {}
         self._tcp_sessions: dict = {}
         self.opportunistic_dot = bool(opportunistic_dot)
         self.opportunistic_discover = bool(opportunistic_discover)
+        self.query_padding = bool(query_padding)
         self._dot_memo: dict = {}
         self.transport_v6 = None
         self._v6_ready = None

@@ -50,9 +50,12 @@ resumption (§4.6.3.2's SHOULD -- asyncio's client API offers no way to
 present a saved ticket, so the ``resumptions`` field of Table 2 stays
 permanently empty rather than pretending), early data (§4.6.3.1, a SHOULD
 conditional on a context this build cannot create without resumption),
-query padding (§4.6.8.1's SHOULD -- that is the RFC 8145 section 5 row),
 and DoQ (§4.4's second SHOULD -- no stdlib QUIC, the same deferral the
-stub's transport list records). §4.5¶7's "retain across restart" is vacuous
+stub's transport list records; its §5.4 padding counterpart in RFC 9250
+defers with it). Query padding (§4.6.8.1's SHOULD) *is* exercised: the
+encrypted egress pads per RFC 8467 §4.1's 128-octet block
+(:attr:`namespy.resolver.Resolver.query_padding`). §4.5¶7's "retain across
+restart" is vacuous
 for a library: the table lives in the resolver object, and the process
 that ended took the knowledge with it; a daemon that wants restart
 persistence owns a serializer this module pointedly does not.

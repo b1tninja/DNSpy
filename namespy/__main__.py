@@ -619,6 +619,16 @@ def build_parser():
         " --dnssec validation does not already cover. Incompatible with --forward.",
     )
     p.add_argument(
+        "--no-query-padding",
+        dest="no_query_padding",
+        action="store_true",
+        help="stop padding queries that leave over an encrypted leg (RFC 8467 §4.1's"
+        " 128-octet block, the SHOULD RFC 9539 §4.6.8.1 points a DoT client at):"
+        " message sizes go back to what the name alone costs, the trade RFC 8467"
+        " §3¶2 permits where bytes matter more than size anonymity. Cleartext legs"
+        " never pad whatever this flag says -- RFC 7830 §6 forbids it there.",
+    )
+    p.add_argument(
         "--forward",
         action="append",
         metavar="UPSTREAM",
@@ -958,6 +968,7 @@ async def cli_query(args) -> int:
             serve_stale=args.serve_stale,
             trust_anchors=anchors,
             opportunistic_dot=args.dot_authority,
+            query_padding=not args.no_query_padding,
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -1058,6 +1069,7 @@ async def cli_stub(args) -> int:
             upstreams,
             dnssec_ok=args.dnssec,
             edns_payload_size=0 if args.no_edns else EDNS_PAYLOAD_SIZE,
+            query_padding=not args.no_query_padding,
         ),
         local_addr=("0.0.0.0", 0),
     )
@@ -1118,6 +1130,7 @@ async def serve(args) -> int:
                 serve_stale=args.serve_stale,
                 trust_anchors=anchors,
                 opportunistic_dot=args.dot_authority,
+                query_padding=not args.no_query_padding,
             ),
             local_addr=("0.0.0.0", 0),
         )

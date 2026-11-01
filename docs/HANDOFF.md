@@ -2420,12 +2420,103 @@ named); README's truncation sentence grew a server side; CHANGELOG carries
 the increment and the §4.3.1 phantom-section correction.
 
 **Next, in order**: (1) RFC 8467 padding for the encrypted legs (row 95's
-condition met -- the codec `edns.padding_option` exists, the policy does
-not; the client rule is §7's 400-octet floor and 7830 §6 already keeps the
-server silent on plaintext); (2) RFC 9471 §3 server-side glue completeness
-(row 181 ⬜, small); (3) 8509/9535 anchor maintenance (row 157 🟡); (4) DoQ
-(9250) deferred as ever on the `aioquic`-sized conversation; (5) the
-authority-leg DoH answer, same small remainder as before.
+condition met -- the codec `edns.pad_option` exists, the policy does
+not; the client rule is §4.1¶2's 128-octet query block -- an earlier
+draft of this very sentence cited "§7's 400-octet floor", which is a
+section of bibliography and a number nobody wrote, caught the same way
+the F.0 phantom was, by opening the document before quoting it --
+and 7830 §6 already keeps the server silent on plaintext); (2) RFC 9471
+§3 server-side glue completeness (row 181 ⬜, small); (3) 8509/9535
+anchor maintenance (row 157 🟡); (4) DoQ (9250) deferred as ever on the
+`aioquic`-sized conversation; (5) the authority-leg DoH answer, same
+small remainder as before.
+
+### Follow-up: the size of the thing on the wire — RFC 8467 padding policy (increment K)
+
+The padding option has had a codec since the EDNS round and a refusal
+since the server round; it now has a policy, and the policy has a
+number. **RFC 8467 §4.1's Block-Length Padding** ships: queries leave
+over encrypted legs padded to the next multiple of **128 octets**
+(§4.1¶2), which is the strategy the document recommends and the one the
+walk's own charter points at -- **RFC 9539 §4.6.8.1** tells the DoT
+client to authority servers that it "SHOULD use EDNS0 padding
+[RFC7830]... a reasonable suggestion can be found in [RFC8467]". Three
+mechanical rules were made code rather than memory: the option is
+applied **last** (§3¶1) at the egress, which is where a clone can see
+every option the caller already chose; the size is computed on the DNS
+message, never the TCP frame (§3¶3's Transport Protocol Independence,
+whose worked example -- 59 octets over UDP, not 61 -- is now a test);
+and the 4-octet option header is inside the arithmetic (§4.1¶5's
+zero-length option still costs 4 octets, so a message four short of a
+boundary takes no payload at all).
+
+**The gate is the transport, not the taste.** RFC 7830 §6's MUST NOT
+over unencrypted transport is why `padded_clone` is a *clone*: the
+opportunistic race hands one packet to cleartext and encrypted legs at
+once, and the two wires must differ. The encrypted legs are
+`_query_authority`'s DoT wire on the walk and `StubResolver._stream_query`
+(both `dot` and `doh` pass through it, which is why one live-TLS test
+covers the placement for both); the UDP and TCP legs cannot receive the
+option whatever the knobs say. **RFC 7830 §4¶1's ceiling** -- padded
+messages MUST NOT exceed the Requestor's Payload Size -- is read as the
+sender's own advertisement (on a query, the Requestor is us), and a
+boundary beyond it refuses padding entirely rather than clipping to
+size, because §4.1's promise is a multiple and half a block anonymizes
+nothing.
+
+**On by default**, with `--no-query-padding` (constructor
+`query_padding=False` on both resolver classes) as the RFC 8467 §3¶2
+resource-conservation exit. The reasoning: an encrypted leg is a
+privacy choice already made, the SHOULDs are written to clients that
+made it, and the cost is bounded -- 128-octet blocks, the sender's
+advertisement as ceiling, and a server's §4¶2 duty to pad the reply
+back only where its own limits allow.
+
+**A false alarm, logged because the audit that produced it was still
+worth running.** Opening this increment, the `§4.6.x` citations through
+`opportunistic.py` looked phantom -- RFC 9461 has no §4.6 -- and the
+ADoT draft was cast as their culprit. It is not. **RFC 9539**
+(Unilateral Opportunistic Deployment of Encrypted Recursive-to-
+Authoritative DNS, EXPERIMENTAL, 2024-02) *is* the published ADoT
+document, its §4.6.1-§4.6.12 are the probing policy the module
+implements, and its errata are *exactly* the verified 7831 and 7832 the
+docstrings cite. Every such citation in `opportunistic.py` and
+`resolver.py` is attributed correctly to 9539; the ones naming 9461
+(_dns mapping, port defaults, discovery limits) are correctly 9461's.
+Two dangles were real, and both died: "that is the RFC 8145 section 5
+row" (8145 is edns-key-tag; the padding row is 8467 -- increment H's
+correction that never reached this sentence) and increment J's
+"§7 400-octet floor" above, corrected in place. Lesson kept: the audit
+procedure (open the document, read the section) is just as load-bearing
+when it clears a suspicion as when it confirms one.
+
+**Declined with the documents open in hand**: §4.2's alternative
+strategies (random block sizes and the rest -- §4.1 is the recommended
+one, and two policies on one wire buy an observer variance, not
+anonymity); the **468-octet response block** (§4.1¶3) -- a server's
+duty toward padded queries, and `namespy.server` has only cleartext
+fronts, where §6 forbids the option arriving or leaving; DoQ's padding
+counterpart (RFC 9250 §5.4, deferred with the whole transport); and the
+server replying to a padded query with padding of its own over plaintext
+(7830 §6 again -- the existing `test_padding_asked_for_over_plain_udp_
+is_not_honoured` remains the right behavior and now has neighbors).
+
+**Verified**: 1678 passed, 1 skipped (+12, all in `test_padding_policy.py`:
+the §3¶3 worked example, the §4.1¶5 zero case, last-option ordering,
+the §4¶1 budget refusal, the walk's padded wire and its untouched
+cleartext twin, live-TLS stub ordering, UDP's permanent silence, the
+CLI flag both ways). `ruff`/`format`/`mypy` clean, coverage 91.4%.
+Roadmap row 95 ▫️→✅ (the row-83 rationale grew legs honest: plaintext
+UDP is no longer "every transport here"); README's "not yet *used*"
+sentence rewritten; `opportunistic.py`'s not-yet-exercised list lost its
+padding item and its 8145 tail.
+
+**Next, in order**: (1) RFC 9471 §3 server-side glue completeness
+(row 181 ⬜, small); (2) 8509/9535 anchor maintenance (row 157 🟡);
+(3) DoQ (9250) deferred as ever -- and it inherits this increment: its
+§5.4 padding guidance rides the same `query_padding` decision whenever
+the transport lands; (4) the authority-leg DoH answer, same small
+remainder as before.
 
 ## Previous round: MQTYPE (RFC 10029)
 
