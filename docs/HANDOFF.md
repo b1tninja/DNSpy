@@ -3189,6 +3189,28 @@ pinned, CLI guard. Full suite after: 1866 passed, 1 skipped; mypy, ruff
 check, ruff format clean. Next: U9 (the blocklist client — it consumes
 exactly the vocabulary X emitted and Y logged), then the U6 campaign.
 
+### Sixth citation sweep (post-X, post-Y): zero misses
+
+Every external quote the last two increments wrote was re-checked against
+the RFC Editor text, whitespace-normalized, fragment by fragment: ten
+RFC 8914 sentences and clauses (§4.16, §4.17 ×2, §4.18 ×3, §4.19, §2's
+pairing sentence, §3's EXTRA-TEXT advice), §4.4's sentence again from the
+stale-code fix, six code-to-section headings (15→4.16 … 18→4.19, 3→4.4,
+2→4.3), RFC 5452 §4.2 (which is literally "Matching the Question Section"
+— the test header's and CHANGELOG's citation is the right section, and
+§4.3 "Matching the ID Field" backs the `id` field), and RFC 6891 §7's
+mirror sentence. All seventeen 8914 checks and both others: pass — the
+first sweep in a while with nothing to report. Internal quotes verified
+against their sources too ("never emit output the operator did not ask
+for" is server.py's first rule, and the trace's "indistinguishable from
+a cache answer" is trace.py's own comment). Polish found and fixed: one
+roadmap table cell wearing rst-style double backticks; and two suspected
+problems that were not — querylog's docstring `` \\n `` renders its
+literal backslash-n correctly, and `namespy/__init__.py` deliberately
+re-exports no server surface at all (checked: `DnsServer` and V's
+responder types live at module paths too), so X/Y's unexported modules
+are house policy, not an oversight.
+
 
 ## Previous round: MQTYPE (RFC 10029)
 
