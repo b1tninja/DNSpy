@@ -1311,6 +1311,20 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Fixed
 
+- **Two phantom RFC 1035 quotations, retired.** `RData_TXT`'s docstring
+  quoted section 3.3.14 as saying a string over 255 characters "may be
+  represented by multiple <character-string>s" — no such sentence is in
+  RFC 1035; the docstring now quotes the two sentences that do exist
+  (section 3.3's "up to 256 characters in length (including the length
+  octet)" cap and section 3.3.14's "One or more <character-string>s")
+  and names the split as their composition, which is what it is. The
+  blocklist module's first draft drafted its own new phantom (a section
+  3.5 sentence about hosts "desiring inclusion" that exists nowhere in
+  the RFC) and was corrected against the live text before landing; the
+  docstring now carries section 3.5's real words, including "The
+  reversal, though awkward to read, allows zones to be delegated which
+  are exactly one network of address space." No behavior changed; the
+  wire never knew what its docstrings claimed.
 - **Two documentation-hygiene strays, found while running the definition-of-done
   checklist against increments X and Y.** `SECURITY.md` named
   `namespy.server.Server`, a class that has never existed in the package (the

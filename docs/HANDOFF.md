@@ -3275,6 +3275,29 @@ remaining rows are the two campaigns, U6 (zones, AXFR — and the Catalog
 Zone transport that X's filter rules would want) and U7 (mDNS/DNS-SD,
 with its two open errata to check at implement time).
 
+The prose check on this round's own text caught two sentences wearing
+quotation marks that the RFCs do not contain. The module's first draft
+quoted 1035 §3.5 as saying hosts "desire to be included" in the reverse
+tree — no such sentence is anywhere in RFC 1035 (the string appears
+once, in §1, meaning something else); §3.5's real words are now the
+quote, and they are better: the four-labels-one-octet rule, the
+10.2.0.52 → 52.0.2.10 example, and "The reversal, though awkward to
+read, allows zones to be delegated which are exactly one network of
+address space." The second is older: `RData_TXT`'s docstring had been
+quoting §3.3.14 as saying a long string "may be represented by multiple
+<character-string>s" — that sentence does not exist either; what the
+RFC does say, verbatim, is §3.3's cap ("up to 256 characters in length
+(including the length octet)") and §3.3.14's TXT-DATA being "One or
+more <character-string>s", from which the split follows as a
+composition, not a quotation. Six sweeps had found nothing to fix;
+this one found a phantom that was born mid-increment and one that had
+outlived six sweeps' rosters because no roster ever named it — a
+reminder that the sweep checks the sentences it is told to check, and
+the ones nobody lists are exactly where the ghost sentences live.
+The habit to keep: a sentence that sounds RFC-shaped is presumed
+ghost until it is found, and paraphrase without quotation marks is
+always the safer costume.
+
 
 ## Previous round: MQTYPE (RFC 10029)
 

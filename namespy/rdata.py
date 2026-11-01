@@ -648,8 +648,13 @@ class RData_TXT(RData):
     """``TXT`` RDATA -- one or more ``<character-string>``s (RFC 1035 section 3.3.14).
 
     Each string is a length octet plus up to 255 octets, so a longer value *must*
-    be split across several strings: RFC 1035 section 3.3.14 says a string over
-    255 characters "may be represented by multiple <character-string>s".
+    be split across several strings -- the composition of two sentences that are
+    actually in RFC 1035: section 3.3 caps a ``<character-string>`` at "up to 256
+    characters in length (including the length octet)", and section 3.3.14 makes
+    TXT-DATA "One or more <character-string>s". Neither sentence says the split
+    out loud in so many words; an earlier draft of this docstring quoted a
+    sentence that sounds like it and is not in the RFC, which is the mistake
+    this project keeps sweeping for.
     :func:`split_charstrings` does that and :attr:`text` re-joins them, which is
     what a reader of SPF/DKIM/DMARC values wants. The split stays visible because
     re-joining and then re-splitting at a different boundary is not a no-op on the

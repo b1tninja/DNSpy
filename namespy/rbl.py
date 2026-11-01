@@ -1,10 +1,15 @@
 """The blocklist client's arithmetic: names, codes, and a verdict.
 
 The mechanics are RFCs. RFC 1035 section 3.5 lays out the reverse tree:
-"hosts which desire to be included ... should have a domain name
-corresponding to their 32-bit Internet address" written with the octets
-reversed under ``in-addr.arpa``. RFC 3596 section 2.5 does the same for
-IPv6 with bit groups -- nibbles, reversed, under ``ip6.arpa``. The
+IN-ADDR.ARPA names carry "up to four labels in addition to the
+IN-ADDR.ARPA suffix. Each label represents one octet of an Internet
+address", and the address arrives reversed -- "data for Internet
+address 10.2.0.52 is located at domain name 52.0.2.10.IN-ADDR.ARPA.
+The reversal, though awkward to read, allows zones to be delegated
+which are exactly one network of address space." RFC 3596 section 2.5
+does the same for IPv6: "a sequence of nibbles separated by dots with
+the suffix .IP6.ARPA", "encoded in reverse order, i.e., the low-order
+nibble is encoded first". The
 reversed labels live here once (:func:`reverse_address` hangs them under
 the arpa trees for PTR; :func:`rbl_query_name` hangs them under a
 blocklist zone for the listing question), because a list leaf and a PTR
