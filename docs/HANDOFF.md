@@ -2327,6 +2327,106 @@ condition met — the codec `edns.padding_option` exists, the policy does not);
 the `aioquic`-sized conversation; (6) the authority-leg DoH answer, same small
 remainder as before.
 
+### Follow-up: both families in play, no answer fragmented — RFC 10001 §4.2 (increment J)
+
+BCP 91 is four months old at this writing, and the first thing the increment
+did was read it: §3 is a taxonomy (misconfigurations, network conditions,
+deliberate partitioning), §4.1 belongs to zone operators, §4.2 is the
+recursive resolver's paragraph, §4.3 the stub's, and §5's only new sentence
+is a MUST about forwarding *configurations*. Two of §4.2's paragraphs turn
+out to describe this codebase.
+
+¶1 -- "every recursive DNS resolver SHOULD be dual-stack" -- was half true
+already: the transport raised a v6 endpoint beside the IPv4 one, with its own
+pending queue, and the send path's comment says the caller "falls back to the
+v4 ones" when v6 glue cannot be used. What did not exist was the order:
+`_send_for_entry` cycled `entry.addresses` as the glue listed them, and
+RFC 10001 §3.2's named fault -- a black-holed family on an otherwise living
+network -- made that an answer-partitioning latency: with v6-first glue every
+nameserver paid a full timeout per v6 address before IPv4 got its turn. The
+fix is `_interleave_families`: alternate the two families within one entry,
+starting with whichever the glue itself leads with, so one dead family costs
+one timeout. Stateless deliberately. §4.2 says keep both families *in play*;
+it does not ask a resolver to rank them, and the one document that does rank
+families -- RFC 6724 -- is quoted by §4.3 at *stub* resolvers. The malformed
+addresses a hand-seeded belt may hold go to the tail, where the send loop has
+always been the thing that skips them with a log line.
+
+¶4 -- "when responding to recursive queries ... SHOULD follow the above
+guidance on fragmentation avoidance (see §4.1) ... analogously" -- opened a
+bigger hole. §4.1¶4: "IP fragmentation SHOULD be avoided", "DNS-over-TCP MUST
+be available as a fallback option, instead of relying on fragmented UDP
+packets". The server had the TCP half (streams, 7828 keepalive, the works)
+and not the UDP half: grepping the package for `TC=True` before this
+increment returned *nothing* -- a namespy server had never truncated anything
+in its life, and a big DNSKEY or TXT answer went out as one 1.6-kilobyte
+datagram, trusting the network to reassemble what the client had explicitly
+offered not to need. The client half of the house already re-asked TC over
+TCP (1123 §6.1.3.2, tested); the server half never produced the bit to
+trigger it. `DnsServer._fit_datagram` closes that at the single `_reply`
+choke point both the answer path and `_error` pass through: cap = this
+request's advertised size (6891 §6.2.3¶2's 512 floor included, §6.2.3¶7's
+no-caching honoured by reading the number off the request in hand, never
+from a memo), and while the wire exceeds it, records go back -- "start at the
+end of the response and work forward in the datagram" (1035 §6.2¶4) --
+additional, authority, then the answer's tail, which is the order that keeps
+§6.2¶4's own corollary, "the answer section is guaranteed to be unique",
+while any authority data remains.
+
+The OPT record is never a victim: §7¶6 makes header + question + OPT the
+floor a truncated response MUST reach and MUST NOT fall below, so the floor
+loop sacrifices the record *under* the OPT before touching it, and a legacy
+client (no OPT in, §7¶2) is capped at §4.2.1's 512 and answered with no OPT
+at all -- truncation is not a permission slip to go extended on a request
+that never asked. RFC 8914 §3's "EDE before other data" ordering survives the
+layering because `_keep_explanation_inside_advertised_size` runs inside
+`_apply_edns`, ahead of `_fit_datagram`'s record cuts: by the time records
+fall, the explanation is already gone if it would not fit -- a test pins
+exactly that sequence (3 fat records + EDE: explanation first, third record
+second, TC set, OPT kept). Streams are never sized: §6.2.3¶1's number is a
+*UDP payload* limit, and the stream is the fallback the TC bit promises, so
+`_fit_datagram` runs only when `channel is None`. The MQTYPE combiner's
+`budget` -- already the same §6.2.3 arithmetic, written separately -- now
+calls the same `_datagram_cap`, one formula for "what fits this datagram".
+
+A citation died on the way. `resolver.py`'s truncation docstring cited
+"RFC 1035 section 4.3.1" for the work-forward sentence; **RFC 1035 §4 has no
+§4.3** -- its tree is 4.1 format (4.1.1-4.1.4) and 4.2 transport, full stop.
+The sentence is §6.2¶4's. The neighbouring §7.4 and the `packet.py` §4.2.1
+citations were checked and stand. (Same failure mode as the old 9080
+incident: a citation written from a feeling about where a rule lives.)
+
+`tests/test_dual_stack_policy.py` (11): the interleave matrix including raw
+belts and junk at the tail, the one-timeout-not-two proof against a stubbed
+`query`, and six wire cases -- legacy 512 with no OPT smuggled, extended
+1232 with the OPT kept, the stingy 128 measured at the floor, authority
+emptied before the answer opens, the §7¶6 floor reached (ANCOUNT honestly
+zero), EDE-first ordering, and the stream that never truncates. The server
+harness is imported from `test_server`, following the fixture-reuse precedent
+of the DNSSEC wiring files. (One fixture lesson: the TXT codec enforces
+1035 §3.3.14's 255-octet character-string cap, so fat records are built from
+200-octet chunks -- fat and legal, not illegal.)
+
+Declined with the document open in hand: §4.2¶2/¶3's single-stack escape
+hatches (PREF64 synthesis wants RA/RDNSS discovery this library does not do;
+the forwarding configuration is the operator's); §4.3's 6724 sorting is for
+stubs; §5¶5's forwarding-loop MUST binds configurations, not packets;
+§4.1¶4's TCP MSS suggestion is an OS knob, and the project's existing answer
+to path sizing is `enable_path_mtu_discovery` on its own sockets.
+
+**Verified**: 1666 passed, 1 skipped (+11). `ruff`/`format`/`mypy` clean,
+coverage 91.39%. Roadmap row 58 🟡→✅ (both halves written up, declines
+named); README's truncation sentence grew a server side; CHANGELOG carries
+the increment and the §4.3.1 phantom-section correction.
+
+**Next, in order**: (1) RFC 8467 padding for the encrypted legs (row 95's
+condition met -- the codec `edns.padding_option` exists, the policy does
+not; the client rule is §7's 400-octet floor and 7830 §6 already keeps the
+server silent on plaintext); (2) RFC 9471 §3 server-side glue completeness
+(row 181 ⬜, small); (3) 8509/9535 anchor maintenance (row 157 🟡); (4) DoQ
+(9250) deferred as ever on the `aioquic`-sized conversation; (5) the
+authority-leg DoH answer, same small remainder as before.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

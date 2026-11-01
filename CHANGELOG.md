@@ -8,6 +8,45 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **Both families stay in play, and no answer leaves as a fragment: RFC 10001
+  §4.2 (BCP 91).** The document is young — published 2026-08, obsoleting
+  RFC 3901 — and its §3 is a taxonomy of the way a resolver loses half the
+  name space when one address family fails underneath it. §4.2's first
+  paragraph asks every recursive resolver to be dual-stack; this walk already
+  ran two sockets (the lazily raised v6 transport beside the IPv4 one), but
+  its SLIST tried each entry's addresses in glued order, so on a black-holed
+  v6 route every nameserver paid a timeout per v6 address before IPv4 was
+  consulted — dual-stack in the socket, monostack in the attempt order.
+  `_interleave_families` now alternates the families within an entry, leading
+  with whichever the glue itself leads with, so one dead family costs one
+  timeout (`resolver._send_for_entry`; stateless on purpose — §4.2 asks for
+  both families *in play*, not a learned ranking, and RFC 6724's sortlists
+  are §4.3's guidance for stub resolvers). §4.2¶4 then folds §4.1¶4's
+  fragmentation guidance onto the server's recursive answers — "IP
+  fragmentation SHOULD be avoided ... DNS-over-TCP MUST be available as a
+  fallback option, instead of relying on fragmented UDP packets" — and the
+  server had been quietly violating the first half: nothing in the package
+  had ever set the TC bit, so an oversized answer left the socket as a
+  fragment or not at all. `DnsServer._fit_datagram` caps a UDP reply at what
+  the client advertised (RFC 6891 §6.2.3¶1-¶2, floor at 512; §6.2.3¶7's
+  no-caching means the number is read from this request's own OPT, which
+  `budget` in the MQTYPE combiner now shares rather than duplicating),
+  truncates back from the datagram's end — additional records, then
+  authority, then the answer's tail (RFC 1035 §6.2¶4, whose "the answer
+  section is guaranteed to be unique" the order keeps) — setting TC while
+  never falling below the header + question + OPT floor RFC 6891 §7¶6 makes
+  mandatory for a truncated response, an OPT-free legacy client capped where
+  §4.2.1 capped everyone (512), and RFC 8914 §3's "EDE before other data"
+  ordering survives the layering because the explanation mechanism runs
+  first. Streams are never truncated: the advertised size is "the largest
+  *UDP* payload", and the stream is the very fallback TC promises. `tests/
+  test_dual_stack_policy.py` (11): the interleaving matrix, the
+  one-timeout-not-two send-loop proof, and six wire-level size cases
+  including the §7¶6 floor and the EDE ordering. Left to deployment as the
+  document leaves it: §4.2¶2-¶3's single-stack escape hatches (PREF64,
+  forwarding) and §5¶5's forwarding-loop rule, which bind configurations,
+  not packets.
+
 - Compact Denial of Existence, validator-side: RFC 9824 lands with a correction to
   this project's own deferred-work list (the row that queued it as "the compact
   NSEC3 digest formats are themselves RRs" — 9824 adds no RR format; it adds
@@ -910,6 +949,16 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 
 ### Fixed
+
+- **The truncation-order citation in `resolver.py` pointed at RFC 1035
+  §4.3.1 — and RFC 1035 has no §4.3.** That document's §4 (messages) runs
+  §4.1 (format, with subsections 4.1.1-4.1.4) and §4.2 (transport: UDP,
+  TCP); the branch the citation invented has no trunk to hang from. The
+  quoted sentence, "truncation should start at the end of the response and
+  work forward in the datagram," is §6.2¶4's, found by checking the
+  document while writing `server._fit_datagram`. The neighbouring §7.4
+  citation — "Using the cache", the complete-set prohibition — checked out
+  unchanged, as did §4.2.1's 512-byte rule, quoted in `packet.py`.
 
 - **A correctly signed RFC 5155 §8.7 wildcard No Data answer over NSEC3 was
   judged Bogus, and the walk SERVFAILed it.** Where the chain held no record

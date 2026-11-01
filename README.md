@@ -213,8 +213,12 @@ them change the security properties of anything built on top.
   demo server answers an extended query
   with an OPT of its own — never a forwarded one, always its own payload size, and its
   identifier only if it was given one with `--advertise-nsid` and only if the
-  query asked — and keeps §7's silence for a query that had none. Truncation is fully
-  handled: a `TC` answer is re-asked over TCP instead of being believed
+  query asked — and keeps §7's silence for a query that had none. Truncation is
+  fully handled on both sides of a datagram: the server truncates its own UDP
+  answers back from the end to what the client advertised, TC set, never below
+  header, question, and OPT (RFC 6891 §6.2.3, §7 ¶6; RFC 1035 §6.2; RFC 10001
+  §4.2 ¶4 asks recursive servers to answer without fragmenting), and a `TC`
+  answer it receives is re-asked over TCP instead of being believed
   (RFC 1123 §6.1.3.2).
 - **The IDNA2008 character tables do not ship.** Conversion at the
   boundary is complete — `namespy münchen.de`, `DomainName.from_unicode`,

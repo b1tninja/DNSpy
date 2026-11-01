@@ -87,9 +87,11 @@ that path carries an empty list rather than silence.
 * RFC 6891 section 6.1.1 (one OPT per message, OPT is never forwarded, an OPT
   request must be answered with an OPT), section 6.1.2 (option format; unknown
   codes must be ignored), section 6.1.3 (BADVERS for a VERSION this server does
-  not implement), section 7 (an OPT-free request must be answered without OPT;
+  not implement), section 6.2.3 (the requestor's advertised payload size is what
+  it can reassemble, values under 512 read as 512, and the number belongs to
+  one transaction), section 7 (an OPT-free request must be answered without OPT;
   an option that is badly formatted or out of range must be answered FORMERR,
-  with an OPT)
+  with an OPT; header, question, and OPT are a truncated response's floor)
 * RFC 7830 sections 4, 6 (a responder must pad when asked -- and must not use
   the option at all on an unencrypted transport, which both of this server's
   transports are)
@@ -98,6 +100,12 @@ that path carries an empty list rather than silence.
   that carried an OPT), section 3 (drop EDE options before other data when the
   response outgrows the requestor's payload size), sections 4.22-4.23 (the codes
   this server's own failures earn)
+* RFC 10001 section 4.2 paragraph 4 (a resolver answering recursive queries
+  follows section 4.1 paragraph 4's fragmentation-avoidance guidance
+  analogously -- which lands as: a UDP answer never outgrows what the client
+  advertised, truncation works back from the end of the datagram setting TC
+  (with RFC 1035 sections 4.2.1 and 6.2), and the TCP fallback that promise
+  needs is the stream this server already serves)
 * RFC 10029 section 3.3 (the MQTYPE-Query conditions that oblige a FORMERR),
   section 3.4 (combining several QTYPEs into one answer: the flag-matching test,
   the per-section duplicate rule, and the rule that the option must never itself
@@ -461,6 +469,8 @@ class DnsServer(asyncio.Protocol):
                 keepalive=None if channel is None else channel.keepalive,
             )
         wire = bytes(response)
+        if channel is None:
+            wire = self._fit_datagram(request, response, wire)
         self.log.debug(
             "server_reply(dst=%s id=%#06x rcode=%s octets=%d)",
             addr[0],
@@ -474,8 +484,88 @@ class DnsServer(asyncio.Protocol):
             # The answer goes back on the stream the question arrived on:
             # a datagram is addressed, a stream is already addressed -- it
             # is the connection -- and the channel is that fact made
-            # callable.
+            # callable. No size rule applies here: RFC 1035 §4.2.1's 512
+            # ceiling and RFC 6891 §6.2.3's advertised-payload limit are
+            # both statements about what a *datagram* can hold, and this
+            # stream is the TCP fallback that RFC 10001 §4.1¶4 (via §4.2¶4)
+            # requires the truncation to have -- TC over UDP is a promise
+            # this path keeps in full.
             channel.send(wire)
+
+    @staticmethod
+    def _datagram_cap(request) -> int:
+        """Largest UDP payload this client said it can reassemble.
+
+        RFC 6891 §6.2.3¶2: "Values lower than 512 MUST be treated as equal
+        to 512." And a request with no OPT at all is §7¶2's unextended
+        client -- one that never offered a number -- so it is capped where
+        RFC 1035 §4.2.1 capped everyone before EDNS lifted the ceiling:
+        512 octets. The size is per-transaction and read from *this*
+        request's own OPT: §6.2.3¶7 forbids caching an advertised value
+        beyond the transaction that carried it, and this server composes
+        each reply's OPT fresh anyway.
+        """
+        incoming = None if request is None else request.opt()
+        if incoming is None:
+            return DnsPacket.EDNS_MINIMUM_PAYLOAD
+        return max(DnsPacket.EDNS_MINIMUM_PAYLOAD, int(incoming.rclass))
+
+    def _fit_datagram(self, request, response, wire: bytes) -> bytes:
+        """Truncate a UDP reply that outgrows the client's payload; set TC.
+
+        The size a client advertised is the size it can reassemble
+        (RFC 6891 §6.2.3¶1), and sending past it does not deliver more
+        answer -- it delivers an IP fragment, which RFC 10001 §4.1¶4
+        (applied to recursive servers by §4.2¶4) tells this server to avoid
+        because fragmentation is fragile (RFC 8900). The alternative this
+        build had been quietly choosing was worse than truncation: an
+        oversized datagram either fragments and dies at a firewall or never
+        leaves the socket, and the client times out on an answer that
+        existed.
+
+        Records go back, working forward in the datagram from its end
+        (RFC 1035 §6.2¶4): additional-section records first, then the
+        authority section, then -- only when the answer itself will not fit
+        -- the answer's tail. That order is what §6.2¶4's second sentence
+        guarantees: while any authority data remains, the answer section is
+        whole. The OPT record is never a victim; RFC 6891 §7¶6 makes header,
+        question, and OPT the floor a truncated response falls to and MUST
+        not fall below, so an extended client always gets its EDNS answer
+        version, its DO bit, its EDE options this server declined to eat
+        first (§8914 §3's order ran upstream of here, in
+        :meth:`_keep_explanation_inside_advertised_size`), and the promise
+        TC carries: the rest is on the stream.
+        """
+        cap = self._datagram_cap(request)
+        if len(wire) <= cap:
+            return wire
+        sections = (
+            (response.additional_records, "ARCOUNT", True),
+            (response.nameservers, "NSCOUNT", False),
+            (response.answers, "ANCOUNT", False),
+        )
+        dropped = False
+        for records, count_attr, protect_opt in sections:
+            while len(wire) > cap and records:
+                victim = records[-1]
+                if protect_opt and int(victim.rtype) == int(DnsRType.OPT):
+                    if len(records) == 1:
+                        break  # the §7¶6 floor: OPT alone, nothing left to give
+                    del records[-2]  # sacrifice the record below the OPT
+                else:
+                    records.pop()
+                dropped = True
+                setattr(response, count_attr, len(records))
+                wire = bytes(response)
+        if dropped and not response.TC:
+            response.TC = True
+            wire = bytes(response)
+            self.log.debug(
+                "server_truncated(dst_size=%d cap=%d tc=1)",
+                len(wire),
+                cap,
+            )
+        return wire
 
     def _error(
         self,
@@ -649,8 +739,9 @@ class DnsServer(asyncio.Protocol):
             return
         # RFC 6891 section 6.2.3: "Values lower than 512 MUST be treated as equal to
         # 512", so a client advertising something tiny is still measured against the
-        # floor it is owed rather than a limit that trims everything away.
-        advertised = max(DnsPacket.EDNS_MINIMUM_PAYLOAD, int(incoming.rclass))
+        # floor it is owed rather than a limit that trims everything away -- the same
+        # :meth:`_datagram_cap` the record truncation in :meth:`_fit_datagram` runs on.
+        advertised = self._datagram_cap(request)
         size = len(bytes(response))
         if size <= advertised:
             return
@@ -1086,13 +1177,13 @@ class DnsServer(asyncio.Protocol):
                 self.max_qtypes,
             )
             requested = requested[: self.max_qtypes]
-        incoming = request.opt()
-        # RFC 6891 section 6.2.3, the same floor the EDE rule uses: "Values lower
-        # than 512 MUST be treated as equal to 512", so a requestor advertising a
-        # number designed to make the answer empty is owed the minimum instead -- and
-        # a request with no OPT, which cannot have asked, sizes nothing at all.
-        advertised = 0 if incoming is None else int(incoming.rclass)
-        budget = max(DnsPacket.EDNS_MINIMUM_PAYLOAD, advertised)
+        # RFC 6891 section 6.2.3, the same floor the EDE rule and the
+        # truncation in _fit_datagram use: "Values lower than 512 MUST be
+        # treated as equal to 512", so a requestor advertising a number
+        # designed to make the answer empty is owed the minimum instead --
+        # and a request with no OPT sizes nothing at all, which is where
+        # RFC 1035 section 4.2.1's ceiling still rules.
+        budget = self._datagram_cap(request)
         answered: list[int] = []
         for qtype in requested:
             combination = await self.resolver.resolve(self._standalone_query(request, qtype))

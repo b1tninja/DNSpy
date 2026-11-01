@@ -37,6 +37,9 @@ hints from the network is now the explicit, awaited
 * RFC 6672 section 5.1 (DNAME plus CNAME makes alias loops easier to build)
 * RFC 7766 section 6 (TCP for truncation and for AXFR)
 * RFC 8106 section 2 (root hints: an initial address set is required)
+* RFC 10001 section 4.2 (a recursive resolver stays dual-stack, and both
+  address families keep their turn inside one SLIST entry: see
+  :func:`_interleave_families`)
 * RFC 9156 (QNAME minimisation -- opt-in via ``qname_min``; see
   :mod:`namespy.minimis` for the probe schedule)
 * RFC 8198 / RFC 9077 (aggressive use of validated cached denials -- opt-in via
@@ -869,7 +872,7 @@ class Resolver(asyncio.Protocol):
         mode: a single partial answer would otherwise be cached and served to
         every later client as though it were complete.
 
-        RFC 1035 section 4.3.1 does observe that a server should truncate "at the
+        RFC 1035 section 6.2 does observe that a server should truncate "at the
         end of the response and work forward in the datagram", so a truncated
         response that still carries an authority section has a complete answer
         section.  Acting on that means trusting the server to implement
@@ -1706,6 +1709,60 @@ class Sbelt(Slist):
             clone.history["lame"] = lame
             clone.history["demoted"] = True
         return clone
+
+
+def _interleave_families(addresses):
+    """One entry's addresses, ordered so each family gets its turn before the
+    next entry of the family that led.
+
+    RFC 10001 §4.2¶1 asks every recursive resolver to be dual-stack, and §3.2
+    describes exactly the condition that makes the order matter: a network
+    fault that blacks out one address family while leaving the other up. The
+    glue a delegation carries arrives in whatever order the zone's author
+    wrote it (§4.1¶2's complaint is about a delegation missing a family
+    altogether, which no resolver can fix), and a plain sequential cycle lets
+    one family's timeout run out *every* address before the other family is
+    consulted -- the walk is dual-stack in the socket and monostack in the
+    attempt order this code had until now. Interleaving bounds the damage: a
+    black-holed family costs one timeout, not every timeout it owns.
+
+    Deliberately stateless. §4.2 asks the resolver to keep both families in
+    play, not to learn a preference between them, and RFC 6724's destination-
+    address sorting -- the one document that ranks families -- is §4.3's
+    guidance for *stub* resolvers, not for this walk. The order starts with
+    whichever family the glue itself leads with, so nothing is biased away
+    from what the delegation said; addresses that are neither 4 nor 16 octets
+    (a hand-seeded belt's malformed entry) keep their place at the end for
+    the caller to skip, rather than being silently dropped here too.
+    """
+    fours, sixes, others = [], [], []
+    first_family = None
+    for address in addresses:
+        packed = getattr(address, "packed", None)
+        if packed is None:
+            try:
+                packed = bytes(address)
+            except (TypeError, ValueError):
+                others.append(address)
+                continue
+        if len(packed) == 4:
+            fours.append(address)
+            if first_family is None:
+                first_family = 4
+        elif len(packed) == 16:
+            sixes.append(address)
+            if first_family is None:
+                first_family = 6
+        else:
+            others.append(address)
+    primary, secondary = (sixes, fours) if first_family == 6 else (fours, sixes)
+    interleaved = []
+    for index in range(max(len(primary), len(secondary))):
+        if index < len(primary):
+            interleaved.append(primary[index])
+        if index < len(secondary):
+            interleaved.append(secondary[index])
+    return interleaved + others
 
 
 # Effect / step / trace event types.
@@ -4685,7 +4742,10 @@ class RecursiveResolver(Resolver):
             else:
                 extra_options = (option,) if option is not None else ()
 
-        for address in list(entry.addresses):
+        # Family-interleaved, not glued-order: one black-holed family should
+        # cost this entry one timeout, not every timeout its addresses own
+        # (RFC 10001 §4.2¶1, §3.2; see :func:`_interleave_families`).
+        for address in _interleave_families(entry.addresses):
             # Addresses arrive either as ipaddress objects (glue, root hints) or
             # as raw packed octets (a caller that seeded the belt by hand).
             packed = address.packed if hasattr(address, "packed") else bytes(address)
