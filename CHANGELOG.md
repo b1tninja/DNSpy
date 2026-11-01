@@ -8,6 +8,33 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **RFC 6761's registry answers before the walk — the second horizon's first
+  row shipped (U8).** `.invalid`, `.test`, `.local`, `.onion` and the eighteen
+  RFC 1918 reverse zones are names the registry says a caching resolver answers
+  itself — §6.4¶4's "immediate NXDOMAIN", §6.2¶4's and §6.1¶7's default-negative
+  with a named opt-out, RFC 6762 §3¶3-4's sending of every `.local` query to the
+  multicast group (which a unicast resolver does not speak, so the honest packet
+  is the one never sent), and the registry's lone MUST, RFC 7686 §2¶5's NXDOMAIN
+  for `.onion`. namespy was instead walking all of them to a root that has no
+  business answering; `namespy/special.py` is now the registry — transcribed,
+  cited paragraph by paragraph, and as deliberate about its absences as its
+  entries: `.example` resolves *normally* because §6.5¶4 commands it, and
+  `127.in-addr.arpa` is not in §6.1's list so this module does not invent it.
+  `localhost` answers are synthesized per §6.3¶4 — loopback for A/AAAA, negative
+  for everything else — with TTL 0 because §6.3¶7 defines the RDATA by protocol,
+  and protocol-defined data expires against no zone; the guard sits ahead of the
+  cache for the same reason, and its answers never enter the cache.
+  `SpecialNamesPolicy.IGNORE` is §6.2¶4's own configuration option, warned about
+  at both doors (`.onion` is a leak before it is a wasted query), surfaced as
+  `--ignore-special-names`; a `SpecialName` trace event carries the authorizing
+  paragraph so the walk that never started is visible in all three trace views.
+  The suite proved the behavior change better than any test could: 67 existing
+  fixtures failed the moment the guard landed, because the test network lives in
+  `.test` — the harness switched the option §6.2¶4 offers, the way any private
+  network serving those names would, and 39 tests in `tests/test_special_names.py`
+  pin the registry itself, the no-packet-leave-the-house absence, and the two
+  look-alike spaces that stay walkable. Roadmap row U8 ✅.
+
 - **RFC 5011: trust anchors that replace themselves — the managed-key state
   machine shipped.** The rollover rows kept saying the acquisition story ended
   at *fetching*; it now ends at *maintaining*. `namespy/maintenance.py` is

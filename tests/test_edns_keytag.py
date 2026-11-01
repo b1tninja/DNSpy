@@ -201,7 +201,8 @@ def _keytag_walk(name, qtype, *, responses, anchors=(), client_key_tags=()):
         kwargs["client_key_tags"] = tuple(client_key_tags)
     cache = MemoryDnsCache(time_fn=wiring.Clock())
     return wiring._drive(
-        resolve_steps(sname, wiring._seed_slist(sname), cache, **kwargs), list(responses)
+        resolve_steps(sname, wiring._seed_slist(sname), cache, special_names="ignore", **kwargs),
+        list(responses),
     )
 
 
@@ -317,7 +318,7 @@ def test_the_walk_reads_the_initiating_packets_instances_into_one_copy():
     upstream of a recursive server that validates nothing, whose copy says only
     "these are the tags the one below me knows".
     """
-    resolver = RecursiveResolver(cache=MemoryDnsCache())
+    resolver = RecursiveResolver(cache=MemoryDnsCache(), special_names="ignore")
     seen = []
 
     async def fake_network(entry, questions, extra_qtypes=(), edns_options=()):

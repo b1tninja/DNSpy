@@ -2936,6 +2936,42 @@ PowerShell text cmdlets; use the editor or python with explicit encodings.
 4 new listener/parity tests; full suite 1752 passed, 1 skipped.
 
 
+### Follow-up: the registry answers first — special-use names (increment U, second-horizon U8)
+
+The second horizon's plan named U8 first because it is a correctness bug
+wearing a feature's clothes, and landing it proved the diagnosis louder than
+any test: **67 fixtures failed the moment the guard went in**, because the
+suite's fixture tree lives in `.test` (RFC 2606). That is not a bug in the
+guard — it is RFC 6761 §6.2 working: a caching resolver denies `.test` *by
+default*, and the paragraph itself names the exception ("a configuration
+option, disabled by default... for use in networks where test names are known
+to be handled by an authoritative DNS server"). The test harness is that
+network, so the harness takes the opt-out — twelve construction sites in the
+five fixture files, one paragraph's worth of reason in `test_dnssec_wiring`
+where the first of them lives. What landed: `namespy/special.py`, the registry
+transcribed and cited per entry (6761 §6.1-§6.4, 6762 §3¶3-4, 7686 §2¶5),
+deliberately excluding `.example` (§6.5¶4 says resolve normally — blocking it
+would be an invention wearing a citation that says the opposite) and
+`127.in-addr.arpa` (not in §6.1's eighteen zones; not invented here). The
+guard sits at the top of `resolve_steps`, ahead of the cache, the failure
+cache, and every network seam, because §6.3¶4/§6.4¶4's "immediate" is about
+the whole answer and §6.3¶7's protocol-defined RDATA expires against no zone —
+hence TTL 0 loopback synthesis for A/AAAA, negative for other types, and no
+cache entries either way. `SpecialNamesPolicy.IGNORE` is §6.2¶4's own option:
+the constructor door warns (logging), the CLI door warns (stderr banner),
+because the flag that fixes `10.in-addr.arpa` for a private net also releases
+`.onion` queries, which RFC 7686 §2¶5 makes a MUST-NOT for good privacy
+reason. A `SpecialName` trace event carries the authorizing paragraph into all
+three trace views (text, mermaid, live echo). Two placement decisions to
+know before editing: the guard judges the QNAME only (a CNAME chain ending at
+a registry name is the publishing zone's rudeness, and §6's paragraphs speak
+about queries), and it runs *ahead of* the NXNAME Meta-TYPE refusal at the
+generator's top — `test_compact_denial` opts that one test out to keep its
+refusal-under-test the Meta-TYPE one. 39 tests; full suite 1791 passed, 1
+skipped. Next in the planned order: U1 (the responder hook) with U2 (the
+reflexive zone) riding it — the roadmap's "order of attack" stands.
+
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

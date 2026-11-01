@@ -118,6 +118,7 @@ from .packet import (
     Response,
 )
 from .rdata import RData_A, RData_AAAA, RData_RRSIG, type_name_of
+from .special import SpecialNameAction, classify_special_use
 from .trace import Trace
 from .validate import SecurityStatus, ValidationVerdict, Validator
 
@@ -254,6 +255,39 @@ class NxdomainPolicy(enum.Enum):
     #: Cut only on DNSSEC-validated denials (RFC 8020 §2¶3). Requires
     #: ``trust_anchors``; unvalidated entries are walked, never cut.
     VALIDATED = "validated"
+
+
+class SpecialNamesPolicy(enum.Enum):
+    """Whether the RFC 6761 special-use registry answers before the walk does.
+
+    :attr:`RESPECT` is the registry read as written: ``invalid.`` answers
+    NXDOMAIN immediately (§6.4¶4), ``localhost.`` answers loopback for
+    address queries and negative for everything else (§6.3¶4), ``test.`` and
+    the RFC 1918 reverse zones answer negative by default (§6.2¶4, §6.1¶7),
+    ``local.`` stays on its link (RFC 6762 §3¶3-4: its MUST sends queries to
+    the multicast group, which this resolver does not speak), and ``onion.``
+    answers NXDOMAIN under RFC 7686 §2¶5's MUST. The reason the paragraphs
+    repeat -- "to avoid unnecessary load on the root name servers and other
+    name servers" -- is a reason this project has always owned; the guard
+    runs ahead of the cache too, because protocol-defined answers (§6.3¶7)
+    have no authority whose records or expiry could be remembered instead.
+
+    :attr:`IGNORE` is the configuration option §6.2¶4 and §6.1¶7 themselves
+    tell caching servers to offer -- "disabled by default", enabled by an
+    operator whose private network really does serve ``test.`` or
+    ``10.in-addr.arpa.`` from an authority of its own. It restores the
+    old behaviour exactly: every name walks. The door warns anyway, because
+    the blessing covers the private-zone case, not the whole registry: RFC
+    7686 §2¶5's MUST is still a MUST for a server not adapted to answer for
+    Tor, and a walked ``.onion`` query leaks the question to every server
+    on the way to the denial at the root.
+    """
+
+    #: The registry as written: local answers, no packets. The default.
+    RESPECT = "respect"
+
+    #: §6.2¶4's named option, switched on: walk everything anyway.
+    IGNORE = "ignore"
 
 
 #: RFC 7828 §3.2.2's default idle horizon when a keepalive conversation
@@ -424,6 +458,12 @@ class Resolver(asyncio.Protocol):
     #: it -- and a test that builds a bare ``Resolver()`` -- filters strictly.
     glue_policy = GluePolicy.STRICT
     nxdomain_cut = NxdomainPolicy.ALWAYS
+
+    #: Whether the RFC 6761 special-use registry answers before the walk
+    #: does; see :class:`SpecialNamesPolicy`. Respecting it is the class
+    #: default, so a driver that never sets it sends no query for a name
+    #: the registry says has no server to ask.
+    special_names = SpecialNamesPolicy.RESPECT
 
     #: Whether cached validated proofs may deny names they were not written for
     #: (RFC 8198 §5); see :meth:`RecursiveResolver.__init__`. Off is the class
@@ -1928,6 +1968,23 @@ class NxdomainCut:
 
 
 @dataclass(frozen=True)
+class SpecialName:
+    """A registry name answered without asking anyone -- the walk that never started.
+
+    :class:`ChainFromCache` made the same argument for a chain leg the cache
+    carried, and it generalizes: an absence is otherwise invisible. This line
+    is the one place a reader can tell "answered from the RFC 6761 registry"
+    apart from "answered from somebody's cache" -- the packets of the two are
+    indistinguishable, and only one of them consulted the network's opinion
+    of a name the registry says has no server to ask about.
+    """
+
+    name: str
+    action: str
+    citation: str
+
+
+@dataclass(frozen=True)
 class CompactDenial:
     """A validated denial arrived as a Compact Answer -- its signed proof asserting
     NXNAME at the queried name (RFC 9824 §2¶3).
@@ -2762,6 +2819,7 @@ def resolve_steps(
     qname_min: bool = False,
     glue_policy: GluePolicy = GluePolicy.STRICT,
     nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
+    special_names: SpecialNamesPolicy = SpecialNamesPolicy.RESPECT,
     failures=None,
     extra_qtypes: tuple = (),
     dnssec_ok: bool = False,
@@ -3146,6 +3204,68 @@ def resolve_steps(
             yield Nodata(hit.soa)
         yield Done(_synthesize_stale(sname, hit, dnssec_ok))
         return True
+
+    if special_names is SpecialNamesPolicy.RESPECT:
+        special = classify_special_use(sname.qname)
+        if special.action is not SpecialNameAction.NONE:
+            # Ahead of the cache, the failure cache, and every seam that can
+            # reach the network: "generate an immediate response" (§6.3¶4,
+            # §6.4¶4) is a rule about the whole answer, and protocol-defined
+            # RDATA (§6.3¶7) has no authority whose records, denials, or
+            # expiries could be remembered instead. The step vocabulary is
+            # the ordinary one -- Nxdomain, Answer, Nodata, Done -- so the
+            # response is assembled like every other and served clients see
+            # the same packet shape; only the SpecialName event says where it
+            # came from. TTL 0 on the loopback records because nothing here
+            # expires against a zone, and the answers stay out of the cache
+            # because resolve_steps never reaches the write-back below.
+            if special.action is SpecialNameAction.NXDOMAIN:
+                yield SpecialName(str(sname.qname), "NXDOMAIN", special.citation)
+                yield Nxdomain()
+                yield Done(
+                    Response(
+                        QR=DnsQR.RESPONSE,
+                        RCODE=DnsResponseCode.NAME_ERROR,
+                        questions=list(sname.questions),
+                    )
+                )
+                return
+            if int(sname.qtype) == int(DnsRType.A):
+                record = DnsRecord(sname.qname, DnsRType.A, ttl=0, rdata=RData_A("127.0.0.1"))
+                yield SpecialName(str(sname.qname), "loopback A", special.citation)
+                yield Answer([record])
+                yield Done(
+                    Response(
+                        QR=DnsQR.RESPONSE,
+                        RCODE=DnsResponseCode.NO_ERROR,
+                        questions=list(sname.questions),
+                        answers=[record],
+                    )
+                )
+                return
+            if int(sname.qtype) == int(DnsRType.AAAA):
+                record = DnsRecord(sname.qname, DnsRType.AAAA, ttl=0, rdata=RData_AAAA("::1"))
+                yield SpecialName(str(sname.qname), "loopback AAAA", special.citation)
+                yield Answer([record])
+                yield Done(
+                    Response(
+                        QR=DnsQR.RESPONSE,
+                        RCODE=DnsResponseCode.NO_ERROR,
+                        questions=list(sname.questions),
+                        answers=[record],
+                    )
+                )
+                return
+            yield SpecialName(str(sname.qname), "negative", special.citation)
+            yield Nodata(None)
+            yield Done(
+                Response(
+                    QR=DnsQR.RESPONSE,
+                    RCODE=DnsResponseCode.NO_ERROR,
+                    questions=list(sname.questions),
+                )
+            )
+            return
 
     for _ in range(max_hops):
         if cache is not None:
@@ -4316,6 +4436,7 @@ class RecursiveResolver(Resolver):
         qname_min: bool = False,
         glue_policy: GluePolicy = GluePolicy.STRICT,
         nxdomain_cut: NxdomainPolicy = NxdomainPolicy.ALWAYS,
+        special_names: SpecialNamesPolicy = SpecialNamesPolicy.RESPECT,
         aggressive_nsec: bool = False,
         serve_stale: float = 0.0,
         dnssec_ok: bool = False,
@@ -4379,6 +4500,18 @@ class RecursiveResolver(Resolver):
             wrong for serving, because it throws away the reason the negative
             cache has a subtree-wide claim at all. :class:`NxdomainPolicy` says
             what each stance costs. Also accepted as the equivalent string.
+        :param special_names: whether the RFC 6761 special-use registry
+            (plus RFC 6762's ``.local`` and RFC 7686's ``.onion``) answers
+            before the walk does. The default, :attr:`SpecialNamesPolicy.RESPECT`,
+            is the registry read as written: immediate loopback for
+            ``localhost.`` (§6.3¶4), immediate NXDOMAIN for ``invalid.``
+            (§6.4¶4), ``test.`` and the private reverse zones by default
+            (§6.2¶4, §6.1¶7), and never a unicast packet for the other two.
+            :attr:`SpecialNamesPolicy.IGNORE` is the configuration option
+            those paragraphs name -- disabled by default, and warned about
+            when enabled, because the registry's one MUST (``.onion``) is a
+            privacy rule as much as a routing one. Also accepted as the
+            equivalent string.
         :param aggressive_nsec: whether the NSEC/NSEC3 bundles already cached
             with validated denials may answer names and types they were not
             written for -- RFC 8198's aggressive use, gate by gate in
@@ -4498,6 +4631,21 @@ class RecursiveResolver(Resolver):
         # and NxdomainPolicy.NEVER must arrive as one thing, and a typo must not
         # leave a resolver that thinks it has a policy.
         self.nxdomain_cut = NxdomainPolicy(nxdomain_cut)
+        # Same coercion, same reason: SpecialNamesPolicy("ignore") from a
+        # config file and the member itself must arrive as one thing, and a
+        # typo must not leave a resolver that thinks it has a policy.
+        self.special_names = SpecialNamesPolicy(special_names)
+        if self.special_names is SpecialNamesPolicy.IGNORE:
+            # A warning, deliberately, in the door's own voice: §6.2¶4 and
+            # §6.1¶7 bless this switch for the private-network case, and the
+            # registry contains RFC 7686 §2¶5's MUST for a name whose query
+            # is a leak before it is a waste. An operator who meant only
+            # 10.in-addr.arpa. should still see what the flag costs beyond it.
+            self.log.warning(
+                "resolver_special_names=ignore: special-use names (RFC 6761 registry, "
+                ".local, .onion) will be walked -- the §6.2¶4/§6.1¶7 opt-in; wasted "
+                "queries for most of the registry, a privacy leak for .onion",
+            )
         self.aggressive_nsec = bool(aggressive_nsec)
         self.serve_stale = float(serve_stale or 0.0)
         # Frozen like edns_options: the walk reads these per lookup, and an
@@ -4952,6 +5100,7 @@ class RecursiveResolver(Resolver):
                         self.cache,
                         glue_policy=self.glue_policy,
                         nxdomain_cut=self.nxdomain_cut,
+                        special_names=self.special_names,
                         failures=self.failure_cache,
                         dnssec_ok=self.dnssec_ok,
                         anchors=self.trust_anchors,
@@ -5220,6 +5369,7 @@ class RecursiveResolver(Resolver):
             qname_min=self.qname_min,
             glue_policy=self.glue_policy,
             nxdomain_cut=self.nxdomain_cut,
+            special_names=self.special_names,
             failures=self.failure_cache,
             extra_qtypes=tuple(extra_qtypes),
             dnssec_ok=self.dnssec_ok,

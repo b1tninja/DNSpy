@@ -491,7 +491,11 @@ def test_a_compact_bundle_is_never_the_evidence_aggressive_caching_fabricates_fr
 
 def test_the_walk_refuses_to_attempt_an_nxname_question() -> None:
     """Section 3.5 para 2: "MUST NOT ... attempt iterative resolution"."""
-    steps = resolve_steps(Sname(DomainName("x.test."), NXNAME), Slist(Sname(DomainName("."))))
+    steps = resolve_steps(
+        Sname(DomainName("x.test."), NXNAME),
+        Slist(Sname(DomainName("."))),
+        special_names="ignore",  # keep the refusal under test the Meta-TYPE one
+    )
     with pytest.raises(ValueError, match="Meta-TYPE"):
         next(steps)
 

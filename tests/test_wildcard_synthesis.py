@@ -381,6 +381,7 @@ def test_the_trace_names_the_template_the_answer_came_from():
         anchors=(wiring._anchor(),),
         now=wiring.NOW,
         aggressive_nsec=True,
+        special_names="ignore",  # fixture tree is .test; see test_dnssec_wiring
     )
     pending = next(generator)
     trace.record(pending)

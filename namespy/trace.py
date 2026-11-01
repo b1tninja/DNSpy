@@ -163,6 +163,12 @@ class Trace:
             offered = ", ".join(str(address) for address in ev.addresses) or "undecodable"
             verdict = "believed" if ev.used else "discarded"
             return ("note", None, f"volunteered glue {ev.ns_name} ({offered}) {verdict}")
+        if cn == "SpecialName":
+            # The walk that never started is otherwise invisible: the packet
+            # is indistinguishable from a cache answer, and the name says
+            # nothing about the paragraph that let this resolver be certain.
+            # The citation rides because "refused to ask" deserves a document.
+            return ("note", None, f"special-use {ev.name}: {ev.action} ({ev.citation})")
         if cn == "Cname":
             return ("note", None, f"CNAME {ev.target}")
         if cn == "Done":

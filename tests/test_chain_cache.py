@@ -248,6 +248,7 @@ def test_the_trace_shows_which_leg_the_cache_carried():
         dnssec_ok=True,
         anchors=(wiring._anchor(),),
         now=wiring.NOW,
+        special_names="ignore",  # fixture tree is .test; see test_dnssec_wiring
     )
     responses = iter(_mail_script())
     pending = next(generator)

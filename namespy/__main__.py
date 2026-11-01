@@ -40,6 +40,7 @@ from .resolver import (
     NxdomainCut,
     NxdomainPolicy,
     RecursiveResolver,
+    SpecialNamesPolicy,
 )
 from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer, DnsStreamServer
 from .stub import TRANSPORTS, StubResolver, Upstream
@@ -710,6 +711,21 @@ def build_parser():
         "rest of that SOA's MINIMUM",
     )
     p.add_argument(
+        "--ignore-special-names",
+        dest="ignore_special_names",
+        action="store_true",
+        help="walk the special-use names instead of answering them from the "
+        "registry (RFC 6761: .invalid, .test, .localhost, and the RFC 1918 "
+        "reverse zones; plus RFC 6762's .local and RFC 7686's .onion): this is "
+        "the configuration option §6.2¶4 and §6.1¶7 tell caching resolvers to "
+        "offer for networks that really do serve those names from a private "
+        "authority. Warns at startup, because .onion is a leak as well as a "
+        "waste -- asking public DNS about a hidden-service name announces the "
+        "question to every server on the walk, and answering NXDOMAIN is the "
+        "one registry MUST. The default refuses these names locally, TTL-0 "
+        "loopback for localhost included (see namespy.special).",
+    )
+    p.add_argument(
         "--allow-out-of-bailiwick-glue",
         dest="allow_out_of_bailiwick_glue",
         action="store_true",
@@ -764,6 +780,27 @@ def _nxdomain_cut(args) -> NxdomainPolicy:
     if getattr(args, "validated_cuts", False):
         return NxdomainPolicy.VALIDATED
     return NxdomainPolicy.NEVER if args.no_nxdomain_cut else NxdomainPolicy.ALWAYS
+
+
+def _special_names(args) -> SpecialNamesPolicy:
+    """Translate the opt-in into a policy -- and say what the opt-in costs.
+
+    No banner when the registry is respected (the default needs no narration),
+    and a loud one when it is not: §6.2¶4 blesses the switch for a network
+    that serves .test or 10.in-addr.arpa. privately, but the same flag also
+    releases .onion queries onto the public walk, which RFC 7686 §2¶5 makes a
+    MUST-NOT-ask for any server not adapted to answer for Tor. The operator
+    who meant one should still see the other.
+    """
+    if getattr(args, "ignore_special_names", False):
+        print(
+            "namespy: special-use names (RFC 6761 registry, .local, .onion) will be "
+            "WALKED, not answered locally -- §6.2¶4's opt-in switched on; a walked "
+            ".onion query is a leak before it is a wasted query",
+            file=sys.stderr,
+        )
+        return SpecialNamesPolicy.IGNORE
+    return SpecialNamesPolicy.RESPECT
 
 
 def _trust_anchors(args):
@@ -983,6 +1020,7 @@ async def cli_query(args) -> int:
             glue_policy=_glue_policy(args),
             failure_cache=_failure_cache(args),
             nxdomain_cut=_nxdomain_cut(args),
+            special_names=_special_names(args),
             aggressive_nsec=args.aggressive_nsec,
             serve_stale=args.serve_stale,
             trust_anchors=anchors,
@@ -1166,6 +1204,7 @@ async def serve(args) -> int:
                 glue_policy=_glue_policy(args),
                 failure_cache=_failure_cache(args),
                 nxdomain_cut=_nxdomain_cut(args),
+                special_names=_special_names(args),
                 aggressive_nsec=args.aggressive_nsec,
                 serve_stale=args.serve_stale,
                 trust_anchors=anchors,

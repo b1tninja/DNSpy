@@ -63,7 +63,19 @@ namespy --serve                      # demo server on 127.0.0.1:53
 `python -m namespy` does the same without installing the console script, and
 `namespy --help` lists the rest (`--no-edns`, `--nsid`, `--mqtype`, `--root-hints`,
 `--dns-suffix`, `--timeout`, `--trace-file`, `--qname-min`,
-`--allow-out-of-bailiwick-glue`, `--no-failure-cache`, `-v`, `--debug`).
+`--allow-out-of-bailiwick-glue`, `--ignore-special-names`, `--no-failure-cache`,
+`-v`, `--debug`).
+
+Special-use names are answered from the registry, never from the network
+(`namespy/special.py`): `.invalid` is NXDOMAIN on sight (RFC 6761 §6.4),
+`localhost` names answer the loopback address for A/AAAA and nothing for
+every other type (§6.3), `.test` and the RFC 1918 reverse zones answer
+negative by default (§6.2, §6.1), `.local` stays on its link (RFC 6762 §3),
+and `.onion` is refused per RFC 7686 §2. `--ignore-special-names` enables
+the configuration option §6.2¶4 itself tells resolvers to offer — for a
+private network that really does serve those names; it warns, because the
+same flag releases `.onion` queries, which leak the question before they
+waste it.
 
 `--trace` prints the walk live — one numbered line per step on stderr, as the
 walk takes it — queries show the zone

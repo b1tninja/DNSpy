@@ -55,7 +55,8 @@ def _aggr_walk(
     if client_cd:
         kwargs["client_cd"] = True
     return wiring._drive(
-        resolve_steps(sname, wiring._seed_slist(sname), cache, **kwargs), list(responses)
+        resolve_steps(sname, wiring._seed_slist(sname), cache, special_names="ignore", **kwargs),
+        list(responses),
     )
 
 
@@ -241,6 +242,7 @@ def test_the_trace_names_the_proof_that_vouched():
         anchors=(wiring._anchor(),),
         now=wiring.NOW,
         aggressive_nsec=True,
+        special_names="ignore",  # fixture tree is .test; see test_dnssec_wiring
     )
     pending = next(generator)
     trace.record(pending)

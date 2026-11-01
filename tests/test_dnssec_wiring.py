@@ -374,6 +374,12 @@ def _txt_walk(
         "aggressive_nsec": aggressive,
         "client_cd": client_cd,
     }
+    # The fixture tree lives in .test (RFC 2606), and RFC 6761 §6.2¶4 says a
+    # caching resolver denies those names *by default* -- the exception it
+    # names is exactly what this file is: a private network that really does
+    # serve .test from its own authorities. So the harness switches the
+    # option §6.2¶4 tells resolvers to offer, everywhere a walk is built.
+    kwargs["special_names"] = "ignore"
     if anchors:
         kwargs["anchors"] = tuple(anchors)
     return _drive(resolve_steps(sname, _seed_slist(sname), cache, **kwargs), list(responses))
@@ -436,6 +442,7 @@ def _walk(
         kwargs["client_cd"] = True
     if failures is not None:
         kwargs["failures"] = failures
+    kwargs["special_names"] = "ignore"  # private .test net; see _walk's note
     return _drive(
         resolve_steps(sname, _seed_slist(sname), cache, **kwargs),
         list(responses),
@@ -772,6 +779,7 @@ def test_a_hint_pointing_at_an_unvisited_zone_stops_instead_of_spinning():
             dnssec_ok=True,
             anchors=(_anchor(),),
             now=NOW,
+            special_names="ignore",  # private .test net; see _walk's note
         ),
         [nxdomain("aaa.zone.test.", [soa(), *zone_denials()])],
     )
@@ -812,7 +820,13 @@ def test_the_trace_marks_chain_queries_and_renders_the_verdict():
     trace = Trace(sname)
     script = _secure_script("aaa.zone.test.")
     generator = resolve_steps(
-        sname, _seed_slist(sname), cache, dnssec_ok=True, anchors=(_anchor(),), now=NOW
+        sname,
+        _seed_slist(sname),
+        cache,
+        dnssec_ok=True,
+        anchors=(_anchor(),),
+        now=NOW,
+        special_names="ignore",  # private .test net; see _walk's note
     )
     pending = next(generator)
     trace.record(pending)

@@ -39,7 +39,8 @@ def _stale_walk(cache, name, *, responses=(), serve_stale=3600.0, client_cd=Fals
     if failures is not None:
         kwargs["failures"] = failures
     return wiring._drive(
-        resolve_steps(sname, wiring._seed_slist(sname), cache, **kwargs), list(responses)
+        resolve_steps(sname, wiring._seed_slist(sname), cache, special_names="ignore", **kwargs),
+        list(responses),
     )
 
 
@@ -274,6 +275,7 @@ def test_the_trace_says_the_answer_was_expired():
         dnssec_ok=False,
         now=wiring.NOW,
         serve_stale=3600.0,
+        special_names="ignore",  # fixture tree is .test; see test_dnssec_wiring
     )
     pending = next(generator)
     trace.record(pending)
