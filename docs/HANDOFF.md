@@ -2972,6 +2972,57 @@ skipped. Next in the planned order: U1 (the responder hook) with U2 (the
 reflexive zone) riding it — the roadmap's "order of attack" stands.
 
 
+### Follow-up: the server that answers with a lambda — dynamic responders and the reflex (increment V, rows U1 + U2)
+
+The hook's whole design argument is placement: `respond_to_packet` was
+already a gate funnel (NXNAME, OPCODE, OPT count, EDNS version, option
+validation) with the recursion after the last gate, so `bind()` slots in
+front of `async with self._slots` and `_dynamic_reply` sends through `_reply`
+— the one egress door every response in the project already used. That is why
+the tests for "dynamic answers inherit the obligations" (OPT echo, CD copy,
+512-clause truncation, EDE plumbing, stream framing) are assertions about
+*other* code still running rather than about the hook itself; the one
+obligation deliberately NOT inherited is the semaphore: bound names do no
+upstream work, so they cannot starve the recursion budget — pinned by
+answering a bound query while every slot is held.
+
+The contract three ways: records (NOERROR + answers, AA set because this
+server IS the authority it claims), `DynamicResponse(rcode=..., authority=...)`
+for verdicts, `None` to fall through. Empty records is a *deliberate* NODATA,
+distinct from None — the difference between "I am the zone and it has none"
+and "ask the network"; that distinction is the whole reason a verdict type
+exists next to the bare sequence. A handler that raises answers SERVFAIL:
+fall-through would send to the public DNS the exact name the operator bound
+to keep off the wire, and a broken substitute is not a licence to consult the
+original. Handlers are sync on purpose; they run on the reply task.
+
+The reflex responder is the project's first consumer of its own hook, and the
+TNAC analogy is in its docstring because it is load-bearing: the answer can
+only come from the socket, which is the one thing that makes it honest. A
+family the transport cannot see answers NODATA rather than inventing it (A
+from a v6 peer → empty); TXT names the ephemeral port because it is the fact
+a debugger wants and the querier cannot forge; TTL 0 everywhere because a
+snapshot of your own packet has nothing to expire against. The name is NOT
+standardized — `whoami.cloudflare` and `o-o.myaddr.l.google.com` are
+deployment conventions and the module says so rather than citing nothing as
+if citing something.
+
+`examples/dynamic_responders.py` is the repo's first example, and it earned
+its keep at birth: Windows reserves high ports without asking (WinError 10013
+on 5353 — Hyper-V/WinNAT exclusion), so the demo tries its preferred port,
+falls back to OS-picked, and prints the truth; the E2E run watched it answer
+on 49952 including its own client port in the TXT sentence. The banner prints
+with flush=True for the same honesty reason — a demo whose instructions stay
+in a stdout buffer when backgrounded tells nobody anything.
+
+Windows note for future sessions: drive live-process demos from a python
+subprocess harness, not PowerShell string-matching — array `-match` does not
+populate `$Matches`, and hidden-window stdout is buffered. 22 tests; full
+suite 1813 passed, 1 skipped. Next in the planned order: U5 (DoT server —
+namespy authenticating namespy), then U3 (filtering with the EDE vocabulary);
+the reflex's NSID/TLS-scope sentence waits for U5 to have a TLS to name.
+
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

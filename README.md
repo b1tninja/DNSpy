@@ -86,6 +86,12 @@ for exactly where a zone cut was crossed and which NS forced a glueless
 sub-resolution, and the terminal lines are where to look while it happens.
 
 `--serve` binds loopback on purpose. It is a codec exercise, not a name server;
+but it does answer for names you give it: `--serve-reflexive` binds the
+reflexive zone (`namespy --forward 127.0.0.1 whoami TXT` answers the address,
+port, and transport your query arrived on — an answer only the socket can
+give), and `DnsServer.bind(name, handler)` is the same door for anything a
+callable can compute — see `examples/dynamic_responders.py`, which runs the
+reflex, a lambda die, a clock, and a suffix-bound mirror on one port.
 exposing a recursive resolver to a network you do not control turns it into an
 amplification instrument (RFC 5358, RFC 9085). See [`SECURITY.md`](SECURITY.md).
 

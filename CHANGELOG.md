@@ -8,6 +8,39 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **Dynamic responders, and the DNS calling-number announcement circuit
+  (second-horizon U1 + U2).** `DnsServer.bind(name, handler,
+  include_subdomains=...)` slots a handler between the validation gates and
+  the recursion: it receives a `ResponderRequest` — qname, qtype, source
+  address, transport, DO/CD, the packet itself — and answers with records, a
+  `DynamicResponse` naming its own RCODE, or `None` to let the network speak.
+  The design claim is inheritance, and the tests assert nothing else: the
+  verdict re-enters `_reply` like every other answer, so the OPT echo, CD
+  copy, AD gating, EDE mapping, datagram truncation, and stream framing are
+  structural, not courtesies a handler can forget to call; a bundled query to
+  a bound name gets the empty MQTYPE-Response that honestly claims "supported,
+  not combined"; and bound answers never spend a `max_concurrent_lookups`
+  slot, because a name the operator owns needs no upstream work to flood.
+  A handler that raises answers SERVFAIL rather than falling through — the
+  binding exists precisely so the network is never asked about that name.
+  The first handler the project ships on its own hook is U2's reflexive zone:
+  `whoami` A/AAAA/TXT answering the address and port the query *arrived from*
+  and the transport it arrived on — the calling-number announcement circuit,
+  in the family of `whoami.cloudflare` and `o-o.myaddr.l.google.com`, with no
+  RFC inventing the name and the docstring saying so. Its honesty is the
+  design: an A query from an IPv6-only peer answers NODATA rather than
+  inventing a v4 it cannot see, TTL 0 everywhere because a snapshot of your
+  own packet is not cacheable, and the TXT sentence names the ephemeral port
+  because "did my two queries share a socket?" is the fact a debugger wants
+  and the querier cannot forge. `--serve --serve-reflexive` binds it on the
+  loopback demo, UDP and TCP alike — the TCP answer says "over tcp", which is
+  the demo's whole lesson. `examples/dynamic_responders.py` is the project's
+  first runnable example: four names, four handlers (the shipped reflex, a
+  lambda die, a TTL-0 clock, a suffix-bound mirror), and a fallback port for
+  the high ports Windows reserves for itself — the end-to-end run watched it
+  take port 49952 after 5353 was refused and print the truth. 22 tests in
+  `tests/test_dynamic_responders.py`; roadmap rows U1 and U2 ✅.
+
 - **RFC 6761's registry answers before the walk — the second horizon's first
   row shipped (U8).** `.invalid`, `.test`, `.local`, `.onion` and the eighteen
   RFC 1918 reverse zones are names the registry says a caching resolver answers

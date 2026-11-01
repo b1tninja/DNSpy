@@ -116,8 +116,10 @@ that path carries an empty list rather than silence.
 """
 
 import asyncio
+import ipaddress
 import logging
 import struct
+from dataclasses import dataclass
 
 from . import enable_path_mtu_discovery
 from .anchors import sentinel_expectation, trusted_anchor_tags
@@ -143,14 +145,17 @@ from .mqtype import (
     mqtype_response_option,
     qtypes_of,
 )
+from .names import DomainName
 from .packet import (
     OPT_RTYPE,
     DnsPacket,
     DnsPacketParseError,
     DnsQuestion,
+    DnsRecord,
     Query,
     Response,
 )
+from .rdata import RData_A, RData_AAAA, RData_TXT
 from .resolver import EDNS_PAYLOAD_SIZE, RecursiveResolver
 
 LOGGER = logging.getLogger(__name__)
@@ -309,6 +314,109 @@ _SECTIONS = (
 _CLIENT_STRIP_TYPES = DNSSEC_SECURITY_TYPES | {int(DnsRType.DS)}
 
 
+@dataclass(frozen=True)
+class ResponderRequest:
+    """Everything a bound responder is entitled to know about one query.
+
+    The point of a dedicated context rather than the raw packet is the
+    reflex case (U2): what makes a ``whoami`` answer honest is that it can
+    only come from the transport -- ``address`` is where the datagram
+    arrived *from*, ``transport`` is the socket it arrived on -- facts the
+    question itself cannot carry and a zone file cannot hold. *dnssec_ok*
+    and *cd* ride along because an answer's shape may legitimately depend
+    on whether the client validates; the full *packet* is there for a
+    handler that needs more, at its own risk of coupling.
+    """
+
+    name: DomainName
+    qtype: int
+    qclass: int
+    address: tuple
+    transport: str
+    dnssec_ok: bool
+    cd: bool
+    packet: DnsPacket
+
+
+@dataclass(frozen=True)
+class DynamicResponse:
+    """What a responder says. A bare sequence of records is this with defaults.
+
+    *answers* empty is a deliberate NODATA: the handler answered, and its
+    answer is "nothing at this name" -- distinct from returning ``None``,
+    which means "not mine, ask the network". *rcode* ``None`` reads as
+    NO_ERROR; a handler that wants NXDOMAIN or REFUSED says so, and the
+    question echo, OPT rules, and EDE mapping that every other response
+    gets are applied by the same :meth:`DnsServer._reply` door either way.
+    """
+
+    rcode: object = None
+    answers: tuple = ()
+    authority: tuple = ()
+
+
+class _ResponderFailed:
+    """Sentinel: a bound handler raised. Fall-through is the one answer left
+    that must not happen -- the operator bound this name precisely so the
+    network would never be asked about it -- so the query dies SERVFAIL."""
+
+
+_RESPONDER_FAILED = _ResponderFailed()
+
+
+#: The name :func:`whoami_responder` answers, when ``--serve-reflexive`` binds
+#: it. A local invention in the family of ``whoami.cloudflare`` and
+#: ``o-o.myaddr.l.google.com`` -- no RFC registers it, and none of those names
+#: is standardized either; the reflex *service* is the idea, the name is
+#: deployment.
+REFLEXIVE_NAME = DomainName("whoami.")
+
+
+def whoami_responder(request: ResponderRequest) -> DynamicResponse:
+    """The calling-number announcement circuit, in DNS.
+
+    TNAC was the telephone network's courtesy: dial a number and the network
+    tells you the number you called from -- an answer only the transport can
+    give, which is exactly what makes it unforgeable advice. This is that
+    service for a DNS server: the source address of the query that arrived,
+    as A/AAAA it is visible in, plus a TXT that says so in words. Nothing is
+    asserted about the *caller*; only about what this socket saw, which is
+    the whole honesty of the design:
+
+    * an A query from an IPv4 peer answers its address; from an IPv6 peer it
+      answers NODATA -- the v4 side is not visible here, and inventing it
+      would break the one promise the service makes;
+    * TXT always answers, and names the port too, because the ephemeral port
+      is the fact a debugger actually wants ("did my two queries share a
+      socket?") and it cannot be forged by the querier either;
+    * every record carries TTL 0: there is nothing to cache about a snapshot
+      of someone's own packet, and the next query will differ at least in
+      the port.
+
+    The CHaos-class precedent (``version.bind``, ``id.server``) is why TXT is
+    the traditional medium; this answers in the IN class, where the resolver
+    in front of the demo needs no special handling to fetch it.
+    """
+    host, port = str(request.address[0]), request.address[1]
+    try:
+        version = ipaddress.ip_address(host).version
+    except ValueError:
+        # A peer address this module cannot parse is a bug or a weird scope
+        # id; NODATA beats composing a sentence about bytes nobody verified.
+        return DynamicResponse()
+    records = []
+    if request.qtype in (int(DnsQType.A), int(DnsQType.ANY)) and version == 4:
+        records.append(DnsRecord(request.name, DnsRType.A, ttl=0, rdata=RData_A(host)))
+    if request.qtype in (int(DnsQType.AAAA), int(DnsQType.ANY)) and version == 6:
+        records.append(DnsRecord(request.name, DnsRType.AAAA, ttl=0, rdata=RData_AAAA(host)))
+    if request.qtype in (int(DnsQType.TXT), int(DnsQType.ANY)):
+        sentence = f"namespy saw you at {host}:{port} over {request.transport}"
+        if request.dnssec_ok:
+            sentence += ", DO set"
+        records.append(DnsRecord(request.name, DnsRType.TXT, ttl=0, rdata=RData_TXT([sentence])))
+    return DynamicResponse(answers=tuple(records))
+
+
 class DnsServer(asyncio.Protocol):
     """Answer DNS queries over a datagram transport by recursing.
 
@@ -398,6 +506,11 @@ class DnsServer(asyncio.Protocol):
         # without being stored can be collected before it finishes.
         self._tasks: set[asyncio.Task] = set()
         self._slots = asyncio.Semaphore(self.max_concurrent_lookups)
+        # Bound dynamic responders, in bind order: (zone, include_subdomains,
+        # handler). Empty by default -- a server nobody configured answers
+        # nothing of its own, and every query walks the resolver as it always
+        # did. See :meth:`bind`.
+        self._responders: list[tuple[DomainName, bool, object]] = []
 
     def connection_made(self, transport):
         self.transport = transport
@@ -417,6 +530,111 @@ class DnsServer(asyncio.Protocol):
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
+
+    def bind(self, name, handler, *, include_subdomains=False) -> None:
+        """Answer *name* from *handler* instead of recursing for it.
+
+        The handler takes a :class:`ResponderRequest` and returns ``None``
+        (not mine -- ask the network), a sequence of
+        :class:`~namespy.packet.DnsRecord` (the answer, NOERROR), or a
+        :class:`DynamicResponse` to choose the RCODE or an authority section.
+        Bindings are consulted in bind order, first non-``None`` wins, and a
+        handler is sync-on-purpose: it runs on the reply task between the
+        validation gates and the recursion, so anything slow is the operator
+        choosing to be slow.
+
+        What a bound answer inherits is the argument for the hook's shape:
+        the response re-enters :meth:`_reply` like any other, so the OPT
+        echo, CD copy, AD gating, DNSSEC strip, EDE mapping, datagram
+        fitting, and stream framing the resolver's answers get are not
+        per-caller courtesies a responder can forget to call -- they are
+        structural. What a bound answer does *not* inherit is the
+        ``max_concurrent_lookups`` semaphore: a responder answers without
+        upstream work, so a flood aimed at a bound name cannot spend the
+        recursion budget, which is the same reflection defense the module
+        docstring draws the semaphore for.
+
+        A handler that raises answers SERVFAIL rather than falling through:
+        the operator bound the name precisely so the network would never be
+        asked about it, and the failure of the substitute is not a licence
+        to consult the original. The exception reaches the debug log, not
+        the wire.
+        """
+        zone = name if isinstance(name, DomainName) else DomainName(str(name))
+        if not callable(handler):
+            raise TypeError(f"handler must be callable, got {type(handler).__name__}")
+        self._responders.append((zone, bool(include_subdomains), handler))
+
+    def _consult_responders(self, dns_packet, addr, channel):
+        """The bound handlers' turn, between the gates and the recursion.
+
+        Returns ``None`` (nothing bound answered), a :class:`DynamicResponse`,
+        or :data:`_RESPONDER_FAILED`. Name matching is DomainName comparison,
+        so it is the case-insensitive folding of RFC 1035 §2.4.4 rather than
+        a string equality that would answer ``WHOAMI.`` and walk ``whoami.``.
+        """
+        question = dns_packet.questions[0]
+        request = ResponderRequest(
+            name=question.name,
+            qtype=int(question.qtype),
+            qclass=int(question.qclass),
+            address=addr,
+            transport="udp" if channel is None else "tcp",
+            dnssec_ok=bool(getattr(dns_packet, "dnssec_ok", False)),
+            cd=bool(dns_packet.CD),
+            packet=dns_packet,
+        )
+        for zone, include_subdomains, handler in self._responders:
+            hit = request.name.is_subdomain_of(zone) if include_subdomains else request.name == zone
+            if not hit:
+                continue
+            try:
+                outcome = handler(request)
+            except Exception as exc:
+                self.log.debug(
+                    "server_responder_failed(src=%s name=%s err=%s)",
+                    addr[0],
+                    request.name,
+                    type(exc).__name__,
+                )
+                return _RESPONDER_FAILED
+            if outcome is None:
+                continue  # the handler declined; the next binding or the network speaks
+            if isinstance(outcome, DynamicResponse):
+                return outcome
+            return DynamicResponse(answers=tuple(outcome))
+        return None
+
+    def _dynamic_reply(self, dns_packet, addr, verdict, asked, channel) -> None:
+        """Send a responder's verdict out the one egress door.
+
+        ``AA`` set because this server *is* the authority it is claiming:
+        whoami data comes from its own socket and nothing else. ``RD``
+        echoes nothing -- recursion remains available whatever this answer
+        skipped, and the flag's response-side meaning is that promise
+        (RFC 1035 §4.1.1). The MQTYPE signal rides as the empty list when
+        the query asked to bundle: §3.4 obliges a supporting server to say
+        so on a valid query, and a bound name is one the server refuses to
+        combine because combination means looking types up, which is not
+        what the operator bound here for.
+        """
+        response = Response(
+            ID=dns_packet.ID,
+            QR=DnsQR.RESPONSE,
+            AA=True,
+            RD=True,
+            RCODE=DnsResponseCode.NO_ERROR if verdict.rcode is None else verdict.rcode,
+            questions=list(dns_packet.questions),
+            answers=list(verdict.answers),
+            nameservers=list(verdict.authority),
+        )
+        self._reply(
+            response,
+            addr,
+            request=dns_packet,
+            mqtype_answered=[] if asked is not None else None,
+            channel=channel,
+        )
 
     def _reply(
         self, response, addr, request=None, extended_errors=(), mqtype_answered=None, channel=None
@@ -1354,6 +1572,20 @@ class DnsServer(asyncio.Protocol):
             return
 
         asked = self._mqtype_request(dns_packet)
+        verdict = self._consult_responders(dns_packet, addr, channel)
+        if verdict is _RESPONDER_FAILED:
+            self._error(
+                dns_packet,
+                addr,
+                DnsResponseCode.SERVER_FAILURE,
+                mqtype_answered=[] if asked is not None else None,
+                channel=channel,
+                extended_errors=(),
+            )
+            return
+        if verdict is not None:
+            self._dynamic_reply(dns_packet, addr, verdict, asked, channel)
+            return
         async with self._slots:
             try:
                 response = await self.resolver.resolve(dns_packet)

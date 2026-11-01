@@ -42,7 +42,13 @@ from .resolver import (
     RecursiveResolver,
     SpecialNamesPolicy,
 )
-from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer, DnsStreamServer
+from .server import (
+    MQTYPE_RECOMMENDED_QTX_LIMIT,
+    REFLEXIVE_NAME,
+    DnsServer,
+    DnsStreamServer,
+    whoami_responder,
+)
 from .stub import TRANSPORTS, StubResolver, Upstream
 from .trace import Trace
 
@@ -518,6 +524,21 @@ def build_parser():
         "without ever buying a second lookup: the MQTYPE-Response still goes out, "
         "empty, which is what 'this is understood and nothing was combined' sounds "
         "like, and silence is what 'not implemented' sounds like",
+    )
+    p.add_argument(
+        "--serve-reflexive",
+        dest="serve_reflexive",
+        action="store_true",
+        help="with --serve: bind the reflexive zone -- answer 'whoami' A/AAAA/TXT "
+        "with the address the query arrived from, the port, and the transport "
+        "(namespy --forward 127.0.0.1 whoami A is the whole client). The "
+        "calling-number announcement circuit for DNS, in the family of "
+        "whoami.cloudflare and o-o.myaddr.l.google.com: an answer only the "
+        "socket can give, which is what makes it unforgeable advice. TTL 0 "
+        "throughout -- a snapshot of your own packet is not a cacheable fact "
+        "-- and an A query from an IPv6-only peer answers NODATA rather than "
+        "inventing an address it cannot see (see namespy.server.whoami_responder, "
+        "and DnsServer.bind for binding your own)",
     )
     p.add_argument(
         "--qname-min",
@@ -1224,6 +1245,15 @@ async def serve(args) -> int:
             ),
             local_addr=("127.0.0.1", 53),
         )
+        if getattr(args, "serve_reflexive", False):
+            # Bound after construction rather than passed in: bind() is the
+            # same door a library embedder uses, and the demo flag is allowed
+            # to look like the API from the outside because it is one call of
+            # it. UDP and TCP share this server instance, so the reflex
+            # answers on both -- and the TCP answer says "tcp", which is the
+            # demo's whole lesson: the answer is the transport's, not a zone's.
+            _server_protocol.bind(REFLEXIVE_NAME, whoami_responder)
+            logging.debug("server_reflexive_bound(name=%s)", REFLEXIVE_NAME)
         logging.debug(
             "%s bound to: %s", _server_protocol, _server_transport.get_extra_info("sockname")
         )
