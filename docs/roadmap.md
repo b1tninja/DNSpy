@@ -248,8 +248,10 @@ this table tested itself against it: **four remembered RFC numbers were wrong**
 (RPZ's is RTP/TTML, the filtering experience RFC is MPLS, the DNS log-record
 RFC is COSE, the blocklist-etiquette RFC is SIP), and the corpus check
 settled each row's anchors the same way the citation sweeps settle code's.
-Nothing below is ✅ — these are proposals — but every row cites documents that
-answered `info()` and `search()` at planning time, October 2026.
+Six of the nine rows below are ✅ — U1, U2, U3, U4, U5 and U8
+shipped; U6, U7 and U9 remain proposals — and every row, shipped or
+not, cites documents that answered `info()` and `search()` at planning
+time, October 2026.
 
 | # | Capability | Spec anchors (verified) | Sketch | Why it is cheap now |
 |---|---|---|---|---|
