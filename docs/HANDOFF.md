@@ -19,9 +19,9 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, **in sync with `origin/master`** as of increment Z's push (the split history and increments U–Z are all landed and CI-green) — pushes run the branch-protected 10 required checks, strict |
-| Suite | 1888 passed, 0 failed, 1 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements) |
+| Suite | 1928 passed, 0 failed, 1 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements) |
 | Coverage | 91% measured with `coverage run -m pytest` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` — the ratchet comment asks for it to be raised only from numbers CI itself reports, so it stays at 80 |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`), and **the serve side grew a ladder** — special-use names (RFCs 6761/6762/7686) are refused to walk, `DnsServer.bind()` responders and the reflexive zone answer from the socket (increment V), DNS over TLS works in both directions (`--serve-dot`, `--forward-dot`; increment W), `--filter` refuses by policy with RFC 8914 §4.16–§4.19's codes and nothing else (increment X), and `--serve-query-log` signs every answer as one JSON line naming the rung it came off (increment Y), and `--rbl`/`--ptr` read blocklist zones and reverse trees through the same reversal, keeping listed/not-listed/unknown three separate answers down to the exit code (increment Z, `namespy/rbl.py`, `examples/blocklist.py`) |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`), and **the serve side grew a ladder** — special-use names (RFCs 6761/6762/7686) are refused to walk, `DnsServer.bind()` responders and the reflexive zone answer from the socket (increment V), DNS over TLS works in both directions (`--serve-dot`, `--forward-dot`; increment W), `--filter` refuses by policy with RFC 8914 §4.16–§4.19's codes and nothing else (increment X), and `--serve-query-log` signs every answer as one JSON line naming the rung it came off (increment Y), and `--rbl`/`--ptr` read blocklist zones and reverse trees through the same reversal, keeping listed/not-listed/unknown three separate answers down to the exit code (increment Z, `namespy/rbl.py`, `examples/blocklist.py`), and `--zone FILE` makes the server authoritative for RFC 1035 §5.1 master files with RFC 1034 §4.3.2 answers — AA, real referrals, synthesized wildcards, the query log's `zone` rung (increment AA, `namespy/zone.py`; U6's transfer leg follows) |
 | Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
@@ -3298,6 +3298,77 @@ the ones nobody lists are exactly where the ghost sentences live.
 The habit to keep: a sentence that sounds RFC-shaped is presumed
 ghost until it is found, and paraphrase without quotation marks is
 always the safer costume.
+
+### Follow-up: the authoritative arc's first leg — a zone file in, §4.3.2 out (increment AA, row U6's serve half)
+
+`namespy/zone.py` is the campaign's opening move, planned against its
+row and split honestly: the row says "serve a zone, then transfer one",
+and only the serving half is landed — the roadmap row carries a
+half-check sentence rather than the ✅ its transfer leg has not earned.
+AXFR (RFC 5936 framing + RFC 9103 fast-done) with TSIG (RFC 8945, whose
+one verified errata is still owed a read before that increment starts)
+is the next move on this row.
+
+The parser is §5.1 sentence by sentence: the character-state scanner
+handles the three quoting regimes the section names (parens across line
+boundaries, text literals that "can contain CRLF within the text", the
+`;` comment that only counts outside quotes), owner/TTL/class default to
+"the last stated" values, `$ORIGIN`/`$INCLUDE` are the section's two
+control entries with the include honoring its own no-effect-on-parent
+sentence, RFC 2308's `$TTL` loads under its verbatim extension sentence,
+and unknown types arrive as RFC 3597 §5's `\#` blobs — which is also
+the loader for any known type with no builder, no silent dropping.
+TTLs are plain decimal integers (§5.1's exact words) because the
+unit-suffix mechanism never produced a citable sentence and this project
+does not cite memory. `$GENERATE` is refused by name with the reason in
+the error text.
+
+Serving follows §4.3.2's steps as written, and the two judgment calls
+are recorded where they live: a wildcard that exists but lacks the
+queried type answers NODATA (the encloser's wildcard makes the name
+effectively existent — the modern authority behavior), and a CNAME
+leaving the zone ends the chain with the CNAMEs as the answer (this
+module serves data; it does not walk). Glue is in-bailiwick only — step
+3b's "whatever addresses are available" is an authorization, not an
+obligation to chase. The referral's AA=off is the increment's whole
+point and its own test.
+
+Dispatch order in the server: responders > zones > filter > forwarder >
+recursion, reasoned in `serve_zone`'s docstring — a bound name overrides
+even the operator's own zone; the filter guards borrowed recursion and
+has nothing to say about authored answers. The query log's documented
+ladder grew its first new rung (`zone`), which is what the Y increment's
+"origin vocabulary" is for. `DynamicResponse` grew `additional` and `aa`
+— the egress door stayed the single door.
+
+Bugs the increment caught before landing, all worth the reread:
+
+- Memory quoted the docs again: the draft docstring rendered §5.1's
+  escape-table row as "the single 8-bit character represented by the
+  decimal value DDD", which is not the sentence (it is "the octet
+  corresponding to the decimal number described by DDD"), and §5.1 does
+  not call the `\#` form "opaque" at all — 3597 §5's own words are now
+  the quotes. Caught by the same presume-ghost habit from increment Z,
+  one increment after Z's lesson was written.
+- `str(DomainName)` is not canonical: `from_labels` re-renders a literal
+  dot inside a label as `\046` while a presentation input keeps `\.`, and
+  a node dict keyed on the string stored one owner under two spellings
+  (the escaped-dot test answered with the WILDCARD before this was
+  fixed — the wrong-name shape that should scare anyone). The key is now
+  the folded label octet tuple, which is the name.
+- Two test-side zone texts forgot a `$TTL` before their first record and
+  one forgot its opening paren — the parser was right three times in a
+  row and the tests apologized.
+
+Tests: 40 in `tests/test_zone.py` (grammar incl. the `$INCLUDE`
+round-trip through a real tmp directory, both error-sentence families,
+every §4.3.2 answer shape, CNAME loop guard, cut-over-wildcard
+precedence, and the live server dispatch on the in-process harness —
+wire-level AA, question echo, referral sections, bind precedence, and
+the log's `zone` rung included). Full suite after: 1928 passed, 1
+skipped; `-O` clean; mypy 34 files; ruff check and format clean;
+coverage TOTAL 91% (zone.py itself 84 — the error-branch prose is the
+residue). Next on this row: the transfer leg.
 
 
 ## Previous round: MQTYPE (RFC 10029)

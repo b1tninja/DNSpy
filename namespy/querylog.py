@@ -24,7 +24,9 @@ carry are the house rules that needed no specification:
   file reads and a truncated file loses one record rather than the
   format. Field names follow the packet and the trace, not invention:
   ``origin`` is the ladder the server already answers on --
-  ``bind`` (a responder), ``policy`` (a filter verdict), ``forward``
+  ``bind`` (a responder), ``zone`` (authoritative data from a loaded
+  master file, answers and referrals alike), ``policy`` (a filter verdict),
+  ``forward``
   (configured upstreams), ``recurse`` (the walk, cache included),
   ``reject`` (a refusal this server composed about the request).
   A cache answer is not called out separately because nothing else

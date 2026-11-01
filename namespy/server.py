@@ -368,11 +368,22 @@ class DynamicResponse:
     NO_ERROR; a handler that wants NXDOMAIN or REFUSED says so, and the
     question echo, OPT rules, and EDE mapping that every other response
     gets are applied by the same :meth:`DnsServer._reply` door either way.
+
+    Two fields belong to the zone server as much as to handlers:
+    *additional* is where step 3b's glue goes (RFC 1034 section 4.3.2:
+    "Put whatever addresses are available into the additional section"),
+    and *aa* is the claim itself -- True for data this server authored,
+    False for the referral, whose authority belongs to the zone named
+    in the authority section. A responder has no reason to set it
+    False; the flag exists because an authoritative answer and an
+    "ask-them" answer must not wear the same face.
     """
 
     rcode: object = None
     answers: tuple = ()
     authority: tuple = ()
+    additional: tuple = ()
+    aa: bool = True
 
 
 class _ResponderFailed:
@@ -456,6 +467,7 @@ class DnsServer(asyncio.Protocol):
         dot_upstreams=(),
         filter_policy: FilterPolicy | None = None,
         query_log: QueryLog | None = None,
+        zones=(),
     ):
         """
         :param nsid: the RFC 5001 name-server identifier to advertise when a
@@ -596,6 +608,10 @@ class DnsServer(asyncio.Protocol):
         self._filter = filter_policy
         # The operator's file, when one was asked for: see :param query_log.
         self._query_log = query_log
+        # Authoritative zones, consulted after the binds and before the
+        # filter: a zone is a serve decision the operator loaded, and the
+        # filter is policy about what this server asks on others' behalf.
+        self._zones = list(zones)
 
     def connection_made(self, transport):
         self.transport = transport
@@ -650,6 +666,48 @@ class DnsServer(asyncio.Protocol):
             raise TypeError(f"handler must be callable, got {type(handler).__name__}")
         self._responders.append((zone, bool(include_subdomains), handler))
 
+    def serve_zone(self, zone) -> None:
+        """Answer as the authority for *zone* (:class:`namespy.zone.Zone`).
+
+        Zones are consulted after the bind list and before the filter:
+        a bound name is the operator overriding even their own zone,
+        while the filter guards what the server asks for others and has
+        nothing to say about what this server authored. Later zones win
+        nothing over earlier ones -- the first zone that claims the
+        question's name answers it, and two zones claiming one name is
+        a configuration error the load step cannot see.
+        """
+        self._zones.append(zone)
+
+    def _consult_zones(self, dns_packet, addr):
+        """A loaded zone's answer as a verdict, or None for none of them.
+
+        The Zone.serve shapes (AA claim, step-3b referral, synthesized
+        wildcard with the query's own name as owner) arrive as written:
+        this only translates the sections into the one egress door's
+        currency.
+        """
+        question = dns_packet.questions[0]
+        for zone in self._zones:
+            answer = zone.serve(question.name, int(question.qtype), int(question.qclass))
+            if answer is None:
+                continue
+            self.log.debug(
+                "server_zone(src=%s name=%s aa=%s answers=%d)",
+                addr[0],
+                question.name,
+                answer.aa,
+                len(answer.answers),
+            )
+            return DynamicResponse(
+                rcode=answer.rcode,
+                answers=answer.answers,
+                authority=answer.authority,
+                additional=answer.additional,
+                aa=answer.aa,
+            )
+        return None
+
     def _consult_responders(self, dns_packet, addr, channel):
         """The bound handlers' turn, between the gates and the recursion.
 
@@ -692,11 +750,13 @@ class DnsServer(asyncio.Protocol):
             return DynamicResponse(answers=tuple(outcome))
         return None
 
-    def _dynamic_reply(self, dns_packet, addr, verdict, asked, channel) -> None:
-        """Send a responder's verdict out the one egress door.
+    def _dynamic_reply(self, dns_packet, addr, verdict, asked, channel, origin="bind") -> None:
+        """Send a responder's or a zone's verdict out the one egress door.
 
-        ``AA`` set because this server *is* the authority it is claiming:
-        whoami data comes from its own socket and nothing else. ``RD``
+        ``AA`` carries the verdict's own claim -- True for bound names
+        and zone data ("this server *is* the authority it is claiming"),
+        False for the step-3b referral, whose answer belongs to the
+        servers named in its authority section. ``RD``
         echoes nothing -- recursion remains available whatever this answer
         skipped, and the flag's response-side meaning is that promise
         (RFC 1035 §4.1.1). The MQTYPE signal rides as the empty list when
@@ -708,12 +768,13 @@ class DnsServer(asyncio.Protocol):
         response = Response(
             ID=dns_packet.ID,
             QR=DnsQR.RESPONSE,
-            AA=True,
+            AA=verdict.aa,
             RD=True,
             RCODE=DnsResponseCode.NO_ERROR if verdict.rcode is None else verdict.rcode,
             questions=list(dns_packet.questions),
             answers=list(verdict.answers),
             nameservers=list(verdict.authority),
+            additional_records=list(verdict.additional),
         )
         self._reply(
             response,
@@ -721,7 +782,7 @@ class DnsServer(asyncio.Protocol):
             request=dns_packet,
             mqtype_answered=[] if asked is not None else None,
             channel=channel,
-            origin="bind",
+            origin=origin,
         )
 
     def _filtered_reply(self, dns_packet, addr, asked, channel, rule) -> None:
@@ -1862,6 +1923,11 @@ class DnsServer(asyncio.Protocol):
         if verdict is not None:
             self._dynamic_reply(dns_packet, addr, verdict, asked, channel)
             return
+        if self._zones:
+            zone_verdict = self._consult_zones(dns_packet, addr)
+            if zone_verdict is not None:
+                self._dynamic_reply(dns_packet, addr, zone_verdict, asked, channel, origin="zone")
+                return
         if self._filter is not None and dns_packet.questions:
             rule = self._filter.evaluate(dns_packet.questions[0].name)
             if rule is not None:

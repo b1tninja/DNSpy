@@ -59,6 +59,7 @@ from .server import (
 )
 from .stub import TRANSPORTS, StubResolver, Upstream
 from .trace import Trace
+from .zone import Zone, ZoneParseError
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
 EXAMPLE_NAME = "example.org"
@@ -639,6 +640,19 @@ def build_parser():
         "default: this file records where your clients went, so it exists "
         "only because a flag said so, and retention stays the filesystem's "
         "problem",
+    )
+    p.add_argument(
+        "--zone",
+        action="append",
+        metavar="FILE",
+        default=None,
+        help="serve FILE as an authoritative zone, repeatable: an RFC 1035 "
+        "section 5.1 master file ($ORIGIN, $TTL, $INCLUDE, parentheses, "
+        "RFC 3597 \\# generic RDATA all load; $GENERATE is refused). "
+        "In-zone answers carry AA; names below an in-zone cut get a real "
+        "referral -- the child's NS in authority, in-bailiwick glue in "
+        "additional, AA off (RFC 1034 section 4.3.2 step 3b). A "
+        "serve-side flag: give it with --serve",
     )
     p.add_argument(
         "--rbl",
@@ -1459,6 +1473,19 @@ async def serve(args) -> int:
             except OSError as exc:
                 raise SystemExit(f"namespy: --serve-query-log: {exc}") from None
             query_log = QueryLog(_query_log_file)
+        zones = []
+        for file in args.zone or ():
+            try:
+                zones.append(Zone.from_file(file))
+            except (OSError, ZoneParseError) as exc:
+                # A zone file that will not load is a startup sentence, in
+                # the same family as a missing root-hints file: the server
+                # that serves half a zone is worse than the one that
+                # refuses to start.
+                raise SystemExit(f"namespy: --zone: {exc}") from None
+            logging.info(
+                "server_zone=%s apex=%s records=%d", file, zones[-1].apex, len(zones[-1].records)
+            )
         _server_transport, _server_protocol = await loop.create_datagram_endpoint(
             lambda: DnsServer(
                 resolver_protocol,
@@ -1467,6 +1494,7 @@ async def serve(args) -> int:
                 dot_upstreams=dot_upstreams,
                 filter_policy=filter_policy,
                 query_log=query_log,
+                zones=zones,
             ),
             local_addr=("127.0.0.1", 53),
         )
@@ -1640,6 +1668,11 @@ def main(argv=None) -> int:
             "--serve-query-log records the queries the --serve server answers; "
             "run with --serve (a one-shot lookup logs nothing -- you already "
             "hold its entire transcript)"
+        )
+    if args.zone:
+        parser.error(
+            "--zone makes the --serve server authoritative for a zone; run "
+            "with --serve (a one-shot lookup asks zones, it does not run one)"
         )
     if args.serve_dot or args.forward_dot:
         parser.error(

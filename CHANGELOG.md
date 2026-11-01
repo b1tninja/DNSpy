@@ -8,6 +8,44 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **Authoritative serving: the first leg of the U6 arc.**
+  `namespy/zone.py` loads an RFC 1035 §5.1 master file and answers the
+  way RFC 1034 §4.3.2 composes them. Parsing is the section's own
+  grammar — entries "predominantly line-oriented, though parentheses
+  can be used to continue a list of items across a line boundary", the
+  `;` comment outside quotes, owner defaulting to "the last stated
+  owner", `[<TTL>] [<class>]` in either order because "type and class
+  mnemonics are disjoint", `$ORIGIN` and `$INCLUDE` (which "never
+  changes the relative origin of the parent file", honored by a
+  recursion that keeps its own), and RFC 2308's `$TTL <TTL> [comment]`
+  extension; unknown types arrive through RFC 3597 §5's `\#` generic
+  form, which is also the loader for any type with no builder here, and
+  `$GENERATE` is refused by name because no §5.1 entry list mentions it
+  and this project does not invent expansion languages. TTLs are plain
+  decimal integers — §5.1's exact words — because no unit-suffix
+  mechanism earned a citation. Serving is the algorithm shape for
+  real: exact nodes answer with AA and the apex SOA; CNAMEs chase
+  inside the zone with a loop guard and stop honestly at a target
+  outside it; a cut in the zone data produces a genuine referral —
+  step 3b verbatim, "Copy the NS RRs for the subzone into the authority
+  section of the reply. Put whatever addresses are available into the
+  additional section", in-bailiwick glue only, **AA off**, because the
+  answer belongs to the servers being named; a failed label consults
+  the `*` wildcard and synthesizes "the owner of the RR to be QNAME"
+  (step 3c's own words), and wildcards do not cross the zone cut.
+  `DnsServer(serve_zone()/zones=)` consults zones after the binds and
+  before the filter — a bound name overrides even the operator's own
+  zone; a zone is a serve decision, a filter guards borrowed recursion —
+  and the query log learns a new rung: answers from zone data log
+  `origin: "zone"`, referrals included, so a log reader can tell
+  authored from asked. CLI `--zone FILE` (repeatable) loads at startup
+  and refuses to start on a file that will not parse: the server that
+  serves half a zone is worse than the one that will not start. 40
+  tests, `tests/test_zone.py` — the parse grammar, the answer shapes
+  step by step, and the real server dispatch over the in-process
+  harness, AA bit and question echo included. The transfer leg (AXFR's
+  RFC 5936 framing, RFC 9103 fast-done, TSIG per RFC 8945) follows as
+  the campaign's next increment.
 - **The blocklist client: reading lists in three honest states
   (second-horizon U9).** `namespy/rbl.py` separates the mechanics
   (RFCs) from the etiquette (deployed convention, labelled because it
