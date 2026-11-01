@@ -1778,6 +1778,87 @@ list as it fits -- 6841, 9824, 10001, 8509/9535, 9364/9904/9905/9906, IDNA,
 later. DoQ (9250) stays deferred: no stdlib QUIC, and an extra sized like
 `aioquic` is a bigger conversation than `h2` was.
 
+### Follow-up: the walk holds its streams, and the demo server answers on TCP (RFC 7766 §6.2, RFC 7828 §3.3, BCP 235)
+
+Increment D of the transport track, the last two halves of the
+7828/9210 row. The client side stopped treating a TCP fallback as a
+one-use tissue, and the server side grew the stream front it never had.
+
+Shipped, client: `Resolver._query_tcp` -- shared by the walk's
+truncation/timeout retries and the stub's cleartext upstreams -- pools one
+`_Session` per `(host, port)`: reuse per RFC 7766 §6.2.1¶1, one connection
+per server with a second query waiting on the session's lock rather than
+opening a rival line (§6.2.2¶1's MUST to minimise), the server's offered
+keepalive TIMEOUT arming the idle timer on every answer (§3.2.2¶2's
+"override any previous timeout ... close before it expires"), 0 dropping
+the session on the spot (¶3), absence riding the 30 s default (¶4's return
+to RFC 7766, held as a promise this client can keep). A stream that died
+between queries -- the server's own idle policy, ordinary and expected --
+is reopened silently with one retry (§6.2.4¶2); a *mismatched answer* on a
+shared stream also retires the stream, because a stale response is the
+reading position drifting. Pipelining stays unexercised deliberately, the
+stub's stated reason: one exchange in flight discharges §6.2.1¶2's
+no-reused-ID duty by construction. `AXFR` is §6.2.2¶1's named exception --
+one-shot, never pooled. `_Session`, `_idle_seconds` and the two keepalive
+constants moved to `resolver.py` beside the base transport that now shares
+them (stub re-exports so its tests import the same names);
+`_close_tcp_sessions` hooks both `aclose` paths.
+
+Shipped, server: `DnsStreamServer`, one protocol instance per accepted
+connection in front of the shared `DnsServer` (one responder pipeline, one
+lookup semaphore, two transports -- the `StreamChannel` send-seam threads
+`channel=` through `respond_to_packet`/`_reply`/`_error`/`_apply_edns` and
+the datagram path never sees it). Framing per RFC 1035 §4.2.2 with the
+idle clock reset only by a *complete* message (§7766 §6.2.3¶3's slow-read
+warning); pipelined queries processed concurrently but answered through
+an ordered outbox so responses leave in arrival order (§6.2.1.1¶4's MUST
+to expect and SHOULD to process). The keepalive answer:
+`keepalive_option(timeout)` gained the server form (§3.1's two-octet
+TIMEOUT), and the front advertises exactly `DnsServer(tcp_idle=...)` --
+the default 30, or the operator's number, never a second one (§3.3.2¶1's
+MUST ties advertisement to enforcement); `tcp_idle=None` answers with no
+option at all and clients fall back per §3.2.2¶4; 0 says so and ends the
+line after flushing; a client's own TIMEOUT-0 hint (not the finished
+client form, §3.2.1¶4, but the intent such bytes can only carry) gets its
+answer advertised at 0 and closes the line -- advertising thirty from a
+connection about to end is the one sentence §3.3.2¶1 forbids. A query
+with no OPT and so no option (RFC 6891 §7, quoted by §3.4¶6); a
+UDP query carrying the option is ignored (§3.3.1¶1's MUST, pinned by
+test). Parse failures answer FORMERR with no OPT and spare the stream;
+the zero-length frame ends it (no specification dictates that one --
+the comment says so rather than citing an invented clause; a message of
+zero octets describes no reading position to continue from). `--serve`
+now binds TCP beside UDP: BCP 235 (RFC 9210 §3) updated RFC 1123's
+"SHOULD support TCP" to "All DNS resolvers and servers MUST support and
+service both", so a demo server answering only UDP would be
+demonstrating the exact failure that document catalogues.
+
+**Verified**: 1508 passed, 1 skipped (+20: `tests/test_stream_reuse.py`
+-- 8 against a real framed TCP server: two forwards one connection, three
+concurrent one connection, offered-timeout holds, 0 refuses and the next
+ask needs a fresh line, die-between-queries reopens with no error
+surfaced, mismatched IDs discredit the stream, AXFR never pooled, close
+really closes; `tests/test_server_stream.py` -- 12 on real sockets: the
+default 30 advertised, tcp_idle=17 advertised as 17, silence silent but
+OPT still present, unextended queries unextended back, tcp_idle=0
+advertises 0 and EOFs, the client's 0-hint answered at 0 then EOF,
+FORMERR-spare-the-stream, zero-length-dies, the 1-second idle close
+timed from the last message, pipelined concurrency measured (<0.14 s for
+two 0.08 s walks) and ordering checked, UDP's MUST-ignore, and the
+package's own `StubResolver(transport="tcp")` against its own
+`DnsStreamServer` agreeing on eleven seconds over one accepted connection).
+`ruff`/`format`/`mypy` clean, `-O` run holds, coverage 91%. CI: the serve
+tests grew the `_stub_stream_listener` seam (the listener is the fourth
+socket serve must let go, and the leak test now proves it). Roadmap: the
+7828/9210 row to done.
+
+**Next, in order**: (1) the earlier list as it fits -- 6841, 9824, 10001,
+8509/9535, 9364/9904/9905/9906, IDNA, 9471, 8145 §5; (2) 9539 §4
+opportunistic encryption now reuses all four transports on the authority
+leg -- the transports it needs have all landed, so the row is purely the
+probe, the store, and the fallback; (3) DoQ (9250) stays deferred on the
+`aioquic`-sized conversation.
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

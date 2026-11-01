@@ -15,6 +15,7 @@ Exit codes are the interface a script consumes: ``0`` answered, ``2`` no answer,
 import argparse
 import asyncio
 import logging
+import types
 
 import pytest
 
@@ -60,6 +61,35 @@ class _FakeTransport:
 
     def close(self):
         self.closed = True
+
+
+def _stub_stream_listener(monkeypatch):
+    """Route the CLI's TCP listener creation to a fake that reports closure.
+
+    The same seam logic as ``_stub_endpoints``: serve() now binds a stream
+    front beside the datagram one (BCP 235 requires both), and a test of the
+    wiring must not reach for port 53 to prove it. Returns the fake server,
+    whose ``closed`` flips when serve's ``finally`` lets it go.
+    """
+
+    class _FakeServer:
+        def __init__(self):
+            self.closed = False
+            self.sockets = [types.SimpleNamespace(getsockname=lambda: ("127.0.0.1", 53))]
+
+        def close(self):
+            self.closed = True
+
+    server = _FakeServer()
+
+    async def fake_start_server(factory, **_kwargs):
+        factory()  # build the protocol the listener would spawn, proving it constructs
+        return server
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "create_server", fake_start_server, raising=False
+    )
+    return server
 
 
 def _stub_endpoints(monkeypatch, resolve, resolve_bundle=None):
@@ -595,6 +625,7 @@ async def test_serve_runs_until_cancelled(monkeypatch, caplog):
         asyncio.get_running_loop(), "create_datagram_endpoint", idle_endpoint, raising=False
     )
     monkeypatch.setattr(cli, "_lookup_example_org_via_local_server", skip_demo)
+    _stub_stream_listener(monkeypatch)
 
     with caplog.at_level(logging.INFO):
         task = asyncio.ensure_future(cli.serve(_args(["--serve"])))
@@ -608,10 +639,11 @@ async def test_serve_runs_until_cancelled(monkeypatch, caplog):
 async def test_serve_closes_every_socket_on_the_way_out(monkeypatch):
     """Server mode runs until someone stops it, which is when leaks start to matter.
 
-    Two endpoints are opened here, and the resolver keeps a third socket of its
-    own. Nothing in asyncio closes any of them, so the ``finally`` in ``serve`` is
-    the only thing standing between a demo server and a descriptor leak -- and the
-    path exercised is the ordinary Ctrl+C one, not an exceptional one.
+    Two endpoints, a stream listener, and the resolver keeps a third socket of
+    its own. Nothing in asyncio closes any of them, so the ``finally`` in
+    ``serve`` is the only thing standing between a demo server and a descriptor
+    leak -- and the path exercised is the ordinary Ctrl+C one, not an
+    exceptional one.
     """
     made = []
 
@@ -627,6 +659,7 @@ async def test_serve_closes_every_socket_on_the_way_out(monkeypatch):
         asyncio.get_running_loop(), "create_datagram_endpoint", idle_endpoint, raising=False
     )
     monkeypatch.setattr(cli, "_lookup_example_org_via_local_server", skip_demo)
+    listener = _stub_stream_listener(monkeypatch)
 
     task = asyncio.ensure_future(cli.serve(_args(["--serve"])))
     await asyncio.sleep(0)
@@ -636,6 +669,7 @@ async def test_serve_closes_every_socket_on_the_way_out(monkeypatch):
 
     assert len(made) == 2, "resolver endpoint plus the server's own socket"
     assert [transport.closed for transport in made] == [True, True]
+    assert listener.closed, "the TCP listener is the fourth socket serve must let go"
 
 
 def test_main_routes_serve_to_the_server(monkeypatch):
@@ -803,6 +837,7 @@ async def test_the_advertised_identifier_reaches_the_server_a_serve_builds(monke
         asyncio.get_running_loop(), "create_datagram_endpoint", idle_endpoint, raising=False
     )
     monkeypatch.setattr(cli, "_lookup_example_org_via_local_server", skip_demo)
+    _stub_stream_listener(monkeypatch)
 
     task = asyncio.ensure_future(cli.serve(_args(["--serve", "--advertise-nsid", "ns-a"])))
     await asyncio.sleep(0)
@@ -836,6 +871,7 @@ async def test_the_operational_qtype_limit_reaches_the_server_a_serve_builds(mon
         asyncio.get_running_loop(), "create_datagram_endpoint", idle_endpoint, raising=False
     )
     monkeypatch.setattr(cli, "_lookup_example_org_via_local_server", skip_demo)
+    _stub_stream_listener(monkeypatch)
 
     for argv, limit in ((["--serve", "--max-qtypes", "2"], 2), (["--serve"], 4)):
         made.clear()

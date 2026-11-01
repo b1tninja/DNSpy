@@ -241,9 +241,14 @@ them change the security properties of anything built on top.
   and it says so at startup. Answers and negative assertions are still stored for
   the queried name only, so there is nothing else for a referral to smuggle.
 - **Not a name server.** No zone storage, no serving of a zone, no AXFR/IXFR. The
-  bundled `DnsServer` answers from the resolver for loopback testing.
+  bundled `DnsServer` answers from the resolver for loopback testing, over UDP
+  and — because BCP 235 makes TCP non-optional — over TCP too
+  (`DnsStreamServer`, speaking length-framed queries with the
+  edns-tcp-keepalive conversation).
 - **The recursive walk speaks Do53.** Queries to authority servers go over
-  UDP, with TCP only for truncation; DNS over QUIC (RFC 9250) and
+  UDP, with TCP for truncation and timeouts — those streams are held and
+  reused (RFC 7766 §6.2.1, paced by RFC 7828's keepalive) rather than opened
+  per query; DNS over QUIC (RFC 9250) and
   mDNS/DNS-SD (RFC 6762, RFC 6763) are not spoken anywhere. The stub's
   forwarded leg offers more: UDP, TCP, TLS (RFC 7858) and HTTPS
   (RFC 8484, HTTP/2 via the optional `doh` extra) — see `--stub-transport`.

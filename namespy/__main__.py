@@ -40,7 +40,7 @@ from .resolver import (
     NxdomainPolicy,
     RecursiveResolver,
 )
-from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer
+from .server import MQTYPE_RECOMMENDED_QTX_LIMIT, DnsServer, DnsStreamServer
 from .stub import TRANSPORTS, StubResolver, Upstream
 
 LOCAL_DNS: tuple[str, int] = ("127.0.0.1", 53)
@@ -426,7 +426,8 @@ def build_parser():
     p.add_argument(
         "--serve",
         action="store_true",
-        help="run the demo server (binds 127.0.0.1:53) instead of doing a one-shot lookup",
+        help="run the demo server (binds 127.0.0.1:53 over both UDP and TCP, "
+        "per BCP 235) instead of doing a one-shot lookup",
     )
     p.add_argument(
         "--short",
@@ -1043,6 +1044,7 @@ async def serve(args) -> int:
     resolver_protocol = None
     _resolver_transport = None
     _server_transport = None
+    _stream_server = None
     try:
         loop = asyncio.get_running_loop()
         anchors = _trust_anchors(args)
@@ -1077,6 +1079,20 @@ async def serve(args) -> int:
         logging.debug(
             "%s bound to: %s", _server_protocol, _server_transport.get_extra_info("sockname")
         )
+        # The same server, on TCP as well, because BCP 235 (RFC 9210 section 3)
+        # updated RFC 1123 to make that a MUST for anything that calls itself a
+        # DNS server -- "All DNS resolvers and servers MUST support and service
+        # both UDP and TCP queries" -- and a demo that answers only over UDP
+        # would be demonstrating the failure the document was written about.
+        # Each accepted stream gets its own DnsStreamServer protocol instance
+        # (framing, keepalive, idle timer per connection) in front of the one
+        # shared DnsServer that owns the recursion and its bounds. (The
+        # protocol-factory half of asyncio is ``create_server``; the
+        # ``start_server`` sugar above it is for reader/writer coroutines.)
+        _stream_server = await loop.create_server(
+            lambda: DnsStreamServer(_server_protocol), host="127.0.0.1", port=53
+        )
+        logging.debug("%s bound to: %s", "DnsStreamServer", _stream_server.sockets[0].getsockname())
         # The DNSSEC stance this process takes upstream, recorded at the one
         # moment it is fixed. The two DO directions face different rules and
         # only one is the operator's choice: RFC 4035 §4.1¶1 obliges a
@@ -1113,12 +1129,15 @@ async def serve(args) -> int:
         return 0
     finally:
         # This mode runs until someone stops it, which is exactly when an
-        # unclosed socket stops being a detail: the two endpoint transports, plus
-        # the resolver's private IPv6 one. Every way out of here -- bind failure,
-        # Ctrl+C, something unexpected -- lets all three go.
+        # unclosed socket stops being a detail: the two endpoint transports,
+        # the stream listener, plus the resolver's private IPv6 one. Every
+        # way out of here -- bind failure, Ctrl+C, something unexpected --
+        # lets all four go.
         for transport in (_resolver_transport, _server_transport):
             if transport is not None:
                 transport.close()
+        if _stream_server is not None:
+            _stream_server.close()
         if resolver_protocol is not None:
             await resolver_protocol.aclose()
 

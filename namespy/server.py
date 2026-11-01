@@ -1,4 +1,13 @@
-"""A UDP DNS server that answers by recursing with :class:`RecursiveResolver`.
+"""A DNS server that answers by recursing with :class:`RecursiveResolver`.
+
+Two transports answer: :class:`DnsServer` is the datagram half (a protocol
+on a UDP endpoint), and :class:`DnsStreamServer` fronts it with one
+instance per accepted TCP connection -- the length-framed conversation of
+RFC 1035 section 4.2.2, the edns-tcp-keepalive schedule of RFC 7828
+section 3.3, and the idle management BCP 235 asks servers to make
+configurable. One responder pipeline serves both: a response leaves
+through whichever channel the question arrived on, and the recursion, the
+bounds, and the option rules below are transport-blind.
 
 Serving has a different risk profile from resolving. A resolver receives input
 from servers it chose; a server receives input from anyone, and every unanswered
@@ -34,8 +43,9 @@ one option it implements is NSID (RFC 5001): an identity string configured at
 construction, returned only to a query that asked for it, never invented on its
 own. Padding (RFC 7830) is deliberately *not* honoured here: section 4 says a
 responder must pad when asked, section 6 says an implementation must not use
-the option over an unencrypted transport, and this server's transport is plain
-UDP -- the second MUST is the one that can be obeyed without lying about the
+the option over an unencrypted transport, and both of this server's
+transports -- datagram and stream -- are plaintext -- the second MUST is the
+one that can be obeyed without lying about the
 encryption, so padding is dropped and the reply stays its natural size.
 
 MQTYPE (RFC 10029) is implemented in both directions: a malformed request is
@@ -81,7 +91,8 @@ that path carries an empty list rather than silence.
   an option that is badly formatted or out of range must be answered FORMERR,
   with an OPT)
 * RFC 7830 sections 4, 6 (a responder must pad when asked -- and must not use
-  the option at all on an unencrypted transport, which plain UDP is)
+  the option at all on an unencrypted transport, which both of this server's
+  transports are)
 * RFC 7873 section 5.2 (COOKIE lengths, and the FORMERR for an illegal one)
 * RFC 8914 section 2 (an Extended DNS Error may ride in any response to a query
   that carried an OPT), section 3 (drop EDE options before other data when the
@@ -98,6 +109,7 @@ that path carries an empty list rather than silence.
 
 import asyncio
 import logging
+import struct
 
 from . import enable_path_mtu_discovery
 from .dnssec import DNSSEC_SECURITY_TYPES
@@ -111,6 +123,8 @@ from .edns import (
     extended_dns_error_option,
     extended_error_option_valid,
     find_option,
+    keepalive_of,
+    keepalive_option,
     nsid_of,
 )
 from .enums import DnsOpCode, DnsQR, DnsResponseCode, DnsRType
@@ -206,6 +220,41 @@ _OWN_FAILURE_ERRORS = {
 #: section 3). No specification sets a number -- this one is a design decision.
 MAX_CONCURRENT_LOOKUPS = 32
 
+#: The idle horizon a :class:`DnsStreamServer` connection keeps by default.
+#: RFC 7766 section 6.2.3 paragraph 2 recommends a server idle period "on
+#: the order of seconds" and names no number; RFC 7828 section 3.4 leaves
+#: the value to the server, requiring only (section 3.3.2 paragraph 1) that
+#: what is advertised be what is enforced. Thirty seconds is this build's
+#: answer to both, and the same figure the client side rides when a server
+#: offers nothing (:data:`namespy.resolver._KEEPALIVE_DEFAULT_S`) -- so a
+#: default conversation between the two halves of this package agrees
+#: without either reading the other's source.
+DEFAULT_TCP_IDLE_S = 30
+
+
+class StreamChannel:
+    """How one response reaches the stream it arrived on, and what to say there.
+
+    A bound method of :class:`DnsStreamServer` for *send*, plus the
+    keepalive TIMEOUT this connection advertises (``None`` for a server
+    that keeps silent about its idle policy). It rides through
+    :meth:`DnsServer.respond_to_packet` as a keyword, and its presence is
+    the whole of the difference between the two transports: a response
+    that leaves through a channel goes to one client's open stream and may
+    carry the keepalive announcement, while a response with no channel is
+    the ordinary datagram answer -- on which RFC 7828 section 3.3.1
+    paragraph 1 obliges the server to ignore the option even when the
+    query carried it, which it does, because ``None`` never reaches the
+    option builder.
+    """
+
+    __slots__ = ("keepalive", "send")
+
+    def __init__(self, send, keepalive=None):
+        self.send = send
+        self.keepalive = keepalive
+
+
 #: The three RR sections of a message, as the attribute that holds each one and
 #: the header count that describes it, in the order RFC 1035 section 4.1 lays
 #: them out. RFC 10029 section 3.4 is a rule *about sections* -- extra RRs go
@@ -259,6 +308,7 @@ class DnsServer(asyncio.Protocol):
         max_concurrent_lookups: int = MAX_CONCURRENT_LOOKUPS,
         nsid=None,
         max_qtypes: int | None = MQTYPE_RECOMMENDED_QTX_LIMIT,
+        tcp_idle: int | None = DEFAULT_TCP_IDLE_S,
     ):
         """
         :param nsid: the RFC 5001 name-server identifier to advertise when a
@@ -295,6 +345,21 @@ class DnsServer(asyncio.Protocol):
             be the other available message, and section 3.5 makes silence mean the
             option is "unsupported by the server", which is not true of a server that
             simply declined this much work.
+        :param tcp_idle:
+            how long a :class:`DnsStreamServer` connection to this server may
+            sit idle before being closed -- and, since RFC 7828 section 3.3.2
+            paragraph 1 obliges an advertising server to advertise the number
+            it actually enforces, the TIMEOUT its stream responses carry.
+            The default is :data:`DEFAULT_TCP_IDLE_S`. :const:`None` keeps
+            the timeout but goes silent about it: stream responses carry no
+            option, and clients fall back to RFC 7766 behaviour, which is
+            precisely what RFC 7828 section 3.2.2 paragraph 4 tells them to
+            do. 0 refuses keepalive outright -- section 3.3.2's "SHOULD send
+            an edns-tcp-keepalive option with a timeout of 0" answer for a
+            server whose resources cannot hold connections, carried
+            honestly -- and each stream closes once the messages it already
+            delivered have been answered.
+
         """
         if not isinstance(resolver, RecursiveResolver):
             raise TypeError(f"resolver must be a RecursiveResolver, got {type(resolver).__name__}")
@@ -306,6 +371,10 @@ class DnsServer(asyncio.Protocol):
         # the floor. A negative would slice the requested list from its wrong
         # end and hand back types the client never asked for.
         self.max_qtypes = None if max_qtypes is None else max(0, int(max_qtypes))
+        # Same reading as max_qtypes for the negative clamp -- a negative idle
+        # is not a long one, it is the operator saying "hold nothing", which is
+        # what 0 already means. None is silence, not a missing number.
+        self.tcp_idle = None if tcp_idle is None else max(0, int(tcp_idle))
         if isinstance(nsid, str):
             nsid = nsid.encode("utf-8")
         self.nsid = None if nsid is None else bytes(nsid)
@@ -334,7 +403,7 @@ class DnsServer(asyncio.Protocol):
         return task
 
     def _reply(
-        self, response, addr, request=None, extended_errors=(), mqtype_answered=None
+        self, response, addr, request=None, extended_errors=(), mqtype_answered=None, channel=None
     ) -> None:
         if request is not None:
             # RFC 4035 §3.2.2¶2: "The name server side MUST copy the setting of the
@@ -377,7 +446,13 @@ class DnsServer(asyncio.Protocol):
                 extended_errors = (
                     extended_dns_error_option(EDE_STALE_ANSWER, b"namespy: served stale"),
                 )
-            self._apply_edns(request, response, extended_errors, mqtype_answered)
+            self._apply_edns(
+                request,
+                response,
+                extended_errors,
+                mqtype_answered,
+                keepalive=None if channel is None else channel.keepalive,
+            )
         wire = bytes(response)
         self.log.debug(
             "server_reply(dst=%s id=%#06x rcode=%s octets=%d)",
@@ -386,9 +461,18 @@ class DnsServer(asyncio.Protocol):
             response.RCODE,
             len(wire),
         )
-        self.transport.sendto(wire, addr)
+        if channel is None:
+            self.transport.sendto(wire, addr)
+        else:
+            # The answer goes back on the stream the question arrived on:
+            # a datagram is addressed, a stream is already addressed -- it
+            # is the connection -- and the channel is that fact made
+            # callable.
+            channel.send(wire)
 
-    def _error(self, dns_packet, addr, rcode: DnsResponseCode, mqtype_answered=None) -> None:
+    def _error(
+        self, dns_packet, addr, rcode: DnsResponseCode, mqtype_answered=None, channel=None
+    ) -> None:
         """Reply with *rcode*, echoing the question so the client can match it.
 
         ``mqtype_answered`` is the list to put in a MQTYPE-Response option --
@@ -421,6 +505,7 @@ class DnsServer(asyncio.Protocol):
             request=dns_packet,
             extended_errors=self._own_failure_errors(rcode),
             mqtype_answered=mqtype_answered,
+            channel=channel,
         )
 
     @staticmethod
@@ -447,7 +532,9 @@ class DnsServer(asyncio.Protocol):
         """How many OPT records a request carried (RFC 6891 section 6.1.1 allows one)."""
         return sum(1 for record in dns_packet.additional_records if int(record.rtype) == OPT_RTYPE)
 
-    def _apply_edns(self, request, response, extended_errors=(), mqtype_answered=None) -> None:
+    def _apply_edns(
+        self, request, response, extended_errors=(), mqtype_answered=None, keepalive=None
+    ) -> None:
         """Attach the OPT record this server is entitled -- or obliged -- to send.
 
         Two halves of RFC 6891 meet here. Section 6.1.1: "If an OPT record is
@@ -506,15 +593,19 @@ class DnsServer(asyncio.Protocol):
         # The early return above cannot strand a MQTYPE-Response obligation: an
         # MQTYPE-Query option can only arrive inside an OPT record, so a requestor
         # that sent no OPT never asked, and RFC 6891 section 7's "no OPT in, no OPT
-        # out" is the whole of what that client is owed.
-        attach(self._reply_options(request, extended_errors, mqtype_answered))
+        # out" is the whole of what that client is owed. The same return is also
+        # what keeps a keepalive announcement off an unextended stream answer --
+        # RFC 7828 section 3.3.2 paragraph 1 offers the option only to queries
+        # "that include an OPT RR", and RFC 7828 section 3.4 paragraph 6 quotes
+        # section 7 to make the point for persistent connections explicitly.
+        attach(self._reply_options(request, extended_errors, mqtype_answered, keepalive))
         if extended_errors:
             self._keep_explanation_inside_advertised_size(
-                request, response, attach, mqtype_answered
+                request, response, attach, mqtype_answered, keepalive
             )
 
     def _keep_explanation_inside_advertised_size(
-        self, request, response, attach, mqtype_answered=None
+        self, request, response, attach, mqtype_answered=None, keepalive=None
     ) -> None:
         """Drop the EDE options if they made the response bigger than the client asked for.
 
@@ -549,9 +640,11 @@ class DnsServer(asyncio.Protocol):
         # that may not go: a reply that loses it says "this server does not
         # implement multiple QTYPEs", which is a statement no amount of re-asking
         # takes back from the client's side.
-        attach(self._reply_options(request, mqtype_answered=mqtype_answered))
+        attach(self._reply_options(request, mqtype_answered=mqtype_answered, keepalive=keepalive))
 
-    def _reply_options(self, request, extended_errors=(), mqtype_answered=None) -> list:
+    def _reply_options(
+        self, request, extended_errors=(), mqtype_answered=None, keepalive=None
+    ) -> list:
         """The options this server puts in its own OPT for this request.
 
         NSID, and only when it was asked for. RFC 5001 section 2.2 is
@@ -575,7 +668,8 @@ class DnsServer(asyncio.Protocol):
         case, because here the code *is* understood and the answer is still no:
         RFC 7830 section 4 makes padding a MUST for a responder that is asked,
         while section 6 forbids the option outright on a transport that is not
-        encrypted. This server's transport is plain UDP, so honouring section 4
+        encrypted. Both of this server's transports are plaintext, so
+        honouring section 4
         would mean obeying one MUST by breaking another; section 6 is the
         sentence that speaks to the situation this server is actually in, and it
         is the one kept. A future DNS-over-TLS front end is where padding belongs.
@@ -595,6 +689,14 @@ class DnsServer(asyncio.Protocol):
         somewhere the size rule is not looking. ``None`` means the query never
         asked, and sending the option unasked would be a claim about this server
         that no one requested.
+
+        An edns-tcp-keepalive announcement, when ``keepalive`` carries one, sits
+        with the response's own statements about this connection -- RFC 7828
+        section 3.3.2 paragraph 1 permits it on any stream answer to a query
+        that carried OPT, obliges the number to be the one actually enforced
+        (the caller reads it straight off this connection's idle policy, so it
+        always is), and section 3.3.1 paragraph 1 keeps it off UDP entirely --
+        which it is, because the datagram path passes no keepalive at all.
         """
         options = []
         try:
@@ -607,6 +709,10 @@ class DnsServer(asyncio.Protocol):
             asked = None
         if self.nsid is not None and asked is not None:
             options.append(EdnsOption(NSID_OPTION_CODE, self.nsid))
+        if keepalive is not None:
+            # The connection's enforced idle number, said as it is -- 0
+            # included, because refusing to hold is a policy with a value.
+            options.append(keepalive_option(keepalive))
         if mqtype_answered is not None:
             # The empty list is the point of this branch as much as the filled one:
             # section 3.4 allows MQTYPE-Response to be empty while still requiring
@@ -617,7 +723,7 @@ class DnsServer(asyncio.Protocol):
         options.extend(extended_errors)
         return options
 
-    def _edns_options_or_error(self, dns_packet, addr) -> bool:
+    def _edns_options_or_error(self, dns_packet, addr, channel=None) -> bool:
         """Whether ``dns_packet``'s options survive a first reading.
 
         RFC 6891 section 7: "If there is a problem with processing the OPT
@@ -664,12 +770,12 @@ class DnsServer(asyncio.Protocol):
             options = dns_packet.edns_options()
         except DnsPacketParseError as exc:
             self.log.debug("server_bad_edns_option(src=%s err=%s)", addr[0], exc)
-            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
             return False
         cookie = find_option(options, COOKIE_OPTION_CODE)
         if cookie is not None and not cookie_length_valid(len(cookie.data)):
             self.log.debug("server_bad_cookie_length(src=%s length=%s)", addr[0], len(cookie.data))
-            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
             return False
         for option in options:
             # Every EDE option, not the first: RFC 8914 section 3 lets a sender put
@@ -681,7 +787,7 @@ class DnsServer(asyncio.Protocol):
                     addr[0],
                     len(option.data),
                 )
-                self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+                self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
                 return False
         reason = mqtype_query_rejection(
             options,
@@ -691,7 +797,7 @@ class DnsServer(asyncio.Protocol):
         )
         if reason is not None:
             self.log.debug("server_bad_mqtype_query(src=%s reason=%s)", addr[0], reason)
-            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
             return False
         return True
 
@@ -1004,7 +1110,7 @@ class DnsServer(asyncio.Protocol):
             break
         return answered
 
-    async def respond_to_packet(self, dns_packet, addr):
+    async def respond_to_packet(self, dns_packet, addr, channel=None):
         if DnsQR.QUERY != dns_packet.QR:
             self.log.debug("server_not_query(src=%s id=%#06x)", addr[0], dns_packet.ID)
             return
@@ -1012,14 +1118,14 @@ class DnsServer(asyncio.Protocol):
         if dns_packet.QDCOUNT != 1:
             # The resolver models one Sname at a time, and answering one of N
             # questions without saying which is worse than refusing.
-            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
             return
 
         if DnsOpCode.QUERY != dns_packet.OPCODE:
             self.log.debug(
                 "server_unsupported_opcode(src=%s opcode=%s)", addr[0], dns_packet.OPCODE
             )
-            self._error(dns_packet, addr, DnsResponseCode.NOT_IMPLEMENTED)
+            self._error(dns_packet, addr, DnsResponseCode.NOT_IMPLEMENTED, channel=channel)
             return
 
         if self._opt_count(dns_packet) > 1:
@@ -1029,7 +1135,7 @@ class DnsServer(asyncio.Protocol):
             # (RCODE=1) MUST be returned." Checked before any upstream work so
             # one malformed datagram cannot buy any recursive lookups.
             self.log.debug("server_multiple_opt(src=%s:%s)", addr[0], addr[1])
-            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR)
+            self._error(dns_packet, addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
             return
 
         version = dns_packet.edns_version
@@ -1040,10 +1146,10 @@ class DnsServer(asyncio.Protocol):
             # highest implementation level of the responder" -- which is what
             # tells the requestor how far down this server actually goes.
             self.log.debug("server_edns_version(src=%s:%s version=%s)", addr[0], addr[1], version)
-            self._error(dns_packet, addr, DnsResponseCode.BADVERS)
+            self._error(dns_packet, addr, DnsResponseCode.BADVERS, channel=channel)
             return
 
-        if not self._edns_options_or_error(dns_packet, addr):
+        if not self._edns_options_or_error(dns_packet, addr, channel=channel):
             # Options belong to the OPT, so they are judged with it: after the
             # version check, because options defined for a VERSION this server
             # does not implement cannot be interpreted at all, and before the
@@ -1073,6 +1179,7 @@ class DnsServer(asyncio.Protocol):
                     addr,
                     DnsResponseCode.SERVER_FAILURE,
                     mqtype_answered=None if asked is None else [],
+                    channel=channel,
                 )
                 return
             answered = None
@@ -1085,7 +1192,9 @@ class DnsServer(asyncio.Protocol):
                     # for a client that has left is not worth finishing.
                     self.log.debug("server_late_result(dst=%s)", addr[0])
                     return
-            self._reply(response, addr, request=dns_packet, mqtype_answered=answered)
+            self._reply(
+                response, addr, request=dns_packet, mqtype_answered=answered, channel=channel
+            )
 
     def datagram_received(self, data, addr):
         host, port = addr[0], addr[1]
@@ -1128,3 +1237,274 @@ class DnsServer(asyncio.Protocol):
             self.log.debug("server_overload_drop(src=%s:%s)", host, port)
             return
         self._spawn(self.respond_to_packet(dns_packet, addr))
+
+
+class DnsStreamServer(asyncio.Protocol):
+    """One TCP connection in front of a :class:`DnsServer`.
+
+    The datagram server answers a request and forgets the client existed;
+    a stream is a *relationship*, and this class is what this package
+    brings to one. RFC 9210 section 3 updates RFC 1123 to make the TCP
+    half of a DNS server non-optional -- "All DNS resolvers and servers
+    MUST support and service both UDP and TCP queries", and servers
+    "including forwarders MUST support and service TCP for receiving
+    queries" -- and RFC 7766 section 6.2.1 paragraph 1 asks both ends to
+    make that transport worth having by reusing it. So: the length-
+    prefixed framing of RFC 1035 section 4.2.2 read from the stream one
+    whole message at a time; the keepalive conversation of RFC 7828
+    section 3.3 answered with the idle timeout this connection actually
+    enforces (section 3.3.2 paragraph 1's MUST); an idle close on the
+    schedule RFC 9210 section 4.2 paragraph 4 asks software to make
+    configurable, reset only by a *complete* message because RFC 7766
+    section 6.2.3 paragraph 3 named the slow-read trick that partial
+    resets invite; and pipelined queries processed concurrently -- RFC
+    7766 section 6.2.1.1 paragraph 4's MUST to expect them and SHOULD to
+    process them -- while their answers leave in arrival order, the one
+    ordering rule TCP DNS has never broken.
+
+    One instance per connection: ``asyncio`` builds one from a factory on
+    each :meth:`~asyncio.loop.start_server` accept, and everything here
+    -- the framing buffer, the answer ordering, the idle timer -- is the
+    state of one client's line, not of the server. The shared server
+    beneath stays the single bound on upstream work; this class adds a
+    transport, not a policy.
+    """
+
+    def __init__(self, dns_server: DnsServer):
+        self.server = dns_server
+        self.log = LOGGER
+        #: The number this connection's answers advertise, straight from the
+        #: operator's knob: ``None`` says nothing, 0 refuses, N>0 is both the
+        #: promise and the enforcement. Held separate from *what the timer
+        #: runs on* only for the silent case: a server advertising nothing
+        #: still holds no connection forever (RFC 7766 section 6.2.3 paragraph
+        #: 2 recommends a real idle period regardless of what is signalled),
+        #: and thirty seconds is the number the rest of this package agrees
+        #: on when nobody names one.
+        self._advertised = dns_server.tcp_idle
+        self._enforced = DEFAULT_TCP_IDLE_S if dns_server.tcp_idle is None else dns_server.tcp_idle
+        self._transport: asyncio.Transport | None = None
+        self._addr = ("?", 0)
+        self._buf = bytearray()
+        #: Futures, one per received message, in arrival order; the pump
+        #: awaits them one by one, which is how concurrent answers exit in
+        #: sequence without any of them waiting to *start*.
+        self._outbox: asyncio.Queue = asyncio.Queue()
+        self._pump: asyncio.Task | None = None
+        self._idle_timer: asyncio.TimerHandle | None = None
+        self._tasks: set[asyncio.Task] = set()
+        #: Set when this connection has decided its last answer: the
+        #: zero-timeout refusal, a client's own close hint, or the pump's
+        #: standing read of either. Late-arriving messages find it set and
+        #: are answered with nothing -- a client still writing into a
+        #: closing stream gets the RFC 7766 section 6.2.4 paragraph 2
+        #: outcome, a retry on the next connection, not a half-answer
+        #: from this one.
+        self._closing = False
+
+    def connection_made(self, transport):
+        self._transport = transport
+        peer = transport.get_extra_info("peername")
+        if peer:
+            self._addr = (peer[0], peer[1])
+        self.log.debug("server_stream_open(src=%s:%s)", self._addr[0], self._addr[1])
+        self._pump = asyncio.ensure_future(self._pump_out())
+        # Idle starts at the handshake, not at the first message: a client
+        # that connects and says nothing is holding a connection idle right
+        # now, and a listener that tolerates that indefinitely is a
+        # half-open socket farm (BCP235 section 4.2's whole concern).
+        self._arm_idle()
+
+    def connection_lost(self, _exc):
+        # The outbox dies here: RFC 7766 section 6.2.4 paragraph 3 is a
+        # MUST -- responses still owed to a client that has gone are not
+        # sent to the bytes that used to be them -- and the tasks that
+        # would have produced them have nothing left to answer to either.
+        timer, self._idle_timer = self._idle_timer, None
+        if timer is not None:
+            timer.cancel()
+        for task in list(self._tasks):
+            task.cancel()
+        self._tasks.clear()
+        pump, self._pump = self._pump, None
+        if pump is not None:
+            pump.cancel()
+
+    def data_received(self, data):
+        self._buf.extend(data)
+        while len(self._buf) >= 2:
+            (n,) = struct.unpack("!H", self._buf[:2])
+            if n == 0:
+                # A length prefix describes a DNS message, and a message of
+                # zero octets is not one -- no header, no question, nothing
+                # the stream can be read past. No specification hands down
+                # the sentence for it, because the sentence is the same for
+                # every framed stream: the reading position is wrong by
+                # definition, so nothing further on this line is trustworthy.
+                # Close; a client may mean it as a probe, and a probe does
+                # not owe an answer.
+                self.log.debug("server_stream_framing_error(src=%s)", self._addr[0])
+                self._shutdown()
+                return
+            if len(self._buf) < 2 + n:
+                return  # the rest of this message is still in flight
+            frame = bytes(self._buf[2 : 2 + n])
+            del self._buf[: 2 + n]
+            self._on_message(frame)
+
+    def _on_message(self, frame):
+        if self._closing:
+            # The decision is made; RFC 7766 section 6.2.4 paragraph 3 says
+            # the same sentence to a connection this side is leaving as to
+            # one the client left: nothing further goes out.
+            self.log.debug("server_stream_closing_drop(src=%s)", self._addr[0])
+            return
+        # The idle clock resets here and nowhere earlier: a whole message
+        # has just landed, which is the event RFC 7766 section 6.2.3
+        # paragraph 3 distinguishes from "a segment arrived" -- the second
+        # is what a slow-read attack is made of.
+        self._arm_idle()
+        try:
+            dns_packet, _offset = DnsPacket.parse(frame)
+        except DnsPacketParseError as exc:
+            # Debug, as on the datagram path: this is the attacker-facing
+            # line. The answer mirrors the datagram policy -- FORMERR, and
+            # no OPT when there was no parseable request to earn one --
+            # but the framing stayed sound, so the stream itself survives.
+            self.log.debug("server_stream_parse_failed(src=%s err=%s)", self._addr[0], exc)
+            self._enqueue(None)
+            return
+        self._note_client_hint(dns_packet)
+        self._enqueue(dns_packet)
+
+    def _note_client_hint(self, dns_packet):
+        """Read a client's own closing signal, if its query carried one.
+
+        RFC 7828's finished client form of the option is the empty one
+        (section 3.2.1 paragraph 4's MUST), so a query that arrives with a
+        TIMEOUT *in* it is a client written against something older. A 0 in
+        that position can only mean what the same value means everywhere
+        else in this option -- section 3.2.2 paragraph 3's "send no more
+        queries on that connection", spoken by the sender instead of the
+        receiver -- so honour the intent the bytes show: answer what has
+        been asked, hold nothing further. An empty option, and no option at
+        all, say nothing of the kind and change nothing here.
+        """
+        try:
+            wanted = keepalive_of(dns_packet.edns_options())
+        except DnsPacketParseError:
+            # The same broken option the responder's own gate will refuse
+            # with a FORMERR; it cannot also be a close hint. Whatever the
+            # answer, this connection has no readable number to act on.
+            return
+        if wanted == 0:
+            self._closing = True
+
+    def _enqueue(self, dns_packet):
+        """Give one received message its place in the answer order, and an answer task."""
+        slot = asyncio.get_running_loop().create_future()
+        self._outbox.put_nowait(slot)
+        task = asyncio.ensure_future(self._answer(dns_packet, slot))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _answer(self, dns_packet, slot):
+        """Produce this message's response wire, or ``None`` for no answer.
+
+        The channel handed to the shared pipeline carries two facts about
+        the stream: how to reach it again (``emit``, which fills the slot
+        the pump is holding in order) and what this connection advertises
+        for keepalive -- the connection's enforced number verbatim, or
+        nothing at all when its operator chose silence. Messages the
+        pipeline drops -- a non-query, a cancel mid-recursion, the gates
+        that answer with only a log line -- resolve their slot to ``None``,
+        because a queue with a hole in it is a stalled pump, and a stalled
+        pump is every later answer stuck behind a message that never owed
+        one.
+        """
+
+        def emit(wire):
+            if not slot.done():
+                slot.set_result(wire)
+
+        # A connection that has already decided on its last answer -- by the
+        # zero policy or a client's own closing hint -- associates no idle
+        # time with itself, so section 3.3.2 paragraph 1's honesty clause
+        # says 0, and 0 is what it says. Advertising thirty from a stream
+        # about to end would be the one sentence the MUST forbids.
+        advertised = 0 if self._closing else self._advertised
+        channel = StreamChannel(emit, keepalive=advertised)
+        try:
+            if dns_packet is None:
+                # Parse failed: the shared responder's no-OPT FORMERR, sent
+                # through the same channel so the datagram path stays what
+                # it always was. The sibling's private seam is the honest
+                # door here -- the policy "FORMERR with no OPT" belongs to
+                # DnsServer, and copying it here is how two transports
+                # learn to disagree about it.
+                self.server._error(None, self._addr, DnsResponseCode.FORMAT_ERROR, channel=channel)
+            else:
+                await self.server.respond_to_packet(dns_packet, self._addr, channel=channel)
+        except asyncio.CancelledError:
+            # connection_lost cancelled the work: the client is gone, and
+            # section 6.2.4 paragraph 3 is exactly about answers nobody is
+            # left to send. The slot dies unanswered; the pump is already
+            # cancelled with us.
+            raise
+        finally:
+            if not slot.done():
+                slot.set_result(None)
+        if self._advertised == 0:
+            # Section 3.3.2 paragraph 1's refusal said, this connection
+            # holds nothing -- not even until a timer says so.
+            self._closing = True
+
+    async def _pump_out(self):
+        """Write answers in message order, framing each as it leaves."""
+        while True:
+            slot = await self._outbox.get()
+            try:
+                wire = await slot
+            except asyncio.CancelledError:
+                return
+            if wire is None:
+                self._maybe_finish_closing()
+                continue
+            if self._transport is None:
+                return  # gone between answer and write -- 6.2.4 paragraph 3 again
+            self._transport.write(struct.pack("!H", len(wire)) + wire)
+            self._maybe_finish_closing()
+
+    def _maybe_finish_closing(self):
+        if self._closing and self._outbox.empty() and self._transport is not None:
+            self._shutdown()
+
+    def _arm_idle(self):
+        if self._enforced <= 0:
+            return  # zero holds nothing to time out; closing is post-answer work
+        timer, self._idle_timer = self._idle_timer, None
+        if timer is not None:
+            timer.cancel()
+        self._idle_timer = asyncio.get_running_loop().call_later(self._enforced, self._on_idle)
+
+    def _on_idle(self):
+        self._idle_timer = None
+        self.log.debug("server_stream_idle_close(src=%s:%s)", self._addr[0], self._addr[1])
+        self._closing = True
+        self._shutdown()
+
+    def _shutdown(self):
+        transport, self._transport = self._transport, None
+        timer, self._idle_timer = self._idle_timer, None
+        if timer is not None:
+            timer.cancel()
+        if transport is not None:
+            transport.close()
+
+    def eof_received(self):
+        # The client half-closed: no questions will arrive, so no answers
+        # are owed, and RFC 7766 section 6.2.4 paragraph 3 forbids pushing
+        # the in-flight ones anywhere. Falling off the end returns None,
+        # which is asyncio's cue to finish the close.
+        self._closing = True
+        self._shutdown()

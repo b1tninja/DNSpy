@@ -54,7 +54,13 @@ from .enums import DnsRClass, DnsResponseCode, DnsRType
 from .names import DomainName
 from .packet import EDNS_DO_BIT, DnsRecord, Query
 from .rdata import RData_A, RData_AAAA
-from .resolver import Resolver
+from .resolver import (  # noqa: F401 -- re-exported, and the tests import these names from here
+    _KEEPALIVE_DEFAULT_S,
+    _KEEPALIVE_FLOOR_S,
+    Resolver,
+    _idle_seconds,
+    _Session,
+)
 
 LOGGER = logging.getLogger("namespy.stub")
 
@@ -71,14 +77,12 @@ TRANSPORTS: tuple[str, ...] = ("udp", "tcp", "dot", "doh")
 #: 443-mixing camouflage among the transport's virtues).
 DEFAULT_PORTS = {"udp": 53, "tcp": 53, "dot": 853, "doh": 443}
 
-#: RFC 7828 §3.2.2's default idle horizon when a keepalive conversation
-#: happened but named no timeout, and the floor below which even an offered
-#: timeout is not trusted (a server offering 1 second makes reuse a
-#: round-trip tax for nothing). §3.4¶2's "some amount of time" is this
-#: build's reading of it; §6's 30 seconds is the same number, arrived at
-#: independently.
-_KEEPALIVE_DEFAULT_S = 30.0
-_KEEPALIVE_FLOOR_S = 2.0
+# The keepalive idle arithmetic (_KEEPALIVE_DEFAULT_S, _KEEPALIVE_FLOOR_S,
+# _idle_seconds) and the held-stream session class (_Session) live in
+# :mod:`namespy.resolver` beside the base transport that now shares them:
+# the walk's own TCP fallbacks pool the same sessions the ``dot`` transport
+# holds, so the shape and its RFC 7828 §3.2.2 arithmetic belong to the
+# plumbing, not to whichever resolver reached for it first. Imported above.
 
 #: RFC 7858 §3.1¶4's "reasonable period (such as one hour per server)" for
 #: remembering a server that refused DNS over TLS -- timeout, refusal, or a
@@ -87,21 +91,6 @@ _KEEPALIVE_FLOOR_S = 2.0
 #: constant: long enough that a lookup storm does not re-pound a dead 853,
 #: short enough that a fixed server is reachable again the same working day.
 _DOT_REMEMBER_S = 3600.0
-
-
-def _idle_seconds(timeout: int | None) -> float:
-    """How long a stream may rest after an answer offering *timeout*.
-
-    The whole of RFC 7828 §3.2.2's client arithmetic, spelled once: none
-    offered (or nothing usable in the option) rides the conservative default,
-    an offered number is honoured -- except below :data:`_KEEPALIVE_FLOOR_S`,
-    where reuse would cost a handshake per lookup and the server's offer is
-    declined in favour of the floor. A ``0`` never arrives here: §3.2.2¶3's
-    close-now is a decision the caller acts on before arming anything.
-    """
-    if timeout is None:
-        return _KEEPALIVE_DEFAULT_S
-    return max(float(timeout), _KEEPALIVE_FLOOR_S)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,58 +216,6 @@ def _host_address_record(host: str) -> DnsRecord:
     return DnsRecord(root, DnsRType.A, DnsRClass.IN, 0, rdata=RData_A(ip))
 
 
-class _Session:
-    """One held TCP (or TLS) stream to an upstream, and its idle life.
-
-    A connection is shared, never snatched: the lock admits one exchange at
-    a time (the conservative reading of RFC 7828 §3.3¶3's matching duties --
-    every response that arrives is the answer to the query whose lock this
-    is, or the stream is discarded), and :attr:`timer` is RFC 7828 §3.2.2¶2's
-    "initiate close of the connection before the timeout expires", armed from
-    the server's offered TIMEOUT (floored at :data:`_KEEPALIVE_FLOOR_S`,
-    defaulted to :data:`_KEEPALIVE_DEFAULT_S`) after each answer. A waiter
-    that finds the session closed on winning the lock has lost it to the
-    timer, not to the server -- its caller re-opens rather than failing.
-    """
-
-    __slots__ = ("closed", "lock", "reader", "timer", "writer")
-
-    #: Streams are one-exchange-at-a-time; the DoH HTTP/2 session overrides
-    #: this to say its queries may ride concurrent streams.
-    multiplexed = False
-
-    def __init__(self, reader, writer):
-        self.reader = reader
-        self.writer = writer
-        self.lock = asyncio.Lock()
-        self.timer: asyncio.TimerHandle | None = None
-        self.closed = False
-
-    def arm_idle(self, seconds: float, loop) -> None:
-        self.cancel_idle()
-        self.timer = loop.call_later(seconds, self._on_idle)
-
-    def _on_idle(self) -> None:
-        self.timer = None
-        self.close_now()
-
-    def cancel_idle(self) -> None:
-        if self.timer is not None:
-            self.timer.cancel()
-            self.timer = None
-
-    def close_now(self) -> None:
-        self.closed = True
-        self.cancel_idle()
-        writer, self.writer = self.writer, None
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception as exc:  # best-effort teardown, said not raised
-                LOGGER.debug("stub_stream_close_failed(err=%s)", type(exc).__name__)
-                del exc
-
-
 class StubResolver(Resolver):
     """Forward queries to a list of recursive servers and return their answers.
 
@@ -321,6 +258,7 @@ class StubResolver(Resolver):
         #: own copies of the same four names.
         self.queue: dict[tuple, tuple] = {}
         self.queue_v6: dict[tuple, tuple] = {}
+        self._tcp_sessions: dict = {}
         self.transport = None
         self.transport_v6 = None
         self._v6_ready = None
@@ -627,6 +565,7 @@ class StubResolver(Resolver):
         for session in self._sessions.values():
             session.close_now()
         self._sessions.clear()
+        self._close_tcp_sessions()  # the cleartext pool the base transport holds
         self._stream_dead.clear()
         for transport in (self.transport, self.transport_v6):
             if transport is not None:

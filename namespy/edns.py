@@ -522,18 +522,30 @@ def nsid_of(options) -> bytes | None:
     return None if option is None else option.data
 
 
-def keepalive_option() -> EdnsOption:
-    """A client's edns-tcp-keepalive: the empty request form, always.
+def keepalive_option(timeout: int | None = None) -> EdnsOption:
+    """The edns-tcp-keepalive option, in whichever form *timeout* asks for.
 
-    RFC 7828 section 3.2.1 paragraph 4: "Clients MUST specify an
-    OPTION-LENGTH of 0 and omit the TIMEOUT value." The client does not
-    negotiate a lifetime from its side -- it asks whether the server will
-    hold the connection, and the server's response answers with the number.
-    Callers that reach for this on a UDP query are breaking paragraph 1's
-    MUST NOT; the TCP transports in :mod:`namespy.stub` are its only
-    intended users, and the timeout is read back with :func:`keepalive_of`.
+    With no argument, the client's request form: RFC 7828 section 3.2.1
+    paragraph 4 makes it flat -- "Clients MUST specify an OPTION-LENGTH of 0
+    and omit the TIMEOUT value." The client does not negotiate a lifetime
+    from its side -- it asks whether the server will hold the connection,
+    and the server's response answers with the number. Callers that reach
+    for this on a UDP query are breaking paragraph 1's MUST NOT; the stream
+    transports in :mod:`namespy.stub` are its only intended client users.
+
+    With an integer, the server's response form: section 3.1's two-octet
+    TIMEOUT, which section 3.3.2 paragraph 1 obliges a sending server to
+    fill with the timeout actually associated with the session -- 0 included,
+    because "send no more queries on this connection" is a value with
+    meaning, not an absence of one. Negative and oversized numbers are the
+    caller's mistake to hear: the wire has room for 0..65535 and nothing
+    between.
     """
-    return EdnsOption(KEEPALIVE_OPTION_CODE, b"")
+    if timeout is None:
+        return EdnsOption(KEEPALIVE_OPTION_CODE, b"")
+    if not 0 <= int(timeout) <= 0xFFFF:
+        raise ValueError(f"keepalive TIMEOUT {timeout!r} is not a 16-bit idle timeout")
+    return EdnsOption(KEEPALIVE_OPTION_CODE, int(timeout).to_bytes(KEEPALIVE_TIMEOUT_OCTETS, "big"))
 
 
 def keepalive_of(options) -> int | None:

@@ -81,6 +81,7 @@ from .edns import (
     MQTYPE_QUERY_OPTION_CODE,
     extended_error_presentation,
     extended_errors_of,
+    keepalive_of,
     key_tag_option,
     key_tags_of,
     nsid_of,
@@ -239,6 +240,89 @@ class NxdomainPolicy(enum.Enum):
     VALIDATED = "validated"
 
 
+#: RFC 7828 §3.2.2's default idle horizon when a keepalive conversation
+#: happened but named no timeout, and the floor below which even an offered
+#: timeout is not trusted (a server offering 1 second makes reuse a
+#: round-trip tax for nothing). §3.4¶2's "some amount of time" is this
+#: build's reading of it; §6's 30 seconds is the same number, arrived at
+#: independently.
+_KEEPALIVE_DEFAULT_S = 30.0
+_KEEPALIVE_FLOOR_S = 2.0
+
+
+def _idle_seconds(timeout: int | None) -> float:
+    """How long a stream may rest after an answer offering *timeout*.
+
+    The whole of RFC 7828 §3.2.2's client arithmetic, spelled once: none
+    offered (or nothing usable in the option) rides the conservative default,
+    an offered number is honoured -- except below :data:`_KEEPALIVE_FLOOR_S`,
+    where reuse would cost a handshake per lookup and the server's offer is
+    declined in favour of the floor. A ``0`` never arrives here: §3.2.2¶3's
+    close-now is a decision the caller acts on before arming anything.
+    """
+    if timeout is None:
+        return _KEEPALIVE_DEFAULT_S
+    return max(float(timeout), _KEEPALIVE_FLOOR_S)
+
+
+class _Session:
+    """One held TCP (or TLS) stream to a peer, and its idle life.
+
+    A connection is shared, never snatched: the lock admits one exchange at
+    a time (the conservative reading of RFC 7828 §3.3¶3's matching duties --
+    every response that arrives is the answer to the query whose lock this
+    is, or the stream is discarded), and :attr:`timer` is RFC 7828 §3.2.2¶2's
+    "initiate close of the connection before the timeout expires", armed from
+    the server's offered TIMEOUT (floored at :data:`_KEEPALIVE_FLOOR_S`,
+    defaulted to :data:`_KEEPALIVE_DEFAULT_S`) after each answer. A waiter
+    that finds the session closed on winning the lock has lost it to the
+    timer, not to the server -- its caller re-opens rather than failing.
+
+    It serves both stream halves of this package from one class: the
+    walk's pooled TCP fallbacks (see :meth:`Resolver._query_tcp`) and a
+    stub's ``dot`` upstreams (see :mod:`namespy.stub`) hold exactly this
+    shape, and the DoH transport (see :mod:`namespy.doh`) borrows its
+    lock and timer.
+    """
+
+    __slots__ = ("closed", "lock", "reader", "timer", "writer")
+
+    #: Streams are one-exchange-at-a-time; the DoH HTTP/2 session overrides
+    #: this to say its queries may ride concurrent streams.
+    multiplexed = False
+
+    def __init__(self, reader, writer):
+        self.reader = reader
+        self.writer = writer
+        self.lock = asyncio.Lock()
+        self.timer: asyncio.TimerHandle | None = None
+        self.closed = False
+
+    def arm_idle(self, seconds: float, loop) -> None:
+        self.cancel_idle()
+        self.timer = loop.call_later(seconds, self._on_idle)
+
+    def _on_idle(self) -> None:
+        self.timer = None
+        self.close_now()
+
+    def cancel_idle(self) -> None:
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+    def close_now(self) -> None:
+        self.closed = True
+        self.cancel_idle()
+        writer, self.writer = self.writer, None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as exc:  # best-effort teardown, said not raised
+                LOGGER.debug("stream_close_failed(err=%s)", type(exc).__name__)
+                del exc
+
+
 class Resolver(asyncio.Protocol):
     """Send queries to authoritative servers and match the answers.
 
@@ -327,6 +411,14 @@ class Resolver(asyncio.Protocol):
     queue: dict
     queue_v6: dict
     _v6_ready: Any
+
+    #: The pooled held streams :meth:`Resolver._query_tcp` reuses, keyed by
+    #: ``(host, port)``. Declared bare like the datagram plumbing above: the
+    #: instances that bind it -- :class:`RecursiveResolver` and
+    #: :class:`~namespy.stub.StubResolver` -- do so in ``__init__``, and
+    #: ``_query_tcp`` creates one on demand for anything else (a bare
+    #: ``Resolver()`` driven by tests that never bind it).
+    _tcp_sessions: dict
 
     async def query(
         self,
@@ -698,7 +790,7 @@ class Resolver(asyncio.Protocol):
         return response
 
     async def _query_tcp(self, host, wire, query_packet, port: int = 53):
-        """Query over TCP, with the 2-octet length prefix RFC 1035 section 4.2.2.
+        """Query over TCP, on a held connection where one is held.
 
         TCP is reached from three places: a UDP attempt that timed out, a UDP
         response with ``TC`` set (see :meth:`_await_udp`), and zone transfers,
@@ -706,8 +798,37 @@ class Resolver(asyncio.Protocol):
         budget for the whole exchange, so a server that accepts the connection and
         then stalls cannot hold the lookup open for three times the query timeout.
 
-        A response that arrives over TCP with ``TC`` still set is returned as it
-        came. RFC 7766 section 8 gives TCP a 65535-octet message field, so
+        The connection is a *session*, not a rite: one per ``(host, port)``,
+        held across exchanges, because RFC 7766 section 6.2.1 paragraph 1 asks
+        both ends to "support connection reuse by sending multiple queries and
+        responses over a single persistent TCP connection" -- the setup RTT the
+        same paragraph names as TCP's cost is exactly what this pool pays once
+        instead of per lookup. One connection per server is also section 6.2.2
+        paragraph 1's "MUST ... minimise the number of concurrent TCP
+        connections": the lock makes a second query wait on the session instead
+        of opening a rival line. (That document's SHOULD to *pipeline* is left
+        unexercised, for the stub's stated reason: with one exchange in flight
+        the matching duty of section 6.2.1 paragraph 2 is discharged by ID
+        alone, and a resolver's tail latency belongs to its client.) Zone
+        transfers are the documented exception -- the same paragraph counts
+        them as their own connection -- so an ``AXFR`` query rides a one-shot
+        stream that closes when the answer has been read.
+
+        The idle life is RFC 7828's conversation. A response carrying
+        edns-tcp-keepalive re-arms the session's timer with the offered
+        TIMEOUT, honouring section 3.2.2 paragraph 2 ("SHOULD honour the
+        timeout received in that response ... initiate close of the
+        connection before the timeout expires"); a TIMEOUT of 0 is paragraph
+        3's "send no more queries on that connection", and the session goes
+        with it; no option at all rides the conservative default, paragraph
+        4's return to RFC 7766 -- where section 6.2.3 leaves the server to
+        decide, and this client's 30 seconds is a hold, not a claim. A
+        server that closes first is met the way section 6.2.4 paragraph 2
+        tells clients to meet it: retry the unanswered query once, invisibly,
+        on a fresh connection.
+
+        A response that arrives over TCP with ``TC`` still set is returned as
+        it came. RFC 7766 section 8 gives TCP a 65535-octet message field, so
         truncation should not happen, but a server that sets the bit anyway is
         answered honestly rather than silently; :func:`_write_cache` refuses to
         cache it.
@@ -715,43 +836,94 @@ class Resolver(asyncio.Protocol):
         The answer is checked against *query_packet* just as a UDP answer is.
         Point-to-point transport removes the off-path forgery threat that
         RFC 5452 addresses, but not the mundane ones: a middlebox, a stale
-        pipelined response, or a server with a broken ID field can all hand back
-        something that is not the answer to this question, and silently using it
-        would be a wrong answer rather than a failure.
+        pipelined response, or a server with a broken ID field can all hand
+        back something that is not the answer to this question, and silently
+        using it would be a wrong answer rather than a failure. On a *shared*
+        connection a mismatch also discredits the stream -- a stale response
+        in the pipe means the reading position has drifted -- so the session
+        is dropped, and a query that had been riding a reused one tries
+        again over freshly opened bytes.
         """
         self.log.debug("resolver_tcp_try(dst=%s id=%s)", host, query_packet.ID)
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=self.query_timeout
-            )
-        except Exception as e:
-            self.log.debug(
-                "resolver_tcp_connect_failed(dst=%s id=%s err=%s)",
-                host,
-                query_packet.ID,
-                type(e).__name__,
-            )
-            return None
-        try:
-            pkt = await self._stream_exchange(reader, writer, wire, query_packet, host)
-        except Exception as e:
-            self.log.debug(
-                "resolver_tcp_failed(dst=%s id=%s err=%s)",
-                host,
-                query_packet.ID,
-                type(e).__name__,
-            )
-            return None
-        finally:
+        self.log.debug("resolver_tcp_try(dst=%s id=%s)", host, query_packet.ID)
+        q0 = query_packet.questions[0] if query_packet.questions else None
+        poolable = getattr(q0, "qtype", None) != DnsQType.AXFR  # 6.2.2 para 1's own line
+        sessions = getattr(self, "_tcp_sessions", None)
+        if sessions is None:
+            sessions = self._tcp_sessions = {}
+        key = (host, port)
+        for _attempt in (1, 2) if poolable else (1,):
+            session = sessions.get(key) if poolable else None
+            if session is not None and session.closed:
+                self._drop_tcp_session(key, session)  # died idle since it was last held
+                session = None
+            if session is None:
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port), timeout=self.query_timeout
+                    )
+                except Exception as e:
+                    self.log.debug(
+                        "resolver_tcp_connect_failed(dst=%s id=%s err=%s)",
+                        host,
+                        query_packet.ID,
+                        type(e).__name__,
+                    )
+                    return None
+                session = _Session(reader, writer)
+                if poolable:
+                    sessions[key] = session  # registered now, so a concurrent query waits
+                fresh = True
+            else:
+                fresh = False
             try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception as exc:
-                # The answer has already been read; a failure while tearing the
-                # connection down (a server that RSTs instead of finishing the
-                # close) must not turn a good response into an error.
-                self.log.debug("resolver_tcp_close_failed(err=%s)", type(exc).__name__)
-        return pkt
+                async with session.lock:
+                    if session.closed:
+                        # the idle timer (or the server) took the stream while this
+                        # call queued -- a network event, not a failure
+                        raise ConnectionError("stream ended before its turn")
+                    pkt = await self._stream_exchange(
+                        session.reader, session.writer, wire, query_packet, host
+                    )
+                    if pkt is None:
+                        raise ConnectionError("server answered something else")
+            except Exception as e:
+                self.log.debug(
+                    "resolver_tcp_failed(dst=%s id=%s err=%s reused=%s)",
+                    host,
+                    query_packet.ID,
+                    type(e).__name__,
+                    not fresh,
+                )
+                self._drop_tcp_session(key, session)
+                if fresh or not poolable:
+                    return None
+                continue  # section 6.2.4 para 2's retry, once, on a fresh stream
+            if not poolable:
+                session.close_now()
+                return pkt
+            timeout = keepalive_of(pkt.edns_options())
+            if timeout == 0:
+                # RFC 7828 section 3.2.2 paragraph 3: send nothing more here.
+                self.log.debug("resolver_tcp_keepalive_refused(dst=%s)", host)
+                self._drop_tcp_session(key, session)
+            else:
+                session.arm_idle(_idle_seconds(timeout), asyncio.get_running_loop())
+            return pkt
+        return None  # unreachable: both attempts return or continue above
+
+    def _drop_tcp_session(self, key, session) -> None:
+        """Retire *session*, and only it, from the reuse pool."""
+        sessions = getattr(self, "_tcp_sessions", None)
+        if sessions is not None and sessions.get(key) is session:
+            del sessions[key]
+        session.close_now()
+
+    def _close_tcp_sessions(self) -> None:
+        """Close every pooled stream; the walk's and a stub's shutdown share this."""
+        sessions, self._tcp_sessions = getattr(self, "_tcp_sessions", None), {}
+        for session in (sessions or {}).values():
+            session.close_now()
 
     async def _stream_exchange(self, reader, writer, wire, query_packet, host):
         """One length-prefixed exchange on an already-open stream.
@@ -3624,6 +3796,7 @@ class RecursiveResolver(Resolver):
         """
         self.queue: dict[tuple, tuple] = {}
         self.queue_v6: dict[tuple, tuple] = {}
+        self._tcp_sessions: dict = {}
         self.transport_v6 = None
         self._v6_ready = None
         self.log = LOGGER
@@ -3754,6 +3927,12 @@ class RecursiveResolver(Resolver):
                 transport.close()
         self.transport = None
         self.transport_v6 = None
+
+        # The pooled TCP fallback streams are the second socket family this
+        # class owns privately, and they close here too -- same reason as the
+        # v6 bring-up above: nothing else holds them, and the docstring
+        # above promised no leaks on this path.
+        self._close_tcp_sessions()
 
         for queue in (getattr(self, "queue", None), getattr(self, "queue_v6", None)):
             for _key, (_query, future) in list((queue or {}).items()):
