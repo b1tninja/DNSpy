@@ -120,6 +120,7 @@ import ipaddress
 import logging
 import ssl
 import struct
+import time
 from dataclasses import dataclass
 
 from . import enable_path_mtu_discovery
@@ -134,6 +135,7 @@ from .edns import (
     cookie_length_valid,
     extended_dns_error_option,
     extended_error_option_valid,
+    extended_errors_of,
     find_option,
     keepalive_of,
     keepalive_option,
@@ -157,6 +159,7 @@ from .packet import (
     Query,
     Response,
 )
+from .querylog import QueryLog
 from .rdata import RData_A, RData_AAAA, RData_TXT
 from .resolver import EDNS_PAYLOAD_SIZE, RecursiveResolver
 from .stub import StubResolver, Upstream
@@ -452,6 +455,7 @@ class DnsServer(asyncio.Protocol):
         tcp_idle: int | None = DEFAULT_TCP_IDLE_S,
         dot_upstreams=(),
         filter_policy: FilterPolicy | None = None,
+        query_log: QueryLog | None = None,
     ):
         """
         :param nsid: the RFC 5001 name-server identifier to advertise when a
@@ -530,6 +534,18 @@ class DnsServer(asyncio.Protocol):
             The composed answers carry their RFC 8914 explanation, no
             AA and no AD, and never reach any cache: see the module's
             docstring for why each of those is the same decision.
+        :param query_log:
+            a :class:`~namespy.querylog.QueryLog` receiving one JSON
+            record per answered query -- default :const:`None`, the
+            silence the module's first rule demands of anything that
+            writes to disk on someone's behalf. The record names its
+            ``origin`` from the ladder this server answers on
+            (``bind``, ``policy``, ``forward``, ``recurse``,
+            ``reject``), and asks nothing the pipeline does not
+            already know: no cache-vs-walk distinction is invented
+            because none is kept (see :mod:`namespy.trace`'s own
+            concession that a refused special-name answer is
+            "indistinguishable from a cache answer").
 
         """
         if not isinstance(resolver, RecursiveResolver):
@@ -578,6 +594,8 @@ class DnsServer(asyncio.Protocol):
         # Policy filtering, judged after the binds and before anything
         # that could remember or leak: see :param filter_policy.
         self._filter = filter_policy
+        # The operator's file, when one was asked for: see :param query_log.
+        self._query_log = query_log
 
     def connection_made(self, transport):
         self.transport = transport
@@ -703,6 +721,7 @@ class DnsServer(asyncio.Protocol):
             request=dns_packet,
             mqtype_answered=[] if asked is not None else None,
             channel=channel,
+            origin="bind",
         )
 
     def _filtered_reply(self, dns_packet, addr, asked, channel, rule) -> None:
@@ -730,6 +749,7 @@ class DnsServer(asyncio.Protocol):
             extended_errors=(extended_dns_error_option(rule.action.value, rule.action.extra_text),),
             mqtype_answered=[] if asked is not None else None,
             channel=channel,
+            origin="policy",
         )
 
     async def _forward_dot(self, dns_packet, addr, asked, channel) -> None:
@@ -812,6 +832,7 @@ class DnsServer(asyncio.Protocol):
             request=dns_packet,
             mqtype_answered=[] if asked is not None else None,
             channel=channel,
+            origin="forward",
         )
 
     async def aclose(self) -> None:
@@ -825,7 +846,14 @@ class DnsServer(asyncio.Protocol):
             await self._forwarder.aclose()
 
     def _reply(
-        self, response, addr, request=None, extended_errors=(), mqtype_answered=None, channel=None
+        self,
+        response,
+        addr,
+        request=None,
+        extended_errors=(),
+        mqtype_answered=None,
+        channel=None,
+        origin="recurse",
     ) -> None:
         if request is not None:
             # RFC 4035 §3.2.2¶2: "The name server side MUST copy the setting of the
@@ -898,6 +926,63 @@ class DnsServer(asyncio.Protocol):
             # requires the truncation to have -- TC over UDP is a promise
             # this path keeps in full.
             channel.send(wire)
+        self._log_query(response, addr, request, extended_errors, wire, origin, channel)
+
+    def _log_query(self, response, addr, request, extended_errors, wire, origin, channel) -> None:
+        """Append this answer's record to the operator's log, if one was asked for.
+
+        The vocabulary is borrowed, never invented: ``origin`` names the
+        rung the answer came off, ``rcode`` reads the extended number the
+        way the CLI printer reads it, ``stale`` rides the resolver's own
+        marker, and the ``ede`` list parses the outgoing options through
+        the same door the client-side code does (``extended_errors_of``
+        -- the built options are raw TLVs, and ``info_code`` belongs to
+        the parse, a fact one live bug taught this method the hard way).
+        Two numbers are stamped onto the request at its parse site --
+        ``_namespy_bytes`` (octets received) and ``_namespy_started``
+        (monotonic clock at the responder's entry) -- because those
+        facts exist exactly once, at the edges, and an object is the
+        only carrier that reaches this point without threading
+        parameters through fourteen refusal sites. Absent stamps (a
+        datagram that never parsed) record as ``null``, which is the
+        truth rather than a guess. And the whole record is built inside
+        a try: emitting the log is the last act of an answer that has
+        already left, and no answer should ever be recalled -- or its
+        task crashed -- because the bookkeeping tripped.
+        """
+        if self._query_log is None:
+            return
+        try:
+            question = request.questions[0] if request is not None and request.questions else None
+            try:
+                rcode = DnsResponseCode(int(response.extended_rcode)).name
+            except Exception:
+                rcode = str(int(response.RCODE))
+            started = getattr(request, "_namespy_started", None)
+            self._query_log.emit(
+                {
+                    "ts": time.time(),
+                    "client": f"{addr[0]}:{addr[1]}",
+                    "transport": ("udp" if channel is None else ("dot" if channel.tls else "tcp")),
+                    "origin": origin,
+                    "id": int(response.ID),
+                    "qname": None if question is None else str(question.name),
+                    "qtype": None if question is None else int(question.qtype),
+                    "qclass": None if question is None else int(question.qclass),
+                    "rcode": rcode,
+                    "ede": [int(e.info_code) for e in extended_errors_of(extended_errors)],
+                    "tc": bool(response.TC),
+                    "ad": bool(response.AD),
+                    "stale": bool(getattr(response, "stale_answer", False)),
+                    "in_bytes": getattr(request, "_namespy_bytes", None),
+                    "out_bytes": len(wire),
+                    "elapsed_ms": (
+                        None if started is None else round((time.monotonic() - started) * 1000, 1)
+                    ),
+                }
+            )
+        except Exception as exc:
+            self.log.debug("server_querylog_record_failed(err=%s)", type(exc).__name__)
 
     @staticmethod
     def _datagram_cap(request) -> int:
@@ -1042,6 +1127,7 @@ class DnsServer(asyncio.Protocol):
         mqtype_answered=None,
         channel=None,
         extended_errors=None,
+        origin="reject",
     ) -> None:
         """Reply with *rcode*, echoing the question so the client can match it.
 
@@ -1084,6 +1170,7 @@ class DnsServer(asyncio.Protocol):
             ),
             mqtype_answered=mqtype_answered,
             channel=channel,
+            origin=origin,
         )
 
     @staticmethod
@@ -1690,6 +1777,7 @@ class DnsServer(asyncio.Protocol):
         return answered
 
     async def respond_to_packet(self, dns_packet, addr, channel=None):
+        dns_packet._namespy_started = time.monotonic()
         if DnsQR.QUERY != dns_packet.QR:
             self.log.debug("server_not_query(src=%s id=%#06x)", addr[0], dns_packet.ID)
             return
@@ -1838,6 +1926,7 @@ class DnsServer(asyncio.Protocol):
         host, port = addr[0], addr[1]
         try:
             dns_packet, _offset = DnsPacket.parse(data)
+            dns_packet._namespy_bytes = len(data)
         except DnsPacketParseError as exc:
             # Debug, not warning: this is the attacker-controlled path, and a
             # warning per datagram is a free log-flood primitive. The offset and
@@ -2077,6 +2166,7 @@ class DnsStreamServer(asyncio.Protocol):
         self._arm_idle()
         try:
             dns_packet, _offset = DnsPacket.parse(frame)
+            dns_packet._namespy_bytes = len(frame)
         except DnsPacketParseError as exc:
             # Debug, as on the datagram path: this is the attacker-facing
             # line. The answer mirrors the datagram policy -- FORMERR, and

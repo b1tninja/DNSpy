@@ -8,6 +8,39 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **The query log: one JSON line per answer, and every line names its
+  rung (second-horizon U4).** `namespy/querylog.py`'s `QueryLog` appends
+  one JSON object per query/response pair to a file of the operator's
+  choosing — a row checked against the corpus that *cites nothing*,
+  because there is no query-log RFC and the formats people
+  half-remember are misfiled ones, and ghosting a number was refused at
+  planning time as it is here. The honesty is in the default: **off**,
+  because the server module's first rule — "never emit output the
+  operator did not ask for" — bites hardest on a file that grows on
+  disk recording where clients went; retention and rotation stay the
+  filesystem's problem. The emit point is the module's single egress
+  door, so every record knows not just what answered but *which rung*
+  answered: `origin` is one of `bind` / `policy` / `forward` /
+  `recurse` / `reject`, the same ladder increment X pinned, and
+  `stale` rides the resolver's own marker. What is *not* claimed is a
+  claim too: no cache-vs-walk distinction is invented, because the
+  pipeline keeps no marker for it — the trace's own comment concedes a
+  refused special-name answer is "indistinguishable from a cache
+  answer." The fields: timestamp, client address, transport
+  (`udp`/`tcp`/`dot`, judged by the channel facts the reflex zone
+  already reads), id, qname/qtype/qclass, the extended RCODE by name,
+  the `ede` list parsed through the client-side door
+  (`extended_errors_of` — the built options are raw TLVs that know no
+  `info_code`, one live bug taught the builder that), TC/AD/stale,
+  in- and out-bytes, and elapsed milliseconds. Two facts are stamped
+  onto the packet at its parse site (`_namespy_bytes`,
+  `_namespy_started`) because they exist exactly once, at the edges;
+  a record that fails to build degrades to a debug line, never a
+  revoked answer. `--serve --serve-query-log FILE` (append; the TCP and
+  DoT ports inherit through the shared protocol). 14 tests,
+  `tests/test_querylog.py`: one per rung, `null` rather than a guess
+  for a never-parsed datagram, the stream channels naming themselves
+  tcp and dot, and the default-off posture pinned as its own test.
 - **Policy filtering: the four refusals, with honest signals
   (second-horizon U3).** `namespy.filtering` makes RFC 8914 §4.16–§4.19
   executable: `FilterAction` is Blocked (15), Censored (16), Filtered (17)

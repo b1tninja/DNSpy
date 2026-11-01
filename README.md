@@ -105,6 +105,11 @@ first rule wins) refuses a name as block or censor (NXDOMAIN), filter
 (NODATA), or prohibit (REFUSED), each explained on the wire by its RFC 8914
 extended error code 15–18 — judged after bound names and before the cache,
 any forwarder, and the walk, and never carrying AA, AD, or a cache entry.
+And `--serve --serve-query-log FILE` appends one JSON-lines record per
+answer — client, transport, the rung it came off (`bind`, `policy`,
+`forward`, `recurse`, `reject`), the RCODE and any EDE codes, sizes,
+elapsed milliseconds — default off, like everything this server writes to
+someone's disk.
 exposing a recursive resolver to a network you do not control turns it into an
 amplification instrument (RFC 5358, RFC 9085). See [`SECURITY.md`](SECURITY.md).
 

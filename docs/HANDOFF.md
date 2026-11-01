@@ -3139,6 +3139,56 @@ the `rfclib[mcp]` extra, not a separate `rfclib-mcp` distribution.
 Full suite after this increment: 1852 passed, 1 skipped; mypy and ruff
 clean; `ruff format` now covers the new files.
 
+### Follow-up: every answer signs its slip — the query log (increment Y, row U4)
+
+`namespy/querylog.py` is small on purpose: a `QueryLog` wrapping a text
+sink, one `json.dumps` per line, flush per record, and a write failure
+that costs a debug line and nothing else. The row cites no RFC because
+the corpus has nothing to cite — checked at planning time, and the
+increment kept that discipline rather than inventing a standard to lean
+on. What carries the design instead is the server module's first rule
+("never emit output the operator did not ask for"), applied harder here
+than anywhere: the log exists only because `--serve-query-log FILE`
+said so, and it records client addresses, which is exactly why the
+default is silence and rotation stays outside the library.
+
+The emit is one line at the bottom of `_reply` — the single egress door
+every increment before this one already funneled through — with an
+`origin` parameter naming the rung: `bind`, `policy`, `forward`,
+`recurse` (defaults at the door), `reject` (defaults inside `_error`).
+No refusal site needed touching. Two facts ride stamped on the parsed
+request (`_namespy_bytes` at both parse sites, `_namespy_started` at
+the `respond_to_packet` entry) because they exist once, at the edges,
+and threading parameters through fourteen sites for a log line is the
+alternative the stamps replace. Absent stamps record as `null` — the
+never-parsed datagram has a real record (reject, FORMAT_ERROR) with
+honest holes.
+
+Declined on purpose: a `cache` origin. The sketch promised one; the
+pipeline keeps no marker that would answer for it, and the trace file
+already concedes the indistinguishability in its own comment. Inventing
+a field the source cannot feed is the phantom-citation failure mode
+with a schema instead of a §. `stale` shipped instead because the
+resolver genuinely stamps it. A follow-up that wants cache-vs-walk
+starts with a response-level stamp and a trace event, not with this log.
+
+A live probe caught the one real bug on the way: `ede` was reading
+`info_code` off the *built* `EdnsOption` TLVs — that attribute belongs
+to the parse (`extended_errors_of`), so the filter rung's record died
+mid-build. It died after the answer had already left, which is the
+containment the docstring promises; the builder now runs whole inside
+a try, parses EDE through the client-side door, and the module keeps
+the scar in prose. Also learned: `DnsOpCode(4)` is not how unassigned
+opcodes are spelled here (they degrade to plain `int` by design), and
+qnames print the wire's canonical trailing dot.
+
+Tests: 14 in `tests/test_querylog.py` — sink contract (parsable lines,
+append, broken sink, non-ASCII), one record per rung, reject-with-nulls
+for garbage, tcp/dot naming from the channel, arrival order, default-off
+pinned, CLI guard. Full suite after: 1866 passed, 1 skipped; mypy, ruff
+check, ruff format clean. Next: U9 (the blocklist client — it consumes
+exactly the vocabulary X emitted and Y logged), then the U6 campaign.
+
 
 ## Previous round: MQTYPE (RFC 10029)
 

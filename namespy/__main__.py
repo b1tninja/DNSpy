@@ -34,6 +34,7 @@ from .filtering import FilterPolicy
 from .idna import IdnaError
 from .names import DomainName
 from .packet import OPT_RTYPE, DnsPacket, DnsPacketParseError, DnsQuestion, Query, Response
+from .querylog import QueryLog
 from .rdata import generic_presentation, type_name_of
 from .resolver import (
     EDNS_PAYLOAD_SIZE,
@@ -619,6 +620,20 @@ def build_parser():
         "everything under it). Judged after bound names and before the cache, "
         "any forwarder, and the walk; policy answers carry no AA, no AD, and "
         "are never cached",
+    )
+    p.add_argument(
+        "--serve-query-log",
+        dest="serve_query_log",
+        metavar="FILE",
+        help="with --serve: append one JSON-lines record per query/response "
+        "pair to FILE (created if absent, appended if not). Each line names "
+        "the client address, transport, the rung the answer came off (bind, "
+        "policy, forward, recurse, or reject), the question, the extended "
+        "RCODE, any EDE codes, sizes, TC, AD, the stale flag, and elapsed "
+        "milliseconds. Default off, and the off is a rule rather than a "
+        "default: this file records where your clients went, so it exists "
+        "only because a flag said so, and retention stays the filesystem's "
+        "problem",
     )
     p.add_argument(
         "--qname-min",
@@ -1292,6 +1307,7 @@ async def serve(args) -> int:
     _server_protocol = None
     _stream_server = None
     _dot_server = None
+    _query_log_file = None
     try:
         loop = asyncio.get_running_loop()
         anchors = _trust_anchors(args)
@@ -1328,6 +1344,16 @@ async def serve(args) -> int:
             except ValueError as exc:
                 raise SystemExit(f"namespy: --forward-dot: {exc}") from None
         filter_policy = FilterPolicy.from_cli(args.filter) if args.filter else None
+        query_log = None
+        if args.serve_query_log:
+            try:
+                # Open for the listener's whole life, closed in the finally
+                # below: a context manager here would scope the file to the
+                # binding of a name, which is the opposite of what a log is.
+                _query_log_file = open(args.serve_query_log, "a", encoding="utf-8")  # noqa: SIM115
+            except OSError as exc:
+                raise SystemExit(f"namespy: --serve-query-log: {exc}") from None
+            query_log = QueryLog(_query_log_file)
         _server_transport, _server_protocol = await loop.create_datagram_endpoint(
             lambda: DnsServer(
                 resolver_protocol,
@@ -1335,6 +1361,7 @@ async def serve(args) -> int:
                 max_qtypes=args.max_qtypes,
                 dot_upstreams=dot_upstreams,
                 filter_policy=filter_policy,
+                query_log=query_log,
             ),
             local_addr=("127.0.0.1", 53),
         )
@@ -1454,6 +1481,8 @@ async def serve(args) -> int:
             await resolver_protocol.aclose()
         if _server_protocol is not None:
             await _server_protocol.aclose()
+        if _query_log_file is not None:
+            _query_log_file.close()
 
 
 def main(argv=None) -> int:
@@ -1489,6 +1518,12 @@ def main(argv=None) -> int:
         parser.error(
             "--filter configures the --serve server's policy; run with --serve "
             "(a one-shot lookup applies no policy -- it is the asking side)"
+        )
+    if args.serve_query_log:
+        parser.error(
+            "--serve-query-log records the queries the --serve server answers; "
+            "run with --serve (a one-shot lookup logs nothing -- you already "
+            "hold its entire transcript)"
         )
     if args.serve_dot or args.forward_dot:
         parser.error(
