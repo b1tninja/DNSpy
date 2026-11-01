@@ -71,6 +71,7 @@ from typing import Any, NamedTuple
 
 from . import enable_path_mtu_discovery
 from .aggressive import synthesize
+from .anchors import key_tag_query_name
 from .bundle import (
     BundledType,
     BundleResult,
@@ -4481,6 +4482,12 @@ class RecursiveResolver(Resolver):
         # anchor list a caller mutates mid-flight would silently change what
         # "validated" meant partway down a delegation chain.
         self.trust_anchors = tuple(trust_anchors)
+        # RFC 8145 §5.2 bookkeeping for the Key Tag query: names signalled
+        # and in flight (so one descent signals once per zone), and the
+        # tasks themselves (asyncio holds weak references; an unretrieved
+        # exception on a dropped task is the noise this set exists to eat).
+        self._ta_signalled: set = set()
+        self._ta_tasks: set = set()
         if self.trust_anchors:
             # RFC 4035 §4.1¶1: a security-aware resolver MUST set DO when it
             # means to validate. An operator who configured anchors but left
@@ -4866,6 +4873,7 @@ class RecursiveResolver(Resolver):
                     step.extra_qtypes,
                     edns_options=step.extra_edns_options,
                 )
+                self._maybe_key_tag_signal(step.questions)
                 if isinstance(sent, Response):
                     # RFC 4035 §4.6¶3: "A resolver MUST disregard the meaning of
                     # the CD and AD bits in a response unless the response was
@@ -5009,6 +5017,80 @@ class RecursiveResolver(Resolver):
         self._dot_memo[key] = (now + min(max(float(ttl), DISCOVERY_MIN_S), DISCOVERY_MAX_S), port)
         self.log.debug("resolver_dot_discovered(dst=%s name=%s port=%s)", host, ns_name, port)
         return port
+
+    def _maybe_key_tag_signal(self, questions) -> None:
+        """RFC 8145 §5.2: a DNSKEY query for an anchor zone owes a Key Tag query.
+
+        §5.2¶1 makes the DNSKEY query itself the trigger ("the need to issue
+        a DNSKEY query is also the trigger to issue a Key Tag query"), and
+        the signal is a NULL/IN question for the §5.1-shaped name. Nobody on
+        this side reads the answer: §5.3¶1 says what the query is *for* (the
+        operator "MAY log or otherwise collect the Key Tag values"), so it
+        rides as a background ``resolve`` -- the full path, deliberately,
+        because §5.2¶5 asks that a Key Tag response be cached and reused
+        "just as it would any other response", and the one word *any* rules
+        out every shortcut that skips the cache. Background because work
+        whose answer belongs to nobody must not add an RTT to work whose
+        answer has a client: the same shape as the opportunistic probe
+        learning, for the same reason.
+
+        The three exclusions are §5.2's own, each with its own door: no
+        anchors, no signal (§5.2¶4's MUST NOT for a non-validating resolver,
+        and this resolver is non-validating without them); non-anchor zones,
+        no signal (§5.2¶3's SHOULD NOT -- the tags §4.2.2.1 rides for a
+        DS-learned zone stay on the option and do not get their own query);
+        and a name that is not a configured anchor's zone verbatim, because
+        §5.2¶2 asks for the tags "of the trust anchor that will be used to
+        validate the expected DNSKEY response" -- the walk's descent-learned
+        DS knowledge is a parent's data about a child, not an anchor.
+        Two economies ride before the send: a cache glance (§5.2¶5's reuse
+        means a warm cache should not re-ask at all -- the inverted sentence
+        of a resolver that re-queries what it still holds), and an in-flight
+        set, which also bounds the recursion the full path invites: the
+        background walk validating its own answer fetches the zone's DNSKEY,
+        whose SendQuery lands back on this method -- and finds the signal
+        already in flight.
+        """
+        if not self.trust_anchors or len(questions) != 1:
+            return
+        question = questions[0]
+        if int(question.qtype) != int(DnsRType.DNSKEY) or int(question.qclass) != int(DnsRClass.IN):
+            return
+        name = question.name
+        tags = sorted(
+            {
+                int(anchor.key_tag)
+                for anchor in self.trust_anchors
+                if anchor.active() and DomainName(str(anchor.zone)) == name
+            }
+        )
+        if not tags:
+            return
+        try:
+            signal = key_tag_query_name(name, tags)
+        except ValueError:
+            return  # a hand-built anchor with a tag past 16 bits is a broken config
+        key = signal.canonical_text
+        if key in self._ta_signalled:
+            return
+        if self.cache.get(signal, DnsRType.NULL, DnsRClass.IN) is not None:
+            return  # §5.2¶5: reuse, do not re-ask
+        self._ta_signalled.add(key)
+        task = asyncio.ensure_future(
+            self.resolve(Query(questions=[DnsQuestion(signal, DnsRType.NULL, DnsRClass.IN)]))
+        )
+        self._ta_tasks.add(task)
+
+        def _settled(done):
+            self._ta_signalled.discard(key)
+            self._ta_tasks.discard(done)
+            if not done.cancelled():
+                done.exception()  # consumed, never read -- telemetry has no reader here
+
+        task.add_done_callback(_settled)
+        self.log.debug(
+            "resolver_key_tag_signal(zone=%s tags=%s)", name, ",".join(f"{t:04x}" for t in tags)
+        )
 
     async def resolve(self, dns_packet):
         """Resolve the first question of *dns_packet* iteratively.

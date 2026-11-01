@@ -2698,9 +2698,86 @@ corrected). `ruff`/`format`/`mypy` clean, coverage unchanged at 91.5%.
 **Next, in order**: (1) RFC 8145's actual subject -- edns-key-tag and the
 `_ta-` DNSKEY-query signalling (row 158 🟡, the last open item on the
 EDNS/DNSSEC maintenance list that is *not* waiting on a dependency or a
-human); (2) DoQ as ever; (3) RFC 5011 as its own row if active store
-maintenance is ever wanted; (4) the standing human task: the first
-release tag.
+human) -- shipped as increment O below; (2) DoQ as ever; (3) RFC 5011 as
+its own row if active store maintenance is ever wanted; (4) the standing
+human task: the first release tag.
+
+### Follow-up: the question that says who validates — RFC 8145 §5 (increment O)
+
+Row 158's own note said the rest of 8145 "is its actual subject,
+edns-key-tag and `_ta-` key-tag signalling on DNSKEY queries,
+unimplemented" -- and the audit found the sentence half right. §4 had
+shipped long ago, down to §4.2.2.1¶2's two lists riding as separate
+instances of the option and §4.2¶6's two-source gate (anchors and DS, the
+`key_tags_for` docstring still citing the rollover-telemetry laundering
+argument); `test_edns_keytag.py` has held all of it. What never shipped
+was §5: the *query*, the NULL/IN question whose first label spells the
+trust-anchor key tags in four-digit hex.
+
+`anchors.key_tag_query_name` is the whole format (§5.1¶2-¶5): `_ta-`, the
+tags zero-padded to four lowercase hex digits, hyphen-joined, sorted
+smallest to largest, over the zone. The document supplies its own test
+vectors and they are the tests: 17476 is `_ta-4444.` (¶3), 999 is `03e7`
+(¶4), and the three-anchor example comes out
+`_ta-0635-7aae-aa1b.example.com` when fed unsorted (¶5). Nothing to
+encode for an empty list and nothing to encode past 65535 -- the tag is
+Appendix B's 16-bit arithmetic, and a label truncating a number the
+operator reads back as telemetry (§7¶1) is the one formatting "generosity"
+that turns a bug into misinformation.
+
+The trigger is `RecursiveResolver._maybe_key_tag_signal`, hooked at the
+driver's SendQuery completion -- the one point every DNSKEY question
+passes, the chain helper and the user's own query alike, which is what
+§5.2¶1's "whenever it also originates a DNSKEY query" describes. Three
+doors, each §5.2's own: ¶4's MUST NOT for non-validating resolvers reads
+as *no anchors, no signal* (the same honest inertness as the sentinel and
+VALIDATED cuts); ¶3's SHOULD NOT keeps DS-learned zones off the query
+path -- their tags stay on the §4 option, which admits them, and get no
+question of their own, which does not; and ¶2's "the trust anchor that
+will be used to validate" scopes the match to configured anchors,
+active() at that -- a window that closed validates with nothing.
+
+The answer belongs to the *operator* (§5.3¶1's MAY-log is the entire
+point -- this is how a zone learns whether anyone still trusts the old
+KSK before withdrawing it), so the send rides as a background `resolve`:
+no RTT added to work that has a client waiting, exceptions consumed and
+dropped the way the probe-learning tasks do. The full path was a
+decision, not a shortcut's opposite: §5.2¶5 asks a caching resolver to
+cache and reuse the response "just as it would any other response", and
+the one word *any* rules out every door that skips the cache -- so the
+glance at `cache.get` before firing is ¶5 read as an instruction not to
+re-ask, and the in-flight set both stops one descent counting its
+telemetry twice and bounds the recursion the full path invites (the
+background walk validating its answer re-fetches the zone's DNSKEY, whose
+SendQuery lands back on the same method and finds the signal already
+running).
+
+The server half was already right, and stayed right: §5.3¶2 demands only
+an "appropriate response... determined by whether the data is in the zone
+file" -- the fixture resolves a NULL query as any other, its NXNAME
+FORMERR gate (9824 §3.5) demonstrated to be that type's own door and not
+a Meta-TYPE amnesty. §4.3¶2's MUST NOT -- no edns-key-tag in any
+response -- got the first explicit test the rule has had.
+
+Declined with the document open: §4.2.2.1¶3's MAY of *combining* the two
+lists into one option (separate instances is ¶2's transmitted shape and
+the one a collector can disaggregate); §5.3¶3's zone-side `_ta-` NULL
+records (a zone-content suggestion for operators, and this fixture serves
+no zone); and the §5.3.1 interaction tuning (aggressive-cache suppression
+of repeat signals is already the cache glance's behavior in the client's
+half of that sentence). 13 tests; row 158 🟡→✅.
+
+**Verified**: 1713 passed, 1 skipped (+13). `ruff`/`format`/`mypy` clean,
+coverage 91.5%. Roadmap row 158 🟡→✅; CHANGELOG Added carries the
+increment.
+
+**Next, in order**: (1) DoQ (9250) -- the last deferred transport, still
+gated on the `aioquic` decision, its §5.4 padding and now its §5
+telemetry both already hooked; (2) RFC 5011 as its own honest row if
+active anchor maintenance is ever wanted; (3) the standing human task:
+the first release tag. The maintenance queue that the phantom-9535 list
+carried for a dozen rounds is, at last, empty of everything that was
+real.
 
 ## Previous round: MQTYPE (RFC 10029)
 

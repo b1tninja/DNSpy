@@ -8,6 +8,29 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **RFC 8145 §5's Key Tag query now rides every anchor-zone DNSKEY fetch —
+  the document's actual subject, finished.** §4's edns-key-tag option
+  shipped with the validation walk long ago (both lists of §4.2.2.1 as
+  separate option instances, §4.2¶6's two-source gate); what was missing
+  was the *query*: NULL/IN for `_ta-<key tags>.<zone>`, §5.1's first label
+  of four-digit lowercase hex sorted smallest to largest, built to the
+  document's own worked examples (17476 → `_ta-4444.`, §5.1¶3; 999 →
+  `03e7`, §5.1¶4; the three-anchor figure → `_ta-0635-7aae-aa1b.example.com`,
+  §5.1¶5). `anchors.key_tag_query_name` is the format, arithmetic-checked
+  against the 16-bit tag; `RecursiveResolver._maybe_key_tag_signal` hooks
+  the driver's SendQuery path and fires the question as a **background
+  resolve** — the full path because §5.2¶5 asks the response be cached
+  "just as it would any other response", and background because §5.3¶1's
+  whole point is telemetry the *operator* reads, not the client. §5.2's
+  doors all hold: no anchors no signal (¶4's MUST NOT), DS-learned zones
+  stay option-only (¶3's SHOULD NOT), the in-flight set stops one descent
+  counting twice (and bounds the recursion the full path invites), a warm
+  cache answers ¶5's reuse by not re-asking. Server side, §5.3¶2's
+  "appropriate response" was the fixture's ordinary resolution — NULL is
+  queryable (RFC 2231 §2.4) where NXNAME's FORMERR (9824 §3.5) stays its
+  own door — and §4.3¶2's MUST-never-echo gets its first explicit test.
+  13 tests in `tests/test_key_tag_query.py`; roadmap row 158 🟡→✅.
+
 - **The trust-anchor store can now be interrogated during a ceremony:
   RFC 8509 §2's sentinel mechanism answers at the serving edge.** An
   operator (or §4.3's harness, on ceremony night) queries

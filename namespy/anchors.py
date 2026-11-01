@@ -56,6 +56,7 @@ __all__ = [
     "TrustAnchorFormatError",
     "active_anchors",
     "fetch_root_anchors",
+    "key_tag_query_name",
     "parse_root_anchors",
     "sentinel_expectation",
     "trusted_anchor_tags",
@@ -488,3 +489,36 @@ def trusted_anchor_tags(
     return frozenset(
         anchor.key_tag for anchor in anchors if anchor.zone == zone and anchor.active(moment)
     )
+
+
+def key_tag_query_name(zone, tags):
+    """The RFC 8145 §5.1 QNAME: ``_ta-`` plus the tags, over the zone.
+
+    §5.1¶2 builds the first label as ``"_ta-"`` followed by "a sorted,
+    hyphen-separated list of hexadecimal-encoded Key Tag values", §5.1¶4
+    demands four-digit zero padding ("the Key Tag is 999 ... represented in
+    hexadecimal as 03e7"), and §5.1¶5 (restated by §5.3.1¶4) sorts the list
+    "from smallest to largest". The document's own examples are the
+    arithmetic: tag 17476 asks ``_ta-4444.`` (§5.1¶3), and trust anchors
+    1589, 43547, 31406 over example.com ask
+    ``_ta-0635-7aae-aa1b.example.com`` (§5.1¶5). Lowercase hex, because the
+    document prints it that way and names are case-insensitive anyway;
+    duplicates collapse, because a label saying 4444-4444 would ask the
+    same question twice inside one sentence.
+
+    A key tag is 16 bits (RFC 4034 Appendix B), so a value outside
+    ``0..65535`` is not a tag with a formatting opinion -- it is a caller
+    bug, and saying so beats silently truncating a number the zone operator
+    will read back as telemetry (§7¶1).
+    """
+    from .names import DomainName  # deferred, the way ds_record() reaches for RData_DS
+
+    listed = sorted({int(tag) for tag in tags})
+    if not listed:
+        raise ValueError("§5.1 has nothing to encode for an empty tag list")
+    for tag in listed:
+        if not 0 <= tag <= 65535:
+            raise ValueError(f"key tag is 16-bit arithmetic: {tag}")
+    text = "_ta-" + "-".join(f"{tag:04x}" for tag in listed)
+    zone_text = zone.to_text() if hasattr(zone, "to_text") else str(zone)
+    return DomainName(f"{text}.{zone_text}" if zone_text != "." else f"{text}.")
