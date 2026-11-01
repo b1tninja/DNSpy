@@ -1114,6 +1114,22 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Changed
 
+- **The authority-leg DoH "remainder" turned out to be a refusal, and is
+  retired as one.** Eight rounds of handoff lists carried "the authority-leg
+  DoH answer, same small remainder as before"; reading RFC 9539 §2.2¶8 whole
+  closes it the other way -- the document "does not pursue the use of DNS
+  over HTTPS... in this context", for want of a way for the resolver to
+  learn the endpoint path, and hands DoH to a future update of itself. The
+  mechanism §2.2¶8 wishes for arguably exists since RFC 9461 §5's `dohpath`
+  (9539 cites 8484 but never cites 9461) -- but §2.2¶7 binds the whole state
+  machine to DoT and DoQ, and running a third encrypted transport on a
+  reading would be implementing an amendment nobody ratified. The
+  behavior was already the refusal (`learn_dot_endpoint` skips an alpn
+  without `dot`; `test_discovery_doh_only_record_describes_no_dot_endpoint`
+  pinned it since the P4 round) -- what changed is the prose that had been
+  calling a declined avenue a to-do, in the module's docstring, roadmap
+  row 56, and the handoff queue.
+
 - **EDNS OPT flags bit 14 is CO, not CD — a wire constant retired against the live
   registry.** `packet.py` documented `EDNS_CD_BIT = 1 << 14` as "Checking Disabled,
   OPT FLAGS bit 14 (RFC 6891 section 6.1.3, RFC 6955 section 4)" — and neither

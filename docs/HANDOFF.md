@@ -2629,14 +2629,78 @@ coverage 91.5%. Roadmap row 157 🟡→✅ with the 9535→7583 correction;
 README's "open roadmap row" sentence rewritten to describe the
 questionnaire; CHANGELOG Added carries the increment.
 
-**Next, in order**: (1) the authority-leg DoH answer -- same small
-remainder as before, now including §4.6.8.1-style padding on that leg by
-inheritance; (2) DoQ (9250) deferred as ever, its §5.4 padding riding the
-`query_padding` decision whenever the transport lands; (3) RFC 5011 as
-its own honest row if active maintenance is ever wanted (it would *write*
-the store the sentinel now lets you *read*); (4) the standing human task:
-the first release tag the Status section has been waving at for ten
-rounds.
+**Next, in order**: (1) the authority-leg DoH answer -- closed by
+increment N below without writing a line of transport code: it was a
+refusal misfiled as a remainder; (2) DoQ (9250) deferred as ever, its
+§5.4 padding riding the `query_padding` decision whenever the transport
+lands; (3) RFC 5011 as its own honest row if active maintenance is ever
+wanted (it would *write* the store the sentinel now lets you *read*);
+(4) the standing human task: the first release tag the Status section has
+been waving at for ten rounds.
+
+### Follow-up: the remainder that was a refusal — authority-leg DoH, read whole (increment N)
+
+The queue's oldest resident -- "the authority-leg DoH answer, same small
+remainder as before" -- closed without a line of transport code, because
+the sentence was never true. RFC 9539 §2.2¶8, read whole for the first
+time this round, is not a gap in the document's coverage of encrypted
+transports; it is a declined one: "This document does not pursue the use
+of DNS over HTTPS... because a DoH client needs to know the path part of
+a DoH endpoint URL. Currently, there are no mechanisms for a DNS
+recursive resolver to predict the path on its own... If such mechanisms
+are later defined, the protocol in this document can be updated to
+accommodate them." And §2.2¶7 binds everything the state machine manages
+to the two transports actually specified: "The protocol described in this
+document specifies the use of DoT and DoQ."
+
+The interesting part of the audit is that §2.2¶8's premise is arguable
+now: the path mechanism the paragraph wishes for is close to what RFC
+9461 §5's ``dohpath`` SvcParam provides -- a URI template published in
+the same `_dns` SVCB records this walk already consults, with §5¶2
+spelling out the origin and the expansion. But 9539 cites RFC 8484 while
+never citing 9461 at all (both reference lists checked), §2.2¶7 keeps
+the machine DoT/DoQ-only, and the update clause is written as a future
+event: "can be updated to accommodate them." Implementing DoH-to-
+authority here would mean running a third transport through a Table 2
+whose formulas were never drafted for it, on a reading the governing
+document has not made. The project's own rule -- the one that declined
+the serving side of compact answers in the H round ("online signing is
+out of this repo's scope") and every serving-roadmap row RRL answers with
+("it is a test fixture, not a service") -- is that a nice-sounding
+extension is not a spec, so the increment is the opposite
+of a build: it retires the to-do.
+
+What made this worth a round anyway: the *code was already right*. The
+discovery layer skips an alpn without `dot` with a `_SkippedError`
+(citation attached), and `test_discovery_doh_only_record_describes_no_
+dot_endpoint` has pinned the HTTP-only record's fate since the P4 round
+-- what was wrong was three sentences of prose calling a declined avenue
+a remainder, and the queue dutifully carrying them for eight rounds. The
+docstring bullet now cites §2.2¶8 as the standing refusal it is, records
+the dohpath tension honestly (9461 §5 arguably answers §2.2¶8's wish; the
+amendment still has not happened), and notes that the paragraph's own
+resource concern -- a path-guessing client "incurring an excessive use of
+resources" -- is a second reason the skip is the right default even
+tonight. Roadmap row 56's deferral list gained DoH with the citations;
+the CHANGELOG's Changed section carries the retirement.
+
+If a future 9539 bis does ratify dohpath-based DoH for the authority
+leg, the seam is ready and small: `learn_dot_endpoint` already parses
+the parameter (the SVCB codec has carried `dohpath` since the 9460
+round), the DoH machinery exists in `namespy/doh.py`, and §4.6.8.1's
+padding knob already reaches any encrypted egress. What would have to be
+written is the state machine's blessing -- and that is the amendment's
+job, not this package's.
+
+**Verified**: 1700 passed, 1 skipped (+0 -- behavior unchanged, prose
+corrected). `ruff`/`format`/`mypy` clean, coverage unchanged at 91.5%.
+
+**Next, in order**: (1) RFC 8145's actual subject -- edns-key-tag and the
+`_ta-` DNSKEY-query signalling (row 158 🟡, the last open item on the
+EDNS/DNSSEC maintenance list that is *not* waiting on a dependency or a
+human); (2) DoQ as ever; (3) RFC 5011 as its own row if active store
+maintenance is ever wanted; (4) the standing human task: the first
+release tag.
 
 ## Previous round: MQTYPE (RFC 10029)
 

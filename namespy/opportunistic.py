@@ -494,8 +494,16 @@ def _endpoint_from_candidate(cand, binding: str, host: str) -> int:
     * an ``alpn`` without ``dot`` is not this transport -- §4.1¶1's
       requirement ("no alpn ... the client MUST treat the SVCB record as
       incompatible", which :func:`select_records` has usually already
-      applied) and §4.1¶2's HTTP branch, whose DoH client the authority
-      leg does not yet contain;
+      applied) and the refusal of an HTTP-only answer that RFC 9539
+      §2.2¶8 makes for the whole authority leg: the document "does not
+      pursue" DoH here because a path mechanism was lacking -- and while
+      RFC 9461 §5's ``dohpath`` arguably supplies the mechanism §2.2¶8
+      wishes for (9539 cites 8484 but never cites 9461), §2.2¶7 binds
+      this document's state machine to DoT and DoQ and hands DoH to a
+      future update. Running a third transport on that reading would be
+      implementing an amendment nobody ratified; this build skips the
+      record instead, which is also what §2.2¶8's resource concern says
+      a path-guessing client would be spending.
     * a ``port`` inside :data:`CONFUSION_RISK_PORTS` is declined per
       §4.2¶3-¶4, and §4.2¶2's auto-mandatory rule makes declining the port
       mean declining the record.
