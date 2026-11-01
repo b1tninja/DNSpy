@@ -66,8 +66,8 @@ namespy --serve                      # demo server on 127.0.0.1:53
 `--allow-out-of-bailiwick-glue`, `--no-failure-cache`, `-v`, `--debug`).
 
 `--trace` output is a Mermaid `sequenceDiagram`, so GitHub renders it directly —
-useful for seeing exactly where a zone cut was crossed and which NS forced a
-glueless sub-resolution.
+useful for seeing exactly where a zone cut was crossed and which NS forced a glueless
+sub-resolution.
 
 `--serve` binds loopback on purpose. It is a codec exercise, not a name server;
 exposing a recursive resolver to a network you do not control turns it into an
@@ -244,6 +244,14 @@ them change the security properties of anything built on top.
   server sees only the labels the previous referral proved relevant, at the
   cost of more queries. `--trace` marks the probe queries, and budget
   exhaustion degrades back to full names rather than failing.
+- **SHA-1 DNSSEC signatures are believed by no one by default** (RFC 9905
+  §2, RFC 9906 §2). RSASHA1 (5) and RSASHA1-NSEC3-SHA1 (7) are deprecated for
+  signing and ECC-GOST (12) retired: a zone signed only with them now answers
+  as **insecure** — served, unsigned, no AD — rather than bogus or broken, and
+  DS records naming those algorithms (or the GOST digest) introduce nothing at
+  all, opt-in or not. The validation arithmetic itself is kept, because RFC
+  9905 §2¶2 MUSTs it, and `--allow-sha1-dnssec` (`allow_deprecated_sha1=True`)
+  re-opens it for reading zones mid-migration that are still signed with them.
 - **Failure caching is coarse, on purpose** (`FailureCache`, RFC 9520 §3.2). A name
   that just failed — or any name under a zone whose servers just stopped answering
   (§3.3) — is answered `SERVFAIL` for one second to five minutes without a query

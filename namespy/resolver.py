@@ -436,6 +436,12 @@ class Resolver(asyncio.Protocol):
     #: and the only one a bare ``Resolver()`` can honestly have.
     trust_anchors = ()
 
+    #: Whether RFC 9905's deprecated SHA-1 signing algorithms (RSASHA1,
+    #: RSASHA1-NSEC3-SHA1) are re-opened as signature verifiers; see
+    #: :meth:`RecursiveResolver.__init__`. Meaningful only with trust anchors,
+    #: and False is the compliant default the document's operator MUST asks for.
+    allow_deprecated_sha1 = False
+
     #: Optional DNS suffix the resolver assumes for *relative* names — those
     #: whose presentation form does not end in the root terminator (``.``).
     #: A trailing ``.`` on the SNAME prevents this suffix from being assumed
@@ -2765,6 +2771,7 @@ def resolve_steps(
     client_key_tags: tuple = (),
     aggressive_nsec: bool = False,
     serve_stale: float = 0.0,
+    allow_deprecated_sha1: bool = False,
 ):
     """Drive resolution as a generator of effect/trace events.
 
@@ -2979,7 +2986,11 @@ def resolve_steps(
     sec_material: dict = {}
     clock = now if now is not None else (cache.time_fn() if cache is not None else None)
     if anchors:
-        sec_validator = Validator(anchors=tuple(anchors), now=clock)
+        sec_validator = Validator(
+            anchors=tuple(anchors),
+            now=clock,
+            allow_deprecated_sha1=allow_deprecated_sha1,
+        )
 
     def _offer(zone, reply, server=None):
         """File everything *reply* carried as the data of the zone that sent it.
@@ -4310,6 +4321,7 @@ class RecursiveResolver(Resolver):
         dnssec_ok: bool = False,
         compact_answers: bool = False,
         trust_anchors=(),
+        allow_deprecated_sha1: bool = False,
         opportunistic_dot: bool = False,
         opportunistic_discover: bool = True,
         query_padding: bool = True,
@@ -4399,6 +4411,16 @@ class RecursiveResolver(Resolver):
             refuses construction without it. Setting anchors turns on ``dnssec_ok``:
             a security-aware resolver MUST ask for the records it means to validate
             (RFC 4035 §4.1¶1), and DO-off proves nothing.
+        :param allow_deprecated_sha1: re-open RFC 9905's deprecated signature
+            algorithms -- RSASHA1 (5) and RSASHA1-NSEC3-SHA1 (7) -- as
+            validators. False, the default, is what §2¶2's operator MUST
+            prescribes: treat them as unsupported, so a zone signed only with
+            them answers as insecure rather than bogus or broken; the DS
+            records those algorithms name are rejected either way, as §2¶1
+            admits no opt-in. True exercises the validation capability the
+            same paragraph makes a MUST to keep, for reading zones still
+            signed with SHA-1. RFC 9906's retirement of ECC-GOST (12) has no
+            equivalent opt-in in the document, so there is none here.
         :raises ValueError: if *glue_policy* or *nxdomain_cut* is not a
             :class:`GluePolicy` / :class:`NxdomainPolicy` (or its name/value), or
             if *nxdomain_cut* is :attr:`NxdomainPolicy.VALIDATED` without
@@ -4482,6 +4504,10 @@ class RecursiveResolver(Resolver):
         # anchor list a caller mutates mid-flight would silently change what
         # "validated" meant partway down a delegation chain.
         self.trust_anchors = tuple(trust_anchors)
+        # RFC 9905 §2¶2's two sentences -- implementations MUST keep the SHA-1
+        # validation, operators MUST default to treating it as unsupported --
+        # are reconciled here, at the one door the walk reads it through.
+        self.allow_deprecated_sha1 = bool(allow_deprecated_sha1)
         # RFC 8145 §5.2 bookkeeping for the Key Tag query: names signalled
         # and in flight (so one descent signals once per zone), and the
         # tasks themselves (asyncio holds weak references; an unretrieved
@@ -4928,6 +4954,7 @@ class RecursiveResolver(Resolver):
                         client_key_tags=client_key_tags,
                         aggressive_nsec=self.aggressive_nsec,
                         serve_stale=self.serve_stale,
+                        allow_deprecated_sha1=self.allow_deprecated_sha1,
                     )
                     sub_response = await self._drive(
                         sub_gen,
@@ -5196,6 +5223,7 @@ class RecursiveResolver(Resolver):
             client_key_tags=client_key_tags,
             aggressive_nsec=self.aggressive_nsec,
             serve_stale=self.serve_stale,
+            allow_deprecated_sha1=self.allow_deprecated_sha1,
         )
         response = await self._drive(
             gen, self.last_trace, client_cd=client_cd, client_key_tags=client_key_tags

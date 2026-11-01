@@ -531,6 +531,17 @@ def build_parser():
         "cached and none echoed (RFC 8020 section 2)",
     )
     p.add_argument(
+        "--allow-sha1-dnssec",
+        dest="allow_sha1_dnssec",
+        action="store_true",
+        help="re-open the signature algorithms RFC 9905 section 2 para 2 deprecated -- "
+        "RSASHA1 (5) and RSASHA1-NSEC3-SHA1 (7) -- as validators. Off by default, which is "
+        "what that paragraph's operator MUST prescribes: a zone signed only with them reads "
+        "as insecure rather than broken. The DS records those algorithms name, and any DS "
+        "using RFC 9906's retired GOST digest, stay rejected with this flag on: section 2 "
+        "para 1 admits no opt-in, and neither does RFC 9906 at all",
+    )
+    p.add_argument(
         "--compact-answers",
         dest="compact_answers",
         action="store_true",
@@ -967,6 +978,7 @@ async def cli_query(args) -> int:
             aggressive_nsec=args.aggressive_nsec,
             serve_stale=args.serve_stale,
             trust_anchors=anchors,
+            allow_deprecated_sha1=args.allow_sha1_dnssec,
             opportunistic_dot=args.dot_authority,
             query_padding=not args.no_query_padding,
         ),
@@ -1129,6 +1141,7 @@ async def serve(args) -> int:
                 aggressive_nsec=args.aggressive_nsec,
                 serve_stale=args.serve_stale,
                 trust_anchors=anchors,
+                allow_deprecated_sha1=args.allow_sha1_dnssec,
                 opportunistic_dot=args.dot_authority,
                 query_padding=not args.no_query_padding,
             ),

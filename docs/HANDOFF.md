@@ -2779,6 +2779,41 @@ the first release tag. The maintenance queue that the phantom-9535 list
 carried for a dozen rounds is, at last, empty of everything that was
 real.
 
+### Follow-up: the documents that arrived after the algorithm table — RFC 9905/9906 (increment P)
+
+The row-155 audit turned up two November-2025 INTERNET STANDARDS that sit *beside*
+RFC 9904's table rather than inside it — §4¶2 of RFC 9905 says outright the
+Implement/Use columns are "not changing" — so the capability table stayed as it was
+and an accept-side policy layer went next to it: four sets in `crypto.py`, one per
+document per record kind, because 9905 deprecates by the DS's **Algorithm** octet and
+9906 by its **Digest Type** (3, the GOST hash as RFC 5933 §4.1.2 denotes it), and confusing the
+two fields is the one way to get both documents wrong at once. The DS exclusion is
+unconditional in both documents and lands before any digest arithmetic runs; when
+deprecated records were all the trust point, the link answers the new
+`ChainOutcome.INSECURE` — the documents' own word, and a genuine fourth state: not
+contradicted (BOGUS), not unexaminable (INDETERMINATE), **void**. §2¶2's signature
+sentence is the asymmetry worth keeping in mind: *operators* MUST start from
+unsupported, *implementations* MUST keep the arithmetic, which is exactly a default
+plus a named opt-in (`allow_deprecated_sha1` → `--allow-sha1-dnssec`), and RFC 9906 —
+no continue-to-support sentence — got no opt-in. The mapping upward honours the word
+the documents chose: DEPRECATED answers route to *insecure* (served, unsigned), never
+bogus and never SERVFAIL, while merely-UNSUPPORTED keeps deferring — precedence is
+bogus > indeterminate > insecure, because a check that awaits a backend might yet pass
+where a forbidden one never will. Two vocabularies changed shape in the process, both
+on review: the boolean marker first sketched for "deprecated" became a fourth
+`SignatureOutcome` member (a conclusion belongs in the outcome enum, not beside it),
+and `_verify`/`_verify_proofs` stopped returning string dialects of `SecurityStatus`
+and return the enum itself — every `kind == "bogus"` in the module is gone. One test
+fixture error surfaced the labels discipline on the way: an apex self-signature over
+`example.net.` carries Labels=2, and the reconstruction check (correctly) refuses 3
+before the arithmetic tier, turning a would-be INDETERMINATE into BOGUS. Full suite
+1723 passed, 1 skipped. The same audit closed roadmap row 130 as a phantom-citation
+non-goal (RFC 6841 is the DNSSEC Policy/Practice framework; 0x20 case entropy was
+never standardized — `draft-vixie-dnsext-dns0x20` expired in 2013 and no published
+RFC mentions the technique). What remains on the horizon is unchanged: the release
+tag (human), DoQ (dependency decision), RFC 5011 (its own row when wanted).
+
+
 ## Previous round: MQTYPE (RFC 10029)
 
 Shipped: the wire form of both options in both directions, the server's half of using them

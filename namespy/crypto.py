@@ -40,6 +40,9 @@ from .dnssec import (
 __all__ = [
     "CRYPTO_DISTRIBUTION",
     "CRYPTO_EXTRA",
+    "DEPRECATED_DS_ALGORITHMS",
+    "DEPRECATED_DS_DIGEST_TYPES",
+    "DEPRECATED_SIGNATURE_ALGORITHMS",
     "ECDSA_ALGORITHMS",
     "ECDSA_FIELD_OCTETS",
     "EC_KEY_OCTETS",
@@ -50,6 +53,7 @@ __all__ = [
     "IMPLEMENT_FOR_VALIDATION",
     "MAX_RSA_KEY_BITS",
     "MIN_RSA_KEY_BITS",
+    "RETIRED_SIGNATURE_ALGORITHMS",
     "RSA_ALGORITHMS",
     "RSA_MIN_KEY_BITS_BY_ALGORITHM",
     "SIGNATURE_ALGORITHMS",
@@ -128,7 +132,12 @@ class ValidationRequirement(Enum):
 #: RSASHA1-NSEC3-SHA1 (7) are MUST for validation even though RFC 9905 deprecated their use
 #: for signing: a validator that refuses them cannot read the zones still signed with them,
 #: which is the whole difference between "do not use this" and "do not implement this". It
-#: is also why a backend has to do SHA-1 as well as SHA-2.
+#: is also why a backend has to do SHA-1 as well as SHA-2. RFC 9905 §4¶2 keeps this reading
+#: explicit: the document "is not changing" the Implement and Use columns -- §2¶2 goes
+#: further and makes continuing to support validation by these algorithms itself a MUST --
+#: so the table below stays a statement about capability, and the operator's default
+#: stance, which the same paragraph demands, is stated separately as the deprecation sets
+#: that follow.
 IMPLEMENT_FOR_VALIDATION: dict[int, ValidationRequirement] = {
     1: ValidationRequirement.MUST_NOT,  # RSAMD5
     3: ValidationRequirement.MUST_NOT,  # DSA
@@ -147,6 +156,49 @@ IMPLEMENT_FOR_VALIDATION: dict[int, ValidationRequirement] = {
     253: ValidationRequirement.MAY,  # PRIVATEDNS
     254: ValidationRequirement.MAY,  # PRIVATEOID
 }
+
+#: What the 9904 table above cannot express: that RFC 9905 and RFC 9906 (both
+#: INTERNET STANDARD, November 2025) split algorithm policy into two roles --
+#: what a validator must be able to *compute* and what it must *accept* by
+#: default. Both documents deprecate creation-side use, one continues the
+#: validation capability as a MUST and one retires it outright, and both
+#: exclude the algorithms' DS records outright. The four sets below are the
+#: accept-side policy; the table above remains the capability policy, and a
+#: single number can stand in both, which is the point.
+
+#: Signature algorithms RFC 9905 §2¶2 deprecated for creating DNSKEY and RRSIG
+#: records, with its operative sentence for validators: "Operators of
+#: validating resolvers MUST treat DNSSEC signing algorithms RSASHA1 and
+#: RSASHA1-NSEC3-SHA1 as unsupported, rendering responses insecure if they
+#: cannot be validated by other supported signing algorithms." The same
+#: paragraph demands implementations "MUST continue to support validation
+#: using these algorithms", so this is a stance with a named opt-in, not a
+#: deletion: unsupported by default, arithmetic retained.
+DEPRECATED_SIGNATURE_ALGORITHMS = frozenset({5, 7})
+
+#: Signature algorithm RFC 9906 §2¶2 retired: "Validating resolvers MUST treat
+#: RRSIG records created from DNSKEY records using these algorithms as
+#: unsupported algorithms" -- GOST R 34.10-2001, mnemonic ECC-GOST. Unlike RFC
+#: 9905 there is no continue-to-support sentence anywhere in the document, so
+#: this exclusion is unconditional: no operator opt-in re-opens algorithm 12.
+RETIRED_SIGNATURE_ALGORITHMS = frozenset({12})
+
+#: DS records RFC 9905 §2¶1 excludes from introducing a zone: "Operators of
+#: validating resolvers MUST treat RSASHA1 and RSASHA1-NSEC3-SHA1 DS records
+#: as insecure. If no other DS records of accepted cryptographic algorithms
+#: are available, the DNS records below the delegation point MUST be treated
+#: as insecure." The deciding field is the DS's own Algorithm octet, which
+#: copies the DNSKEY the digest covers.
+DEPRECATED_DS_ALGORITHMS = frozenset({5, 7})
+
+#: DS digest types RFC 9906 §2¶1 excludes: GOST R 34.11-94 -- Digest Type 3,
+#: the number RFC 5933 §4.1.2 assigns it ("The GOST R 34.11-94 digest algorithm
+#: is denoted in DS RRs by the digest type 3") -- and RFC 9906 §2¶1's orders:
+#: "MUST NOT be used when creating Delegation
+#: Signer (DS) records. Validating resolvers MUST treat GOST R 34.11-94 DS
+#: records as insecure." A DS's Digest Type, not its Algorithm: this is the
+#: other octet, and the two deprecations name different fields on purpose.
+DEPRECATED_DS_DIGEST_TYPES = frozenset({3})
 
 
 class SignatureAlgorithm(Enum):

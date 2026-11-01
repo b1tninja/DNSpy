@@ -369,10 +369,18 @@ class Validator:
         store: DnssecStore | None = None,
         now: float | None = None,
         rclass: int = 1,
+        allow_deprecated_sha1: bool = False,
     ) -> None:
         self.store = store if store is not None else DnssecStore()
         self.now = now
         self.rclass = int(rclass)
+        # RFC 9905 §2¶2 makes RSASHA1/RSASHA1-NSEC3-SHA1 unsupported by default
+        # (their signatures stop proving anything unless another algorithm
+        # covers the data) while making the ability to check them a MUST; this
+        # flag is the operator's opt-in that reconciles the two sentences,
+        # threaded down to namespy.verify. RFC 9906's retirement of ECC-GOST
+        # has no such opt-in and is not carried here.
+        self.allow_deprecated_sha1 = bool(allow_deprecated_sha1)
         self._anchors: dict[str, list[TrustAnchor]] = {}
         for anchor in anchors:
             self._anchors.setdefault(str(DomainName(anchor.zone)), []).append(anchor)
@@ -451,36 +459,64 @@ class Validator:
                 seen.append(tag)
         return tuple(seen)
 
-    def _verify(self, name, rtype: int, rdatas: tuple, keys, *, signer) -> tuple[str, str]:
+    def _verify(
+        self, name, rtype: int, rdatas: tuple, keys, *, signer
+    ) -> tuple[SecurityStatus, str]:
         """Check one RRset's signatures under keys already known authentic.
 
-        Returns ``("valid" | "bogus" | "indeterminate", reason)``. Missing signatures are
-        *bogus*, not merely unprovable: RFC 4033 §5 lists "missing signatures" under
-        Bogus outright, and an RRset inside a zone this validator has already
-        authenticated as secure that arrived unsigned is a contradiction, not an absence
-        -- the same reasoning that makes an unsigned DS under a secure parent a refusal
-        rather than a shrug.
+        Returns the RRset's ``(SecurityStatus, reason)`` -- the module's one
+        vocabulary for these states, so a caller can carry the first element
+        straight into a verdict instead of translating a string dialect that
+        could drift from it. Missing signatures are *bogus*, not merely
+        unprovable: RFC 4033 §5 lists "missing signatures" under Bogus outright,
+        and an RRset inside a zone this validator has already authenticated as
+        secure that arrived unsigned is a contradiction, not an absence -- the
+        same reasoning that makes an unsigned DS under a secure parent a refusal
+        rather than a shrug. INSECURE is the RFC 9905 §2¶2 / RFC 9906 §2¶2
+        answer, reserved for the case where signatures are present but only
+        algorithms the deprecation documents render unsupported cover the data:
+        those paragraphs name insecure, not bogus or indeterminate, as the state
+        such an RRset is left in.
         """
         sigs = self.store.signatures(name, rtype, signer=signer)
         if not sigs:
             return (
-                "bogus",
+                SecurityStatus.BOGUS,
                 f"the {DnsRType(rtype).name} RRset at {name} carries no signature from "
                 f"{signer}, and RFC 4033 §5 counts missing signatures as bogus material",
             )
         bogus_reason: str | None = None
         indet_reason: str | None = None
+        deprecated_reason: str | None = None
         for sig in sigs:
-            verdict = verify_rrsig(sig, name, rdatas, keys, now=self.now, rclass=self.rclass)
+            verdict = verify_rrsig(
+                sig,
+                name,
+                rdatas,
+                keys,
+                now=self.now,
+                rclass=self.rclass,
+                allow_deprecated_sha1=self.allow_deprecated_sha1,
+            )
             if verdict.verified:
-                return ("valid", f"signed by key tag {verdict.key_tag}")
+                return (SecurityStatus.SECURE, f"signed by key tag {verdict.key_tag}")
             if verdict.outcome is SignatureOutcome.INVALID:
                 bogus_reason = verdict.reason
             elif verdict.outcome is SignatureOutcome.UNSUPPORTED:
                 indet_reason = verdict.reason
+            elif verdict.outcome is SignatureOutcome.DEPRECATED:
+                deprecated_reason = verdict.reason
         if bogus_reason is not None:
-            return ("bogus", bogus_reason)
-        return ("indeterminate", indet_reason or "no candidate signature could be attempted")
+            return (SecurityStatus.BOGUS, bogus_reason)
+        if indet_reason is not None:
+            # "could not check" outranks "forbidden to believe": the one
+            # signature a missing backend stopped might verify where a
+            # deprecated one never will, so the deferred question stays the live
+            # one until nothing deferrable remains.
+            return (SecurityStatus.INDETERMINATE, indet_reason)
+        if deprecated_reason is not None:
+            return (SecurityStatus.INSECURE, deprecated_reason)
+        return (SecurityStatus.INDETERMINATE, "no candidate signature could be attempted")
 
     def authenticate_zone(self, zone) -> ZoneVerdict:
         """Walk from *zone*'s apex up to a trust point, per RFC 4035 §5.2 and RFC 4033 §2.
@@ -516,6 +552,8 @@ class Validator:
             status = (
                 SecurityStatus.BOGUS
                 if cv.outcome is ChainOutcome.BOGUS
+                else SecurityStatus.INSECURE
+                if cv.outcome is ChainOutcome.INSECURE
                 else SecurityStatus.INDETERMINATE
             )
             return ZoneVerdict(status, cv.reason, zone=default_zone)
@@ -563,16 +601,14 @@ class Validator:
                 kind, reason = self._verify(
                     zone, int(DnsRType.DS), ds_set, above.keys, signer=parent
                 )
-                if kind != "valid":
-                    results.append(
-                        ZoneVerdict(
-                            SecurityStatus.BOGUS
-                            if kind == "bogus"
-                            else SecurityStatus.INDETERMINATE,
-                            f"the DS RRset at the parent {parent} does not authenticate: {reason}",
-                            zone=parent,
-                        )
+                if kind is not SecurityStatus.SECURE:
+                    lead = (
+                        f"the DS RRset at the parent {parent} is introduced only by "
+                        f"algorithms which the deprecation documents render unsupported"
+                        if kind is SecurityStatus.INSECURE
+                        else f"the DS RRset at the parent {parent} does not authenticate"
                     )
+                    results.append(ZoneVerdict(kind, f"{lead}: {reason}", zone=parent))
                 elif not records:
                     results.append(
                         ZoneVerdict(
@@ -621,16 +657,19 @@ class Validator:
 
     # ------------------------------------------------------------------ denial machinery
 
-    def _verify_proofs(self, zone, records, keys) -> tuple[str, str]:
+    def _verify_proofs(self, zone, records, keys) -> tuple[SecurityStatus, str]:
         """Verify every proof record's RRset under *zone*'s authentic keys.
 
         All of them, not just the ones the geometry predicate happened to consult: RFC
         4033 §5's Secure definition is "able to verify **all** the signatures in the
         response", and a bundle with one forged NSEC alongside the right one is a bundle
-        to refuse, not one to cherry-pick.
+        to refuse, not one to cherry-pick. The verdict is a SecurityStatus, and its
+        aggregation has a precedence: bogus poisons the bundle outright, indeterminate
+        outranks insecure (a deferred check might still pass where a deprecated one
+        never will), and anything left standing decides -- else the bundle is secure.
         """
         seen: set[tuple] = set()
-        worst: tuple[str, str] | None = None
+        worst: tuple[SecurityStatus, str] | None = None
         for record in records:
             key = (name_order_key(DomainName(record.name)), int(record.rtype))
             if key in seen:
@@ -638,11 +677,14 @@ class Validator:
             seen.add(key)
             rdatas = self.store.rdatas(record.name, int(record.rtype), origin=zone)
             kind, reason = self._verify(record.name, int(record.rtype), rdatas, keys, signer=zone)
-            if kind == "bogus":
-                return ("bogus", reason)
-            if kind == "indeterminate" and worst is None:
+            if kind is SecurityStatus.BOGUS:
+                return (SecurityStatus.BOGUS, reason)
+            if (
+                kind is SecurityStatus.INDETERMINATE
+                and (worst is None or worst[0] is SecurityStatus.INSECURE)
+            ) or (kind is SecurityStatus.INSECURE and worst is None):
                 worst = (kind, reason)
-        return worst or ("valid", "every proof record verifies")
+        return worst or (SecurityStatus.SECURE, "every proof record verifies")
 
     def _prove_no_ds(self, zone, parent, above: ZoneVerdict) -> ZoneVerdict:
         """Ask the parent to prove the delegation is unsigned (RFC 4035 §5.2¶7).
@@ -674,13 +716,25 @@ class Validator:
         except ContradictoryProofError as exc:
             return ZoneVerdict(SecurityStatus.BOGUS, str(exc), zone=parent)
         kind, reason = self._verify_proofs(parent, records, above.keys)
-        if kind == "bogus":
+        if kind is SecurityStatus.BOGUS:
             return ZoneVerdict(
                 SecurityStatus.BOGUS,
                 f"the no-DS proof from {parent} fails to verify: {reason}",
                 zone=parent,
             )
-        if kind == "indeterminate":
+        if kind is SecurityStatus.INSECURE:
+            # The parent does assert the denial, but signs it only with
+            # algorithms RFC 9905 §2¶2 / RFC 9906 §2¶2 render unsupported, and
+            # §2¶2 names the successor state insecure outright -- so {zone}
+            # below this cut is unsigned by the documents' decree, the same
+            # answer a verified no-DS proof would have reached, minus the proof.
+            return ZoneVerdict(
+                SecurityStatus.INSECURE,
+                f"the no-DS proof from {parent} rests only on algorithms the "
+                f"deprecation documents render unsupported: {reason}",
+                zone=zone,
+            )
+        if kind is SecurityStatus.INDETERMINATE:
             return ZoneVerdict(
                 SecurityStatus.INDETERMINATE,
                 f"the no-DS proof from {parent} could not be verified: {reason}",
@@ -772,6 +826,7 @@ class Validator:
         results: list[ValidationVerdict] = []
         bogus_reason: str | None = None
         indet_reason: str | None = None
+        deprecated_reason: str | None = None
         for sig in signer_sigs:
             verdict = verify_rrsig(sig, name, rrset, zv.keys, now=self.now, rclass=self.rclass)
             if verdict.verified:
@@ -792,6 +847,8 @@ class Validator:
                 bogus_reason = verdict.reason
             elif verdict.outcome is SignatureOutcome.UNSUPPORTED:
                 indet_reason = verdict.reason
+            elif verdict.outcome is SignatureOutcome.DEPRECATED:
+                deprecated_reason = verdict.reason
         if bogus_reason is not None:
             return [
                 ValidationVerdict(
@@ -807,6 +864,19 @@ class Validator:
                     SecurityStatus.INDETERMINATE,
                     f"the signature over {name}/{DnsRType(rtype).name} could not be "
                     f"checked: {indet_reason}",
+                    zone=DomainName(signer),
+                )
+            ]
+        if deprecated_reason is not None:
+            # RFC 9905 §2¶2, and RFC 9906 §2¶2 in the same words: signatures by
+            # deprecated algorithms do not leave the answer unjudgeable, they
+            # leave it insecure -- served, unsigned, and not stamped AD.
+            return [
+                ValidationVerdict(
+                    SecurityStatus.INSECURE,
+                    f"the only signatures over {name}/{DnsRType(rtype).name} were made "
+                    f"by algorithms the deprecation documents render unsupported: "
+                    f"{deprecated_reason}",
                     zone=DomainName(signer),
                 )
             ]
@@ -843,9 +913,16 @@ class Validator:
         except ContradictoryProofError as exc:
             return ValidationVerdict(SecurityStatus.BOGUS, str(exc), zone=DomainName(signer))
         kind, reason = self._verify_proofs(signer, records, zv.keys)
-        if kind == "bogus":
+        if kind is SecurityStatus.BOGUS:
             return ValidationVerdict(SecurityStatus.BOGUS, reason, zone=DomainName(signer))
-        if kind == "indeterminate":
+        if kind is SecurityStatus.INSECURE:
+            return ValidationVerdict(
+                SecurityStatus.INSECURE,
+                f"the closer-match proof for {qname} rests only on algorithms the "
+                f"deprecation documents render unsupported: {reason}",
+                zone=DomainName(signer),
+            )
+        if kind is SecurityStatus.INDETERMINATE:
             return ValidationVerdict(
                 SecurityStatus.INDETERMINATE,
                 f"the closer-match proof for {qname} could not be verified: {reason}",
@@ -946,16 +1023,29 @@ class Validator:
         except ContradictoryProofError as exc:
             return ValidationVerdict(SecurityStatus.BOGUS, str(exc), zone=zone)
         kind, reason = self._verify_proofs(zone, records, zv.keys)
-        if kind == "bogus":
+        if kind is SecurityStatus.BOGUS:
             return ValidationVerdict(
                 SecurityStatus.BOGUS,
                 f"the proof of denial from {zone} fails to verify: {reason}",
                 zone=zone,
             )
-        if kind == "indeterminate":
+        if kind is SecurityStatus.INDETERMINATE:
             return ValidationVerdict(
                 SecurityStatus.INDETERMINATE,
                 f"the proof of denial from {zone} could not be verified: {reason}",
+                zone=zone,
+            )
+        if kind is SecurityStatus.INSECURE:
+            # The geometry holds and the signatures exist -- they simply name
+            # algorithms RFC 9905 §2¶2 / RFC 9906 §2¶2 forbid believing, whose
+            # named successor state is insecure. The denial cannot be stamped
+            # secure, and per §2¶2 it is not merely unjudgeable either: the zone
+            # below reads as unsigned, which for a denial and an insecure
+            # answer are the same operational outcome.
+            return ValidationVerdict(
+                SecurityStatus.INSECURE,
+                f"the proof of denial from {zone} rests only on algorithms the "
+                f"deprecation documents render unsupported: {reason}",
                 zone=zone,
             )
         if via_compact:

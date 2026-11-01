@@ -3,12 +3,13 @@
 The vectors are the same published ones `test_dnssec_ecc.py` pins -- RFC 6605 §6 and RFC
 8080 §6 as corrected by erratum 4935 -- run here through the whole procedure rather than
 through the encodings alone, which turns "the octets mean what the RFC says" into "the
-RRset authenticates". The three-way outcome is the load-bearing part, so most of the
+RRset authenticates". The outcome taxonomy is the load-bearing part, so most of the
 tests below are about its edges: a MUST NOT algorithm must come back INVALID even in an
 install that cannot do arithmetic at all (the policy check runs before the backend probe,
 which is what makes that testable without one), while an unreadable key must come back
 UNSUPPORTED rather than INVALID, because "we could not check" and "it is forged" lead a
-resolver down different roads.
+resolver down different roads. The fourth outcome, DEPRECATED -- RFC 9905's and RFC
+9906's algorithms -- is pinned in its own file, test_dnssec_deprecation.py.
 
 The RSA leg has no published vector to pin -- RFC 3110 and RFC 5702 print keys but no
 RRSIG -- so it is pinned by deterministic PKCS#1 v1.5 round-trips instead, and the
@@ -155,13 +156,15 @@ def test_must_not_algorithms_are_invalid_not_unsupported(algorithm: int):
     assert "RFC 9904 Table 2" in verdict.reason
 
 
-@pytest.mark.parametrize(("algorithm", "status"), [(12, "MAY"), (99, "UNKNOWN")])
+@pytest.mark.parametrize(("algorithm", "status"), [(99, "UNKNOWN")])
 def test_algorithms_this_package_cannot_attempt_are_unsupported(algorithm: int, status: str):
-    """GOST is registered at MAY and unregistered numbers carry no pairing at all.
+    """Unregistered numbers carry no pairing at all.
 
-    Neither is bogus material -- they are checks that cannot run, RFC 4035 §4.3¶5's
+    Not bogus material either -- a check that cannot run, RFC 4035 §4.3¶5's
     Indeterminate -- and the reason quotes the RFC 9904 status so the operator learns
-    which of the two situations they are in.
+    which of the two situations they are in. ECC-GOST (12) stood here until RFC 9906
+    §2¶2 retired it from DNSSEC: that number now answers DEPRECATED, a settled state
+    rather than a deferrable one, and test_dnssec_deprecation.py pins the change.
     """
     key = _dnskey(algorithm, b"\x01" * 32)
     rrsig = _rrsig(
@@ -389,10 +392,13 @@ def _rsa_rrsig(private, algorithm: int, hash_name: str, key: RData_DNSKEY):
 def test_rsa_round_trips_through_the_procedure(algorithm: int, hash_name: str, spec: str):
     """No RFC prints an RSA RRSIG, so these round-trips stand in -- and one is RSASHA1.
 
-    Algorithm 5 earns its place deliberately: RFC 9905 deprecates it *for signing*, but
-    RFC 9904 Table 2 keeps it a MUST *for validation*, precisely because zones signed
-    with it are still out there -- a validator that refused to check one would report a
-    real answer as bogus, which is the failure the two-column split exists to prevent.
+    Algorithm 5 earns its place deliberately: RFC 9905 §2¶2 deprecated it *for signing*
+    and made operators treat it as unsupported, but the same paragraph makes
+    "implementations MUST continue to support validation using these algorithms" --
+    this round-trip, behind the named opt-in, is that MUST's test. RFC 9904 Table 2
+    still lists it MUST for validation precisely because zones signed with it are out
+    there, and a validator that lost the arithmetic would report a real answer as
+    unjudgeable, which is the failure the two-role split exists to prevent.
     """
     _needs_backend()
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -406,6 +412,7 @@ def test_rsa_round_trips_through_the_procedure(algorithm: int, hash_name: str, s
         _a_rrset(),
         [key],
         now=EDDSA_NOW,
+        allow_deprecated_sha1=True,
     )
     assert verdict.verified
     assert spec in verdict.reason

@@ -8,6 +8,42 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **RFC 9905 and RFC 9906 landed — the algorithms DNSSEC deprecated after
+  the table was set, and the state they name.** RFC 9904 says what a
+  validator must be able to *compute*; these two November-2025 standards say
+  what it may still *believe*, and the distinction is now two policy layers,
+  not one. §2¶1 of each is unconditional: a DS record whose Algorithm is
+  RSASHA1/RSASHA1-NSEC3-SHA1 (9905), or whose Digest Type is the GOST hash
+  (9906), introduces nothing — `authenticate_dnskey_rrset` drops it before
+  the digest loop, and when such records were all the trust point offered,
+  the link answers a new fourth state, `ChainOutcome.INSECURE`: void rather
+  than contradicted, mapping to the zone being unsigned *by decree* rather
+  than by proof. §2¶2 is where RFC 9905 speaks in two voices — operators
+  MUST treat SHA-1 signatures as unsupported, implementations MUST keep the
+  validation — and the pair resolves as a stance with a named opt-in
+  (`allow_deprecated_sha1`, `--allow-sha1-dnssec`), not a deletion;
+  RFC 9906's retirement of ECC-GOST carries no continue-to-support clause
+  and gets no opt-in at all. The signature answer is a fourth
+  `SignatureOutcome`, DEPRECATED, deliberately distinct from 9904's
+  deferrable UNSUPPORTED — *nothing will change on a retry* — and it maps
+  upward to the state §2¶2 names outright: **insecure**, served unsigned,
+  never bogus and never broken; a chain or proof mixing merely-unsupported
+  signatures with deprecated ones still defers, because the deferred check
+  might yet pass where the forbidden one never will. The capability table
+  (`crypto.IMPLEMENT_FOR_VALIDATION`) is untouched, as RFC 9905 §4¶2 says
+  outright it must be. Pinned by `tests/test_dnssec_deprecation.py`
+  (policy sets, all four gates, the opt-in's two outcomes told apart, mixed
+  DS sets, and both plumbing doors), while the RSASHA1 round-trip in
+  `test_dnssec_verify.py` — now behind the opt-in — is that
+  continue-to-support MUST's own test. Along the way `_verify` and
+  `_verify_proofs` stopped returning string dialects of the verdict enum
+  and return `SecurityStatus` itself, so the RRset layer, the chain, the
+  walk, and the documents now speak one vocabulary end to end. The audit
+  that found this row's neighbours also found roadmap row 130's citation
+  was a phantom — RFC 6841 is the DNSSEC Policy/Practice framework, and
+  0x20 case entropy lives only in an expired draft no RFC ever mentioned;
+  the row is closed as a documented non-goal.
+
 - **RFC 8145 §5's Key Tag query now rides every anchor-zone DNSKEY fetch —
   the document's actual subject, finished.** §4's edns-key-tag option
   shipped with the validation walk long ago (both lists of §4.2.2.1 as

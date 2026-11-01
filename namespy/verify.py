@@ -25,7 +25,7 @@ that contains the RRset) are equalities across RR headers this codec layer canno
 the RDATA holds no owner or class -- so they belong to the caller, the same way the
 entry-pair discipline hands `namespy.nsec` its owners.
 
-Three outcomes, not two, because the resolver's next step differs between them:
+Four outcomes, not two, because the resolver's next step differs between them:
 
 * **VALID** -- the arithmetic ran and accepted.
 * **INVALID** -- the RRset does not authenticate: the signtime window is shut, the type
@@ -36,12 +36,21 @@ Three outcomes, not two, because the resolver's next step differs between them:
   backend cannot build a key from. RFC 4035 §4.3 named that state Indeterminate for
   exactly this reason -- "we could not check" must not be laundered into "it is forged",
   because the difference is whether the resolver drops the answer or keeps walking.
+* **DEPRECATED** -- the signature is not disbelieved on arithmetic grounds but by
+  policy: RFC 9905 §2¶2 (RSASHA1, RSASHA1-NSEC3-SHA1) and RFC 9906 §2¶2 (ECC-GOST)
+  render these algorithms unsupported, and name *insecure* -- not bogus, not
+  indeterminate -- as the state of everything only they cover. RFC 9905's deprecation
+  carries the documents' own asymmetry: operators MUST start from unsupported, while
+  implementations MUST keep the validation, so the stance is an opt-in
+  (``allow_deprecated_sha1``) rather than a deletion. RFC 9906's is unconditional.
 
 The MUST NOT algorithms of RFC 9904 Table 2 (RSAMD5, DSA) land on INVALID rather than
-UNSUPPORTED: §1.2¶3 says the point of the marking is "so that recursive resolvers can
-remove support for validating it" -- a validator is entitled to conclude nothing more, and
-a signature nobody may validate authenticates nothing, however well the bytes would have
-verified.
+UNSUPPORTED or DEPRECATED: §1.2¶3 says the point of the marking is "so that recursive
+resolvers can remove support for validating it" -- a validator is entitled to conclude
+nothing more, and a signature nobody may validate authenticates nothing, however well
+the bytes would have verified. The 9905/9906 pair lands on DEPRECATED instead because
+those documents, written two decades later, prescribe their own successor state rather
+than leaving the validator to infer one.
 """
 
 from __future__ import annotations
@@ -52,6 +61,10 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from .crypto import (
+    DEPRECATED_DS_ALGORITHMS,
+    DEPRECATED_DS_DIGEST_TYPES,
+    DEPRECATED_SIGNATURE_ALGORITHMS,
+    RETIRED_SIGNATURE_ALGORITHMS,
     SIGNATURE_ALGORITHMS,
     SignatureMaterialError,
     ValidationRequirement,
@@ -82,11 +95,20 @@ __all__ = [
 
 
 class SignatureOutcome(Enum):
-    """The three answers §5.3.1 can leave a validator with, read through RFC 4035 §4.3."""
+    """The answers §5.3.1 can leave a validator with, read through RFC 4035 §4.3.
+
+    Four now, not the three §5.3.1 itself distinguishes: RFC 9905 §2¶2 and RFC 9906
+    §2¶2 named a fourth -- an algorithm the documents themselves forbid believing,
+    which must stay distinct from UNSUPPORTED because the two answer different
+    questions. UNSUPPORTED is "we could not check" -- a backend might arrive, the
+    walk can defer -- and DEPRECATED is "nothing will change on a retry", whose
+    named successor state is insecure rather than Indeterminate.
+    """
 
     VALID = "valid"
     INVALID = "invalid"
     UNSUPPORTED = "unsupported"
+    DEPRECATED = "deprecated"
 
 
 @dataclass(frozen=True)
@@ -120,6 +142,7 @@ def verify_rrsig(
     *,
     now: float | None = None,
     rclass: int = 1,
+    allow_deprecated_sha1: bool = False,
 ) -> SignatureVerdict:
     """Run §5.3.1's conditions over one RRset, then the arithmetic over every matching key.
 
@@ -146,6 +169,23 @@ def verify_rrsig(
             f"algorithm {algorithm} is MUST NOT for validation in RFC 9904 Table 2; a "
             f"signature made with it authenticates nothing, because §1.2¶3 marks it so "
             f"precisely that resolvers stop validating it",
+            algorithm=algorithm,
+        )
+    if algorithm in RETIRED_SIGNATURE_ALGORITHMS:
+        return SignatureVerdict(
+            SignatureOutcome.DEPRECATED,
+            f"algorithm {algorithm} is retired for DNSSEC by RFC 9906 §2¶2, which makes "
+            f"treating its RRSIG records as unsupported a MUST with no continue-to-support "
+            f"clause behind it, unlike RFC 9905's deprecations",
+            algorithm=algorithm,
+        )
+    if algorithm in DEPRECATED_SIGNATURE_ALGORITHMS and not allow_deprecated_sha1:
+        return SignatureVerdict(
+            SignatureOutcome.DEPRECATED,
+            f"algorithm {algorithm} is deprecated for signing by RFC 9905 §2¶2: operators "
+            f"MUST treat it as unsupported, rendering responses insecure when no other "
+            f"supported algorithm validates them. The capability is kept, as the same "
+            f"paragraph requires; allow_deprecated_sha1=True re-opens it",
             algorithm=algorithm,
         )
     if algorithm not in SIGNATURE_ALGORITHMS:
@@ -269,12 +309,16 @@ class ChainOutcome(Enum):
     SECURE: the anchor's key signed the apex RRset. BOGUS: the link exists and is wrong
     -- no key matches the trusted digest, or the matching key's signature does not
     verify. INDETERMINATE: the link could not be examined (RFC 4035 §4.3¶5's state), which
-    a validator must not report as either of the others.
+    a validator must not report as either of the others. INSECURE: RFC 9905 §2¶1 and
+    RFC 9906 §2¶1 added a fourth ending -- the DS records that introduce this zone name
+    deprecated algorithms and MUST themselves be treated as insecure, so the link is
+    not contradicted, merely void: the zone below is unsigned by decree, not by proof.
     """
 
     SECURE = "secure"
     BOGUS = "bogus"
     INDETERMINATE = "indeterminate"
+    INSECURE = "insecure"
 
 
 @dataclass(frozen=True)
@@ -300,6 +344,7 @@ def authenticate_dnskey_rrset(
     now: float | None = None,
     rclass: int = 1,
     trusted_dnskeys: Iterable[RData_DNSKEY] = (),
+    allow_deprecated_sha1: bool = False,
 ) -> ChainVerdict:
     """Answer RFC 4035 §5.2¶2 for one zone: does a trusted DS introduce these keys?
 
@@ -343,10 +388,23 @@ def authenticate_dnskey_rrset(
     pairs: list[RData_DNSKEY] = []
     incomparable = 0
     disqualified = False
+    deprecated = 0
     for key in records:
         if any(bytes(key) == bytes(anchor) for anchor in direct_keys):
             pairs.append(key)
     for ds in trust_points:
+        if (
+            int(ds.algorithm) in DEPRECATED_DS_ALGORITHMS
+            or int(ds.digest_type) in DEPRECATED_DS_DIGEST_TYPES
+        ):
+            # RFC 9905 §2¶1 ("Operators of validating resolvers MUST treat
+            # RSASHA1 and RSASHA1-NSEC3-SHA1 DS records as insecure") and
+            # RFC 9906 §2¶1 for the GOST digest: these DS records introduce
+            # nothing. They are dropped as if the parent had never published
+            # them -- and if they were the only trust point, what remains is
+            # not a broken link but a void one, decided below.
+            deprecated += 1
+            continue
         if known_digest_octets(int(ds.digest_type)) is None:
             incomparable += 1
             continue
@@ -363,6 +421,13 @@ def authenticate_dnskey_rrset(
                 continue
             pairs.append(key)
     if not pairs:
+        if deprecated and deprecated == len(trust_points) and not direct_keys:
+            return ChainVerdict(
+                ChainOutcome.INSECURE,
+                "every trusted DS is one RFC 9905 §2¶1 or RFC 9906 §2¶1 requires be "
+                'treated as insecure, and no other trust point was offered: "the DNS '
+                'records below the delegation point MUST be treated as insecure"',
+            )
         if incomparable and incomparable == len(trust_points):
             return ChainVerdict(
                 ChainOutcome.INDETERMINATE,
@@ -393,6 +458,7 @@ def authenticate_dnskey_rrset(
     dnskey_type = int(DnsRType.DNSKEY)
     attempts = 0
     blocked: str | None = None
+    deprecated_sig: str | None = None
     for key in pairs:
         for rrsig in signatures:
             if int(rrsig.type_covered) != dnskey_type:
@@ -404,7 +470,15 @@ def authenticate_dnskey_rrset(
                 # "signed the child zone's apex DNSKEY RRset"; tags are 16 bits wide and
                 # collisions exist, so the signer's name decides, not the tag.
                 continue
-            verdict = verify_rrsig(rrsig, zone, records, records, now=now, rclass=rclass)
+            verdict = verify_rrsig(
+                rrsig,
+                zone,
+                records,
+                records,
+                now=now,
+                rclass=rclass,
+                allow_deprecated_sha1=allow_deprecated_sha1,
+            )
             attempts += verdict.attempts
             if verdict.verified:
                 return ChainVerdict(
@@ -416,12 +490,25 @@ def authenticate_dnskey_rrset(
                 )
             if verdict.outcome is SignatureOutcome.UNSUPPORTED:
                 blocked = verdict.reason
+            elif verdict.outcome is SignatureOutcome.DEPRECATED:
+                deprecated_sig = verdict.reason
     if blocked is not None and not attempts:
         # Nothing could be examined: no arithmetic ran, which is the one state a
         # validator must not upgrade to "forged" -- or downgrade to silence.
         return ChainVerdict(
             ChainOutcome.INDETERMINATE,
             f"the candidate signatures could not be examined: {blocked}",
+            matched_key_tag=pairs[0].key_tag,
+        )
+    if deprecated_sig is not None and not attempts:
+        # Every candidate that named a DS- or anchor-matched key was an algorithm
+        # the documents themselves forbid believing. That is not the indeterminate
+        # state above -- nothing will change on a retry -- and RFC 9905 §2¶2 names
+        # the successor state outright: "rendering responses insecure".
+        return ChainVerdict(
+            ChainOutcome.INSECURE,
+            f"the only signatures over the apex DNSKEY RRset carry an algorithm the "
+            f"deprecation documents render unsupported -- {deprecated_sig}",
             matched_key_tag=pairs[0].key_tag,
         )
     return ChainVerdict(
