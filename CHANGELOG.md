@@ -8,6 +8,27 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **The referral shape answers to RFC 9471 §3 now, in tests.** The server's
+  truncation mechanism (increment J's `_fit_datagram`) had only ever been
+  measured against fat *answers*; a referral carries its payload in the other
+  two sections — the NS set in AUTHORITY, the glue in ADDITIONAL — and
+  §3.1¶1's rule ("MUST include all available glue records for in-domain name
+  servers in the additional section or MUST set TC=1 if constrained by
+  message size") reads through that shape. Four tests do the reading: glue
+  whole and silent when it fits; glued-trimmed-and-`TC` when six nameservers
+  clear the advertised 512 (§3.3's update to RFC 1034 step 4c), the NS set
+  standing through every drop because a client can sub-resolve an address but
+  cannot invent a nameserver; the same rule at the legacy 512 with no OPT to
+  protect; and a 128-octet advertisement (§6.2.3¶2's floor at 512) buying the
+  full referral, TC reserved for real constraint. §3.1¶2's client half — the
+  TCP retry a TC promises — was already pinned in `test_resolver_truncation.py`;
+  §3.2's sibling-domain preference is declined with the reason in the roadmap
+  row (no zone, no bailiwick, and J's TC-on-any-drop is stricter than the
+  unobligated MAY). No production line changed: the increment's honest output
+  is the proof that was missing, and roadmap row 181 ⬜→✅.
+
+### Added earlier this round
+
 - **Padding has a policy now: RFC 8467 §4.1 Block-Length Padding on every
   encrypted leg.** The option carried a codec and a server-side refusal for
   two rounds; it now leaves the box. Queries over the stub's `dot` and `doh`
@@ -34,8 +55,6 @@ nothing has been tagged or published yet, so `master` is the only version.
   `tests/test_padding_policy.py`, 12 tests, including the live-TLS stub leg
   (padding arrives, after keepalive, last) and the race's untouched cleartext
   twin.
-
-### Added earlier this round
 
 - **Both families stay in play, and no answer leaves as a fragment: RFC 10001
   §4.2 (BCP 91).** The document is young — published 2026-08, obsoleting

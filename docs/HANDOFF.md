@@ -2512,11 +2512,62 @@ sentence rewritten; `opportunistic.py`'s not-yet-exercised list lost its
 padding item and its 8145 tail.
 
 **Next, in order**: (1) RFC 9471 §3 server-side glue completeness
-(row 181 ⬜, small); (2) 8509/9535 anchor maintenance (row 157 🟡);
+(row 181 ⬜, small) -- closed the same day by increment L below; (2) 8509/9535
+anchor maintenance (row 157 🟡);
 (3) DoQ (9250) deferred as ever -- and it inherits this increment: its
 §5.4 padding guidance rides the same `query_padding` decision whenever
 the transport lands; (4) the authority-leg DoH answer, same small
 remainder as before.
+
+### Follow-up: the referral the tests never sent — RFC 9471 §3 (increment L)
+
+Row 181 had sat ⬜ since the server rows were written, and the honest
+opening move was to read the document (four tight pages, no errata) and
+the code (increment J's `_fit_datagram`) before writing anything. Both
+were already right: J truncates from the end of the datagram, which eats
+ADDITIONAL -- the glue -- before AUTHORITY -- the NS set -- and raises TC
+on any drop, which is precisely §3.1¶1's "MUST include all available
+glue records... or MUST set TC=1 if constrained by message size" and
+§3.3's update to RFC 1034 step 4c. What no test had ever done is *send a
+referral*: every truncation test since J truncated a fat answer, and a
+referral's payload lives in the two sections those tests exercised last
+or not at all. So increment L is proofs, not production: four tests in
+`tests/test_referral_glue.py` drive hand-built referral shapes (NS set +
+A/AAAA glue per §2.1's example) through the real responder.
+
+What the tests pin: glue whole and the header silent when it fits;
+TC=1 and twelve glue records trimmed-from-the-tail while all six NS
+records stand when the client advertises 512 and the zone was fatter; the
+legacy no-OPT client under the same rule at 1035 §4.2.1's 512 (with
+6891 §7¶2 still refusing to invent an OPT); and a 128-octet advertisement
+measured as 512 (§6.2.3¶2) buying the referral untrimmed -- TC reserved
+for real constraint. The first run taught one thing worth recording:
+three nameservers with dual-stack glue *fits* 512 once the codec applies
+§4.1.4 name compression -- the fixture is better behaved than the
+truncation test assumed -- so the size cases went to six servers, which
+overflow with room to spare.
+
+Cleared rather than coded, with the reasons in the roadmap row and the
+CHANGELOG: §3.1¶2's client half ("most iterative clients... retry over
+TCP upon receiving a response with the TC flag set") is the walker's
+long-shipped RFC 7766 behavior, already pinned in
+`test_resolver_truncation.py`; §3.2's sibling-domain preference -- drop
+sibling glue before in-domain glue -- is an authority's arithmetic, and
+this fixture serves no zone, so it has no bailiwick to classify records
+by; J's blanket TC on any drop is in fact *stricter* than §3.2's
+unobligated MAY. The genuinely-authoritative reading of the row ("grow a
+zone-serving mode and include all available glue at composition") is the
+feature line 182's cell already declines: "it is a test fixture, not a
+service". Row 181 ⬜→✅.
+
+**Verified**: 1682 passed, 1 skipped (+4). `ruff`/`format`/`mypy` clean,
+coverage 91.4%. Roadmap row 181 ⬜→✅; CHANGELOG carries the increment.
+
+**Next, in order**: (1) 8509/9535 anchor maintenance (row 157 🟡 --
+acquisition shipped, refresh-on-schedule and rollover handling did not);
+(2) DoQ (9250) deferred as ever, its §5.4 padding riding the
+`query_padding` decision whenever the transport lands; (3) the
+authority-leg DoH answer, same small remainder as before.
 
 ## Previous round: MQTYPE (RFC 10029)
 
