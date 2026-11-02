@@ -157,6 +157,9 @@ result = lookup("example.com", "A")  # blocking; walks the tree, or forward with
 for record in result.records:
     print(record.name, record.ttl, record.rdata)
 print(result.line)  # e.g. "walk validated", "walk cache unsigned", "forward stale"
+
+result = lookup("db.internal", "A", hosts="/etc/hosts")  # consults hosts before DNS
+print(result.line)  # "hosts line 12 of /etc/hosts unsigned" -- an override that says so
 ```
 
 It runs on `namespy.engine`'s thread, so it is legal even from inside a loop you

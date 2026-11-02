@@ -41,6 +41,7 @@ from ..names import DomainName
 from ..packet import DnsQuestion, Query
 from ..resolver import RecursiveResolver
 from ..stub import StubResolver, Upstream
+from .hosts import HostsFile
 
 #: The blocking budget for a one-shot lookup. Generous because the walk can
 #: descend many levels, and a one-shot caller has no loop of their own to
@@ -62,7 +63,8 @@ class Provenance:
     """
 
     #: ``"walk"`` when the iterative descent answered, ``"forward"`` when a
-    #: configured recursive server did (``via`` chose which).
+    #: configured recursive server did (``via`` chose which), or ``"hosts"`` when a
+    #: hosts file did (``hosts`` chose that, before either was reached).
     source: str
     #: The answer required no query on the wire: it was served from the resolver's
     #: cache, or from the RFC 6761 special-use registry consulted before the walk.
@@ -78,6 +80,10 @@ class Provenance:
     #: The answer rode RFC 8767 serve-stale: it is a cached RRset past its TTL,
     #: served because a refresh failed. EDE code 3 names it on the wire.
     stale: bool = False
+    #: A short "says so" clause: the hosts :attr:`~namespy.apps.hosts.HostsMatch.citation`
+    #: (``line 42 of /etc/hosts``) for a hosts answer, empty otherwise.
+    #: :attr:`line` folds it in so an answer never quietly impersonates a network reply.
+    note: str = ""
 
     @classmethod
     def from_answer(cls, response: Any, trace: Any, source: str) -> Provenance:
@@ -101,8 +107,10 @@ class Provenance:
 
     @property
     def line(self) -> str:
-        """The one-line rendering: mechanism, [cache], validated-or-not, [stale]."""
+        """The one-line rendering: mechanism, [note], [cache], validated-or-not, [stale]."""
         parts = [self.source]
+        if self.note:
+            parts.append(self.note)
         if self.cached:
             parts.append("cache")
         parts.append("validated" if self.validated else "unsigned")
@@ -251,6 +259,7 @@ def lookup(
     qtype: Any = "A",
     *,
     via: Any = None,
+    hosts: Any = None,
     qclass: Any = "IN",
     timeout: float | None = DEFAULT_TIMEOUT_S,
     engine: _engine.Engine | None = None,
@@ -261,9 +270,13 @@ def lookup(
     ``via`` picks the mechanism (``None`` walks the tree, an address or list of
     them forwards to recursive servers); ``qtype``/``qclass`` are the ordinary
     mnemonic-or-number pair (:func:`resolve_qtype` accepts an unregistered numeric
-    type). Any remaining keyword is handed to the resolver class chosen --
-    ``dnssec_ok=True``, ``trust_anchors=(...)``, ``serve_stale=...`` for the walk,
-    ``dnssec_ok=...``/``query_timeout=...`` for the stub.
+    type). ``hosts`` -- a :class:`~namespy.apps.hosts.HostsFile` or a path to one --
+    is consulted *before* the walk or the forward, and an IN-class name it maps is
+    answered there, with a provenance line that names the source line; a name it does
+    not know falls through to DNS untouched. Any remaining keyword is handed to the
+    resolver class chosen -- ``dnssec_ok=True``, ``trust_anchors=(...)``,
+    ``serve_stale=...`` for the walk, ``dnssec_ok=...``/``query_timeout=...`` for the
+    stub.
 
     It blocks on the shared default :class:`~namespy.engine.Engine` unless an
     *engine* is passed to isolate this call's thread. Because the work crosses
@@ -272,6 +285,23 @@ def lookup(
     fixed by construction, inherited for free here.
     """
     question = make_question(name, qtype, qclass)
+    if hosts is not None and int(question.qclass) == int(DnsRClass.IN):
+        # Consulted before the walk or the forward, the way every OS resolver does:
+        # a hosts mapping is the operator's own statement about this box, and it wins.
+        # A miss (or a non-IN class, which a hosts file cannot express) falls through
+        # to DNS untouched. When it hits, the provenance names the line -- the whole
+        # point of W5 is that this answer never quietly impersonates a network reply.
+        hosts_file = hosts if isinstance(hosts, HostsFile) else HostsFile.from_file(hosts)
+        hit = hosts_file.match(question.name, question.qtype)
+        if hit is not None:
+            return LookupResult(
+                name=question.name,
+                qtype=question.qtype,
+                records=hit.records,
+                provenance=Provenance("hosts", note=hit.citation),
+                response=None,
+                trace=None,
+            )
     target = coerce_upstreams(via) if via is not None else None
     runner = engine if engine is not None else _engine.default_engine()
     response, trace, source = runner.run(

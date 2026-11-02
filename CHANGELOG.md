@@ -31,6 +31,26 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **Hosts-file honesty (roadmap W5, increment AF).** `namespy/apps/hosts.py` is the
+  override that names itself. Every resolver consults a hosts file first and almost
+  none says so — the roadmap's research hazard for this row is that a quiet hosts
+  override is indistinguishable from a DNS answer. `HostsFile`/`HostsEntry` parse a
+  hosts file and **remember each mapping's line number and file**; `records_for`
+  answers `A` from IPv4 and `AAAA` from IPv6 at **TTL 0** (dnsmasq's local-answer
+  stance — a hand-written mapping is the least cacheable thing in the answer set);
+  `bind(server)` registers each name as a bound responder speaking the server's own
+  `ResponderRequest`/`DynamicResponse` contract; and `lookup(hosts=…)` consults a
+  `HostsFile` (or a path to one) *before* the walk or forward, so a hit renders the
+  provenance line `hosts line 42 of /etc/hosts unsigned` — the roadmap's "answered
+  by hosts entry at line 42", made literal, and the honest `hosts` slot `lookup()`
+  had left empty since W2. A name the file knows but lacks a family for answers
+  NODATA rather than falling through (consulting it is the operator declaring this
+  box its authority); a name it does not know falls through untouched; a non-IN class
+  is never matched on the name. Hosts semantics have no RFC, so each parser rule is
+  labeled a convention (the `namespy/rbl.py` precedent, citing only RFC 1123 §6.1.2's
+  thin sketch); no new anchor, so `rfc-map.md` gained nothing. 21 tests,
+  `tests/test_apps_hosts.py`; full suite 2030 passed, 6 skipped, clean under `-O`.
+
 - **The forwarder, named (roadmap W4, increment AE).** `namespy/apps/forwarder.py`
   turns the forwarding server that only lived inside `__main__`'s `serve()` body
   into an embeddable handle — `Forwarder(upstreams, listen=..., serve_tcp=True)`

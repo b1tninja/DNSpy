@@ -27,6 +27,10 @@ The facades that ship so far:
   handle (``serve`` / ``stop`` / ``stats``) that composes ``DnsServer``'s relay and
   ``StubResolver``'s upstream walk with zero new core code -- the composability
   proof the strategy rests on.
+* :class:`namespy.apps.hosts.HostsFile` (W5) -- hosts-file honesty: a parser that
+  remembers each mapping's line and file, a serve adapter (``bind``) that answers
+  from it at TTL 0, and the door ``lookup(hosts=...)`` consults *first* so a hosts
+  answer says so instead of impersonating a DNS reply.
 
 None of them touches the network at import time, and none resolves a name for you
 that you did not ask about: the list of servers still arrives from outside, which
@@ -36,12 +40,16 @@ is the stub's stance since RFC 1034 section 5.3.1.
 from __future__ import annotations
 
 from .forwarder import Forwarder
+from .hosts import HostsEntry, HostsFile, HostsMatch
 from .lookup import LookupResult, Provenance, lookup
 from .routing import Route, RouteTable, RoutingDecision
 from .stub import Stub
 
 __all__ = [
     "Forwarder",
+    "HostsEntry",
+    "HostsFile",
+    "HostsMatch",
     "LookupResult",
     "Provenance",
     "Route",
