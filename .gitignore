@@ -16,6 +16,12 @@ last_resolution.md
 .vscode/
 .idea/
 
+# The research dossier behind docs/strategy.md: third-party claims (other
+# projects' issue trackers, tool limitations) that age faster than a roadmap
+# row should. The distilled decisions are tracked in strategy.md; this is the
+# re-verify-don't-re-research evidence, deliberately kept out of history.
+docs/research.md
+
 venv/
 .venv/
 debug-*.log

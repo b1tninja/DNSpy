@@ -289,9 +289,56 @@ self-contained script per capability; U7's lands with U7 (U5's example is its te
 suite: a live demo wants a certificate some verifier can trust, and shipping
 a "real-looking" one would be theater).
 
+## The third horizon: composition, ergonomics, and the researcher's toolkit
+
+Sections 1–9 are obligations; the second horizon was capability. This table is
+what the *users* ask for — assembled from a landscape survey (October 2026)
+whose evidence lives in `docs/research.md` (a gitignored working note) and
+whose decisions live in [`strategy.md`](strategy.md). The framing rule the
+survey produced: **namespy competes on correctness and instrumentation, never
+throughput** — the incumbents' codecs are bug-changelogs, their rate limits
+throttle the wrong counter, their brute-forcers treat DNSSEC denials as opaque,
+and none of them says *how it knows* an answer is what it claims to be. The
+layering rule: core stays the RFC implementation; `namespy.apps.*` composes it;
+`examples/` configure it — a pattern graduates upward only on second use (the
+`_reversed_labels` precedent).
+
+| # | Capability | Anchors / convention | Sketch | Why it is cheap now |
+|---|---|---|---|---|
+| W1 | **The sync/callback seam** — one engine, three drives | none needed — asyncio policy, not protocol; every drive documented with the failure each wrong turn produces | `namespy/engine.py`: a facade thread owning a private loop; blocking calls via `run_coroutine_threadsafe` (so a blocking call from inside a running loop works — the nested-loop trap pinned as behavior, not accident); callbacks are plain `on_done(future)` callables, and a raising callback is logged, never propagated into the engine (the `_ResponderFailed` rule crossed to the client side); one timeout policy applied identically on both sides of the seam | every protocol object is already an `asyncio.Protocol` with an `await`able surface — the adapter wraps, it implements nothing; ~50 lines and a test suite that *is* the design rationale |
+| W2 | **Client ergonomics** — one-shot lookup, resident stub | convention-labeled (the resolv.conf/hosts half is deployment, not protocol — the stub's "the list arrives from outside" stance stays); RFC 7858 §3.4 justifies the resident object | `apps.lookup(name, qtype="A", via=None)` returning records **plus a provenance line** (walk/cache/hosts/policy, validated or not); `apps.stub.Stub` with all three drives and sync+async context managers so held DoT streams mean something in a 1000-question loop | the README's current 10-line endpoint dance (`create_datagram_endpoint` + `wait_for` + double-close) collapses to one call over machinery that already works; this is the requests.get moment the survey says every library lives or dies by |
+| W3 | **The route table** — conditional forwarding, the one missing noun | dnsmasq's `--server=/zone/ip` family is deployment convention (documented as such, like RBL etiquette); EDE 22 relay already cited and shipped | `apps.routing.RouteTable`: longest-suffix match over `DomainName`, zone-match means **no fallback** to the general path (dnsmasq documents the trap: a dead zone-only upstream must kill the query honestly rather than leak it elsewhere), silence answered with the existing EDE-22 machinery | the stub's refusal semantics (REFUSED → next upstream, SERVFAIL → that's an answer) and the server's relay (ID rewrite, question echo, AA-clearing) already exist; this is a dict plus two rules — dnsdist proved the noun is load-bearing |
+| W4 | **The forwarder, named** | composition only — stub.py `forward()` + server.py relay semantics, both already cited | `apps.forwarder.Forwarder`: the wiring that composes in pure Python today (the stub's tcp/dot/doh legs are socket-free by design), exposed as `serve()` → handle with `.stop()`/`.stats()` | zero new core code — shipping this *is* the composability proof the strategy rests on; the example shrinks to ~20 lines of configuration |
+| W5 | **Interception and hosts honesty** | no RFC anchors hosts-file semantics — convention-labeled per the `rbl.py` precedent; EDE 15–17–18 vocabulary shipped (increment X) | bind() redirect + block-with-EDE examples; a hosts-file serve adapter (TTL-0 like dnsmasq's local answers); client-side hosts consultation that *says so* ("answered by hosts entry at line 42") — silently lying about what DNS would have said is hosts resolution's real research hazard | the bind()/filter/zone ladder already draws the precedence line (`serve_zone`'s docstring states it); this adds file adapters, not policy machinery |
+| W6 | **The validating stub, assembled** | 4033–4035 validation ✅; RFC 8509 sentinel ✅ (`anchors.py`, increment M); 5011 maintenance ✅ (`maintenance.py`, increment Q) — the row is assembly, cited through its pieces | `examples/validating_stub.py` → `apps.validating`: RecursiveResolver + anchors + cache + serve-stale in ~40 lines, with the sentinel self-check as the startup sentence ("is tag 20326 in the store right now") | delv has no DoT/DoH and doesn't truly iterate; pyunbound hides what libunbound knows — namespy's four-state verdicts, aggressive NSEC and RFC 9824 handling are stronger than anything a Python caller can assemble today; this is the flagship |
+| W7 | **Bulk resolution with honest negatives** | PTR/wordlist mechanics: none; wildcard detection is deployed convention (puredns' algorithm, stated as such); RFC 8020 cut + aggressive NSEC (9077) change what a *negative* answer means — cited through the shipped rows | `apps.bulk`: per-upstream **egress** token buckets (the puredns #73 lesson: a rate limit that throttles input parsing is theater), wildcard filtering via random-label probes per parent zone, answer-vs-scope validation (public resolvers return unrelated answers — their own README says so), memory-bounded batching | the async socket machinery + the NXDOMAIN-cut/aggressive-NSEC layers exist and are tested; nothing on the market reads enumeration negatives through DNSSEC denials — this is the differentiator, not the q/s |
+| W8 | **The audit battery** | per-probe anchors already shipped or cited in-section: 5936 AXFR (gated on U6's transfer leg), 8482 ANY, NSID/5001, NSEC/NSEC3 walk over the existing codecs with 5155 opt-out and 9824 conclusions, CAA 8659 upward walk honoring flag-128/issuewild, TLSA/DANE via stdlib `ssl`+`hashlib`, SVCB §2.4 selection explained | `apps.audit`: one target in, a JSON + human report out — each probe states its conclusion *and* the evidence shape behind it (a 9824-aware "cannot enumerate" is a finding; an opaque NXDOMAIN is not) | every codec and the validator already ship; this is reporting over verdicts the library already forms — the survey's DANE/CAA/SVCB-audit gap is three-star-repo territory today |
+| W9 | **Tunnel/beacon statistics + the honeypot profile** | RFC 9076 §8 (research observes DNS traffic) and ATT&CK T1071.004 name the shapes; C-DNS (8618) stays a documented pointer, not a format to own; tarpit-as-refusal must be argued against the RRL non-goal in its own row | `apps.tunnel_watch`: entropy/label-length/TXT-ratio/volume-per-client over QueryLog NDJSON (stdlib only); honeypot = the honest refusal + first-seen store + no-rDNS-back posture — "a resolver that stopped asking is indistinguishable from one that is broken" cuts both ways: being the *answered* server is how you learn what malware looks up | the query log's NDJSON rungs (increment Y) are the whole data plane; the aggregation is `collections.Counter` arithmetic — no new protocol surface anywhere in either half |
+| W10 | **Surface: entry points and one JSON** | dig-family ergonomics convention; RFC 8427 as prior art for the JSON shape, not a mandate | `python -m namespy.forwarder`-style dispatcher (bare `namespy example.com` unchanged — the increment-Z bareword `rbl` rewrite was this trying to be born); resolv.conf/search/ndots readers in apps only, opt-in, with traceable candidate order; one canonical NDJSON record across every output (query, transport, server, rcode, flags, TTL-with-expiry, verdict, provenance, origin rung) | the trace events already carry most fields of that record; the pipeability story (recon → walk → audit → cross-check without adapters) is a schema decision over shipped data |
+
+**Order of attack, with reasons.** W1 first: every later row inherits its
+drive from the engine, and its test suite settles the hard parts (thread
+affinity, timeout parity, the nested-loop trap) once rather than per-module.
+W2–W5 are one arc — client ergonomics, then the forward table the survey says
+is the single missing noun, then the compositions that prove it. W6 leads the
+research tier because it is flagship-shaped and ships with zero new core code;
+W7 follows (its wildcard filter reads through W6's denial machinery); W8–W9 are
+reporting layers over verdicts already formed; W10 lands last because a CLI
+surface designed before the apps tier settles would design the wrong flags.
+U6's transfer leg and U7 stay as they were — campaigns on their own merits,
+and W8's AXFR probe waits on the former.
+
 **Declined with reasons, in the house style:** RRL/rate limiting (stays ▫️ —
-the server is a loopback fixture); DoH server (stdlib has no HTTP/2, restating
-8484's requirement rather than silently failing it); CoAP (no server here
-talks to it); trust-anchor *automation in the fetch loop* — RFC 5011's state
-machine shipped in `maintenance.py`, and wiring it into resolver fetch remains
-a scheduler decision with no document asking for one.
+the server is a loopback fixture; W9's tarpit must argue its corner as
+refusal-shaped delay, not flood mitigation); DoH server (stdlib has no HTTP/2 —
+U4 shipped the *client*; serving 8484 would mean restating its requirement
+rather than silently failing it); CoAP (no server here talks to it);
+trust-anchor *automation in the fetch loop* — RFC 5011's state machine shipped
+in `maintenance.py`, and wiring it into resolver fetch remains a scheduler
+decision with no document asking for one; raw-throughput competition (the
+C+epoll figure is unreachable and irrelevant to correctness work); DoQ and
+DNSCrypt (no QUIC dependency, no new wire dependency, full stop); DGA/tunnel
+*classifiers* (namespy is the collection and verification end, not another
+model); ambient resolv.conf/hosts reading in core (deployment behavior must
+never be the library's default — opt-in at the apps door).
+

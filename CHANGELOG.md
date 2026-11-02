@@ -6,6 +6,29 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ## [Unreleased]
 
+### Added — planning (no code)
+
+- **The third horizon, and where its research lives.**
+  `docs/strategy.md` (tracked) records the layering rule — core stays the
+  RFC implementation, `namespy.apps.*` composes it, `examples/` configure
+  it, graduation on second use per the `_reversed_labels` precedent — and
+  the positioning an October 2026 landscape survey settled on: namespy
+  competes on correctness and instrumentation, never throughput. Its raw
+  evidence (third-party trackers, tool limitations) lives in
+  `docs/research.md`, deliberately gitignored because those claims age
+  faster than a roadmap row should; only distilled decisions cross into
+  tracked prose, and rule 8 still gates every citation before it reaches
+  code. `docs/roadmap.md` gains **The third horizon** (rows W1–W10): the
+  sync/callback engine seam (one async engine, three drives — await,
+  blocking via a facade-thread loop, plain-callable callbacks), client
+  ergonomics with provenance lines, the route table (conditional
+  forwarding, zone-match means no fallback, EDE-22 on silence), the named
+  forwarder as zero-new-core-code composability proof, interception and
+  hosts honesty, the validating-stub flagship, bulk resolution with
+  DNSSEC-aware negatives, the audit battery, tunnel/beacon statistics and
+  the honeypot profile, and the entry-point dispatcher with one canonical
+  NDJSON record. README's spec-anchor bullet now points at strategy.md.
+
 ### Added
 
 - **Authoritative serving: the first leg of the U6 arc.**

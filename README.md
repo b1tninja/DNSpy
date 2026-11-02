@@ -31,7 +31,10 @@ signature arithmetic DNSSEC validation runs on.
   matrix — every protocol obligation this code could take on, with an honest
   status and the test that pins it, and the roadmap the gaps consolidate
   into. [`docs/rfc-map.md`](docs/rfc-map.md) is the deep RFC 1034 §5.3.3
-  walkthrough behind the resolver
+  walkthrough behind the resolver. [`docs/strategy.md`](docs/strategy.md) is
+  why the next rows are ordered the way they are — the layering rule (core =
+  RFC implementation, `namespy.apps.*` composes it, examples configure it) and
+  the positioning the October 2026 landscape survey settled on
 
 ## Install
 
