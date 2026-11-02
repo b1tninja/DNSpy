@@ -196,9 +196,9 @@ code. It is the same objects, now an embeddable handle:
 ```python
 from namespy.apps import Forwarder
 
-fwd = Forwarder(["1.1.1.1", "9.9.9.9"])   # forwards everything to these recursors
-fwd.serve()                                # binds 127.0.0.1:53 (UDP + TCP)
-print(fwd.stats())                         # {'served': n, 'by_origin': {'forward': n}, 'servfail': 0}
+fwd = Forwarder(["1.1.1.1", "9.9.9.9"])  # forwards everything to these recursors
+fwd.serve()  # binds 127.0.0.1:53 (UDP + TCP)
+print(fwd.stats())  # {'served': n, 'by_origin': {'forward': n}, 'servfail': 0}
 fwd.stop()
 ```
 
