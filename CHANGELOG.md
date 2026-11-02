@@ -31,6 +31,23 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **The route table: conditional forwarding (roadmap W3, increment AD).**
+  `namespy/apps/routing.py` names the one noun every production resolver grew and
+  no RFC defines — dnsmasq's `--server=/zone/ip` family, so the module is
+  convention-labeled the way `rbl.py` is, not given a `rfc-map.md` row. `RouteTable`
+  maps a zone (a `DomainName`; `.` is the general/default path) to upstreams, and
+  `route(name)` returns the single **longest-suffix** match using
+  `DomainName.is_subdomain_of`'s reflex apex-or-below reading. The load-bearing
+  rule is the second one — **zone-match means no fallback**: because `route`
+  returns one route and never a chain, there is no "then try the default" to reach
+  for, and `RoutingDecision.exclusive` states out loud that a zone claimed the name
+  and took the general path off the table. That is dnsmasq's own documented trap — a
+  dead zone-only forwarder must kill the query honestly (the forwarder answers
+  silence with EDE 22, "No Reachable Authority") rather than leak an internal name
+  to a public resolver. The table is decisions only and opens no socket; the
+  forwarder (W4) acts on a `RoutingDecision`. 21 tests, `tests/test_apps_routing.py`,
+  100% of the module; full suite 1998 passed, 6 skipped, clean under `-O`.
+
 - **The composition tier: `namespy/apps/` (roadmap W2, increment AC).** The
   first home for facades that *assemble* the core rather than extend it —
   stdlib-only, no new protocol surface (`docs/strategy.md`'s layering rule made

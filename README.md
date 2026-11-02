@@ -173,6 +173,21 @@ with Stub(["1.1.1.1", "9.9.9.9"], dnssec_ok=True) as stub:  # engine and socket 
     answer = stub.ask_blocking("example.com", "A")
 ```
 
+Not every name belongs at the same server. `namespy.apps.RouteTable` is the
+conditional-forwarding table (dnsmasq's `--server=/zone/ip`, deployment convention
+rather than protocol): longest-suffix match, and a zone match *excludes* the
+general path, so an internal name is never leaked to a public resolver. It decides
+where a name would go and opens no socket — the forwarder (W4) is what acts on it:
+
+```python
+from namespy.apps import RouteTable
+
+table = RouteTable(["internal.example=10.0.0.1"], default="1.1.1.1")
+decision = table.route("db.internal.example")
+print(decision.route.zone, decision.exclusive)  # internal.example  True  (default is off the table)
+print(table.route("example.com").upstreams)  # 1.1.1.1 — only the general path matched
+```
+
 Underneath both, the machinery is explicit. `RecursiveResolver` is an `asyncio.Protocol`: it owns a datagram endpoint and you
 await `resolve()`.
 
