@@ -147,7 +147,33 @@ nothing else in the library contacts that URL.
 
 ## Use it as a library
 
-`RecursiveResolver` is an `asyncio.Protocol`: it owns a datagram endpoint and you
+For the common case there is a one-call facade over the whole endpoint dance —
+records back, and a line saying *how it knows*:
+
+```python
+from namespy.apps import lookup
+
+result = lookup("example.com", "A")  # blocking; walks the tree, or forward with via="1.1.1.1"
+for record in result.records:
+    print(record.name, record.ttl, record.rdata)
+print(result.line)  # e.g. "walk validated", "walk cache unsigned", "forward stale"
+```
+
+It runs on `namespy.engine`'s thread, so it is legal even from inside a loop you
+are already running. For a client you hold across many questions — where a
+DNS-over-TLS stream should be reused rather than re-handshaked (RFC 7858 §3.4) —
+`namespy.apps.Stub` wraps one bound `StubResolver` and speaks in all three drives
+(`ask` to await, `ask_blocking` to block, `ask_callback` for a `on_done` callable),
+as both a sync and an async context manager:
+
+```python
+from namespy.apps import Stub
+
+with Stub(["1.1.1.1", "9.9.9.9"], dnssec_ok=True) as stub:  # engine and socket close on exit
+    answer = stub.ask_blocking("example.com", "A")
+```
+
+Underneath both, the machinery is explicit. `RecursiveResolver` is an `asyncio.Protocol`: it owns a datagram endpoint and you
 await `resolve()`.
 
 ```python

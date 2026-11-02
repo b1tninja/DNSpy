@@ -22,6 +22,17 @@ last_resolution.md
 # re-verify-don't-re-research evidence, deliberately kept out of history.
 docs/research.md
 
+# The corpus that dossier was read from: conference PDFs and their text
+# extractions (cache poisoning, DNS privacy, IoT obfuscation, RRL, ECS,
+# cookies fetched from a live resolver). Same reasoning as the dossier above --
+# evidence, not history, and `git status --short` has to stay readable for the
+# start-here check in docs/HANDOFF.md to mean anything. Root-anchored on
+# purpose: `git ls-files *.txt *.pdf` is empty, so nothing tracked lives under
+# these suffixes, and a document that ever means to be tracked can be added
+# with -f or given a directory.
+/*.txt
+/*.pdf
+
 venv/
 .venv/
 debug-*.log

@@ -19,10 +19,10 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, **in sync with `origin/master`** as of increment AA's push (the split history and increments U–AA are all landed and CI-green) — pushes run the branch-protected 10 required checks, strict |
-| Suite | 1928 passed, 0 failed, 1 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements) |
+| Suite | 1977 passed, 0 failed, 6 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements). Five of the six skips are `test_stub_doh.py`'s HTTP/2 rows ("needs the doh extra") and the sixth is the crypto-absent case: this box has no `h2`, CI's matrix jobs do, so the counts there read 1982/1 — and that absence is why local coverage measures 90% against CI's 91% |
 | Coverage | 91% measured with `coverage run -m pytest` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` — the ratchet comment asks for it to be raised only from numbers CI itself reports, so it stays at 80 |
-| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`), and **the serve side grew a ladder** — special-use names (RFCs 6761/6762/7686) are refused to walk, `DnsServer.bind()` responders and the reflexive zone answer from the socket (increment V), DNS over TLS works in both directions (`--serve-dot`, `--forward-dot`; increment W), `--filter` refuses by policy with RFC 8914 §4.16–§4.19's codes and nothing else (increment X), and `--serve-query-log` signs every answer as one JSON line naming the rung it came off (increment Y), and `--rbl`/`--ptr` read blocklist zones and reverse trees through the same reversal, keeping listed/not-listed/unknown three separate answers down to the exit code (increment Z, `namespy/rbl.py`, `examples/blocklist.py`), and `--zone FILE` makes the server authoritative for RFC 1035 §5.1 master files with RFC 1034 §4.3.2 answers — AA, real referrals, synthesized wildcards, the query log's `zone` rung (increment AA, `namespy/zone.py`; U6's transfer leg follows) |
-| Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes. **The third horizon (rows W1–W10)** landed this round: composition and researcher tooling — engine seam with sync/callback drives, apps tier (route table, forwarder, validating stub, bulk resolver with DNSSEC-aware negatives, audit battery, tunnel stats/honeypot), entry-point dispatcher; ordering rationale in [`docs/strategy.md`](strategy.md) (tracked); its raw survey evidence in `docs/research.md` (**gitignored working note** — third-party claims age faster than roadmap rows; verify rule-8 before any anchor there reaches code or tracked prose) |
+| Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`), and **the serve side grew a ladder** — special-use names (RFCs 6761/6762/7686) are refused to walk, `DnsServer.bind()` responders and the reflexive zone answer from the socket (increment V), DNS over TLS works in both directions (`--serve-dot`, `--forward-dot`; increment W), `--filter` refuses by policy with RFC 8914 §4.16–§4.19's codes and nothing else (increment X), and `--serve-query-log` signs every answer as one JSON line naming the rung it came off (increment Y), and `--rbl`/`--ptr` read blocklist zones and reverse trees through the same reversal, keeping listed/not-listed/unknown three separate answers down to the exit code (increment Z, `namespy/rbl.py`, `examples/blocklist.py`), and `--zone FILE` makes the server authoritative for RFC 1035 §5.1 master files with RFC 1034 §4.3.2 answers — AA, real referrals, synthesized wildcards, the query log's `zone` rung (increment AA, `namespy/zone.py`; U6's transfer leg follows), and **the engine seam** (roadmap W1, increment AB) — `namespy/engine.py` is the adapter between asyncio and callers who do not speak it: one engine (a daemon thread owning one private loop), three drives (`await`, blocking via `run_coroutine_threadsafe`, and plain-callable `on_done(future)`), the nested-loop trap fixed by construction and pinned as behavior with `asyncio.run`'s refusal as the negative control, one `TimeoutError` from either arm of the seam, a raising callback logged instead of allowed to reach the loop, `close()` refusing to deadlock from the loop's own thread, and a ledger of every wrapper the seam built so a submission it will never run is closed and refused by name rather than left pending (`tests/test_engine.py`, 25 tests, 100% of the module, suite warning-clean) |
+| Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes. **The third horizon (rows W1–W10)** landed this round: composition and researcher tooling — engine seam with sync/callback drives, apps tier (route table, forwarder, validating stub, bulk resolver with DNSSEC-aware negatives, audit battery, tunnel stats/honeypot), entry-point dispatcher; ordering rationale in [`docs/strategy.md`](strategy.md) (tracked); its raw survey evidence in `docs/research.md` (**gitignored working note** — third-party claims age faster than roadmap rows; verify rule-8 before any anchor there reaches code or tracked prose). **W1 and W2 are ✅** (increments AB and AC). **W3** (`namespy/apps/routing.py`: `RouteTable` — longest-suffix conditional forwarding over `DomainName`, zone-match means **no fallback**, EDE-22 on silence) is next; W2's own commit put the one-liner into README's library section and opened `namespy/apps/` as the composition tier's home |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
 | Release | `release.yml` wired end-to-end: tag → build → attest → trusted-publish to PyPI → GitHub Release. **One manual step away — see checklist below.** |
@@ -91,6 +91,17 @@ cd D:\code\namespy
   The commits are fine — verify sequentially after the chain finishes.
   Run `add && commit && push` as one chained `cmd /c` line and nothing
   else in the same batch.
+- **A test whose `def` line is eaten by an edit still passes.** Its body folds
+  into the function above it, the suite goes green, and the pass count drops by
+  one quietly. Increment AB lost `test_the_daemon_thread_does_not_outlive_a_forgotten_engine`
+  this way and only the collected-name list showed it, so after any edit that
+  inserts whole functions: `pytest --collect-only -q`, and read the names, not
+  just the number.
+- **The local venv has no `h2`, so five DoH rows skip here and CI runs them.**
+  That is the difference between this box's 1948/6 + 90% coverage and CI's
+  1953/1 + 91%: real, expected, and worth stating in a "verified" line rather
+  than reconciling after the fact. Install `".[dev,doh]"` when a change touches
+  `doh.py`.
 - **Install with quotes**: `pip install -e ".[dev]"`. Unquoted, PowerShell
   eats the brackets.
 - **`Get-Content` misreads UTF-8; it is not corruption.** Windows PowerShell
@@ -169,7 +180,146 @@ cd D:\code\namespy
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
 
-## Latest round: the NXDOMAIN cut (RFC 8020)
+## Latest round: the composition tier opens — `namespy/apps/` (roadmap W2, increment AC)
+
+Shipped: the second row of the third horizon and the first code in the apps
+tier. The layering rule (`docs/strategy.md`) says `namespy/apps/` composes the
+core and adds no protocol surface; this increment is the proof that rule can be
+followed — `namespy/apps/lookup.py` and `namespy/apps/stub.py` import the
+resolver, the stub, the packet types and the engine, and define nothing new on the
+wire. `ruff`, `mypy` and the suite carry that; the import graph is the argument.
+
+**`apps.lookup` returns the answer and says how it knows.** The provenance line
+is the whole product, and its discipline is that every word is a signal the core
+already formed, read by `getattr` and never re-decided: `walk`/`forward` from
+`via`, `AD` into `validated`, the RFC 8767 `stale_answer` marker into `stale`, and
+`cached` claimed **only** when the trace recorded no `SendQuery` at all — so a
+partial cache hit that still asked something reports `walk`, not an over-claim.
+`hosts`/`policy` are named in the roadmap's vocabulary but are honest placeholders
+until W3 and W10 wire them; the docstrings say so rather than printing a word the
+library did not earn. It blocks on the default `Engine`, so — the property W1
+bought — a `lookup` works from a thread already inside a running loop.
+
+**`apps.Stub` is the resident object, and its life is the feature.** It owns one
+`Engine` and one `StubResolver` bound lazily on first question and held for the
+Stub's life, so the encrypted streams `StubResolver` keeps per upstream survive
+from one question to the next — RFC 7858 §3.4's "reuse a single TCP connection …
+do not immediately close a connection after each response," which this round
+verified against the document body before it reached code or prose. One
+`_ask_one` coroutine sits under all three drives (`ask` awaits via
+`wrap_future`, `ask_blocking` via `Engine.run`, `ask_callback` returns the
+`concurrent.futures.Future` with `on_done`); the drives are one forward dressed
+three ways, never three implementations. Both `with` and `async with` close the
+resolver **and** its sockets, and a question refused at the door closes the
+coroutine rather than orphaning it — rule four of the engine, carried up a layer.
+
+**Two test-shape traps found on the way.** A `Resolver`'s `connection_made`
+brings up a private IPv6 socket through the *same* `create_datagram_endpoint`, so
+the fake endpoint that counts "binds once" had to distinguish the main resolver
+from the shim by `isinstance(protocol, Resolver)` — otherwise the §3.4 reuse claim
+counts two. And `make_question` punycodes a text name the way the CLI does
+(`DomainName.from_unicode`), not by string-concatenating a root dot, which is the
+one place a naive facade would silently mistranslate a U-label.
+
+**Verified**: 1977 passed (+29), 6 skipped on this box, clean under `-O`;
+`ruff check` + `ruff format --check` clean across the tree, `mypy namespy` exits 0
+over 38 files, coverage TOTAL 90% (apps 88% / 85%, floor 80 met, no ratchet — the
+comment asks for CI's own number and CI has not run this yet). `docs/rfc-map.md`
+deliberately gained nothing again: it is the RFC 1034 resolution walkthrough, and
+RFC 7858 §3.4 now lives where rule 8 wants it — cited in `apps/stub.py` and on the
+roadmap row, not restated in a document about a different problem. README's
+library section gained the one-liner the W1 row deferred.
+
+**Not claimed, and what it unblocks.** No `examples/` script yet (U5/W1
+precedent: an example earns its place when it shows something a docstring cannot);
+no `hosts`/`file` source behind the provenance words; the server's blocking drive
+still unbuilt. Next in the planned order is W3 (`apps.routing.RouteTable`), the
+single missing noun the survey named, then W4's forwarder which is the composability
+proof with zero new core code.
+
+## An earlier round: the engine seam (roadmap W1, increment AB)
+
+Shipped: the adapter between asyncio and callers who do not speak it, and the
+first row of the third horizon. `namespy/engine.py` implements nothing — that is
+the design. Every protocol object in this project is already an
+`asyncio.Protocol` with an `await`able surface, so the blocking drive is the very
+same coroutine awaited on a loop someone else owns and handed back across the
+thread boundary, and the callback drive is that future with a plain callable
+attached. The seam adds one thread, one timeout policy, and four rules; the tests
+are the rules.
+
+**The nested-loop trap is fixed by construction, and the trap is kept as a test.**
+The obvious facade is `asyncio.run()` in the calling thread, which raises
+`RuntimeError: asyncio.run() cannot be called from a running event loop` for
+exactly the callers who most want it — notebooks, async shells, a resolver called
+from inside a responder. `run_coroutine_threadsafe` cannot care what the calling
+thread is doing. The passing test is the claim; `test_asyncio_run_from_a_running_loop_is_the_trap_we_avoid`
+is the negative control, because a premise nobody re-measures becomes folklore.
+
+**Timeouts mean one thing on both sides.** `wait_for` runs *inside* the loop,
+where cancellation reaches this project's own machinery — which knows how to
+abandon a query in flight — while the caller waits that plus a small grace for the
+thread hop. Both arms arrive as the same `TimeoutError`; a hang would otherwise
+mean three different errors depending on the drive. The grace is measured from a
+wedged loop (a callback that never returns) rather than asserted as a constant,
+and a late answer is not turned into a timeout by a short grace.
+
+**A callback that raises is a logged event, not an engine failure.** That is
+`DnsServer`'s `_ResponderFailed` rule crossed to the client side: a handler's
+mistake must not take the server down, and a notifier's must not take the loop
+down. The callback still fires when the work timed out or was cancelled — "never
+called" is the failure mode a notification API must not have — and it runs on the
+engine's loop thread, which is why the seam schedules it rather than calling it.
+
+**Rule four is the one that moved under review, twice.** The promise: nothing this
+seam refuses is left behind, because a coroutine nobody started is an object with
+a frame and its deallocator files a report this project treats as a smell. The
+first draft swept asyncio's queues — `loop._closed_attribute` for the unrun
+handles, `handle._args[0]` for the coroutine inside them. **Both names were
+invented.** There is no such attribute, and `run_coroutine_threadsafe` carries the
+coroutine in a closure it builds itself with an empty argument tuple, so the sweep
+found nothing while promising it had — silently, on a private name that owes this
+code nothing across patch releases. The second draft was wrong differently:
+sweeping *before* the teardown's cancel-and-drain closed coroutines asyncio still
+intended to run, which surfaced as `cannot reuse already awaited` plus a future
+this seam had already finished. The version that shipped owns the list instead:
+the engine registers each wrapper it builds and hands off inside one critical
+section, forgets it the instant the loop starts running it, and sweeps once the
+loop is closed — the first moment abandonment is certain and the last moment
+anything can still be registered. A caller whose work will never run is refused by
+name instead of holding a future that cannot resolve; a caller whose coroutine was
+never taken gets it back with its frame intact, because the register holds only
+what this seam made. The suite ends warning-clean, which is the only measurement
+that means anything for this rule.
+
+**One test the seam did not write was lying.**
+`test_shutdown_cancels_pending_tasks_rather_than_abandoning_them` submitted work
+and closed in the same breath, then asserted the task had been cancelled mid-await
+— a race over whether the loop ever started the handoff, which it lost once the
+refusal path made the loss loud instead of silent. It now waits for the work to
+start (that is what "pending" claims) and also asserts the caller learns about the
+cancellation. Eight consecutive clean runs of the file, because a test that fails
+on a loaded box teaches the wrong lesson.
+
+**Verified**: 1948 passed (+25), 6 skipped on this box (five are the `h2`-gated
+DoH rows — this venv has no `doh` extra; CI does), `ruff check` +
+`ruff format --check` clean, `mypy namespy` exits 0 over 35 files,
+`python -O -m pytest -q` green, and `namespy/engine.py` measures 100% (161
+statements, 34 branches, no partials). Roadmap's third horizon gained its first ✅
+and its count sentence; `docs/rfc-map.md` deliberately gained nothing, because no
+document governs a thread and inventing an anchor for one is the error rule 8
+exists to stop.
+
+**Not claimed, in order of what it unblocks.** No example yet, on the U5
+precedent: a seam demonstrated without a facade is a threading demo, not a DNS
+demo, so `examples/` waits for W2's one-liner — which is also where README's
+library section gains it, and where `namespy/apps/` first appears (a subpackage
+needs a packaging decision W1 has no business making). The server's blocking drive
+is documented but not built: handlers run on the loop thread, so a sync handler is
+microseconds of pure computation by contract, and deferral gets added when an
+example needs it, not before.
+
+## An earlier round: the NXDOMAIN cut (RFC 8020)
 
 Shipped: §2's SHOULD, as a policy. A NXDOMAIN in the cache now denies the names at and below it,
 so the lookup RFC 2308 would send upstream is answered from the denial the zone already made.
@@ -3369,6 +3519,18 @@ the log's `zone` rung included). Full suite after: 1928 passed, 1
 skipped; `-O` clean; mypy 34 files; ruff check and format clean;
 coverage TOTAL 91% (zone.py itself 84 — the error-branch prose is the
 residue). Next on this row: the transfer leg.
+
+
+### Follow-up: the chain stops here — increment AB (row W1, the engine seam) has its own section above
+
+Increments V through AA appended themselves as `### Follow-up:` subsections under
+a round heading that predates them, which left the newest work hardest to find.
+Increment AB starts the older convention again — `## Latest round: the engine
+seam (roadmap W1, increment AB)`, the first round section under the Status table,
+so a reader who wants what shipped last reads forward once instead of scrolling
+3,400 lines. The renamed neighbour (`## An earlier round: the NXDOMAIN cut`) is
+the heading that stopped being true several increments ago; the `### Follow-up:`
+subsections below it are append-only history and stay where they are.
 
 
 ## Previous round: MQTYPE (RFC 10029)

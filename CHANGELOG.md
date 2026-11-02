@@ -31,6 +31,65 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **The composition tier: `namespy/apps/` (roadmap W2, increment AC).** The
+  first home for facades that *assemble* the core rather than extend it —
+  stdlib-only, no new protocol surface (`docs/strategy.md`'s layering rule made
+  the cut). `namespy.apps.lookup(name, qtype="A", via=None)` is the one-shot
+  blocking request-the-answer call: it collapses the
+  `create_datagram_endpoint` / `wait_for` / double-close dance into a single call
+  over the W1 engine seam and returns records **plus a `Provenance` line** read
+  only from signals the library already forms — `walk` or `forward`, answered
+  without a wire query, `AD`, the serve-stale marker — and never an invented
+  verdict; `hosts`/`policy` are honest placeholders until W3/W10 wire them.
+  `namespy.apps.Stub` is the resident client: one `Engine`, one lazily-bound
+  `StubResolver` held for its life so a DNS-over-TLS stream is reused across a
+  thousand questions rather than re-handshaked each time (RFC 7858 §3.4, verified
+  against the document body and cited in the code docstring), spoken in all three
+  drives — `ask` to await, `ask_blocking` to block even from inside a running
+  loop, `ask_callback` for a plain `on_done` — over a single `_ask_one` coroutine,
+  as both a sync and an async context manager that closes the resolver and its
+  sockets and refuses, rather than orphans, work a shut-down engine will not run.
+  README's library section gained the one-liner the W1 row deferred here.
+  29 tests, `tests/test_apps_lookup.py` and `tests/test_apps_stub.py`; full suite
+  1977 passed, 6 skipped, clean under `-O`.
+
+- **The engine seam: three drives, one asyncio core (roadmap W1, increment AB).**
+  Everything namespy does is an `asyncio.Protocol`, so every public surface was
+  loop-bound: asking a question meant owning a loop. `namespy/engine.py` is the
+  adapter that removes the requirement without adding a second implementation —
+  a daemon thread owning one private loop, `Engine.run` marshalling a coroutine
+  across the thread boundary via `run_coroutine_threadsafe`, `Engine.submit`
+  handing back the `concurrent.futures.Future`, and `on_done(future)` as a plain
+  callable rather than a promise type of our own. The nested-loop trap is fixed
+  by construction (a blocking call works from inside a running loop) and the
+  naive form is kept as a test's negative control, so the premise cannot rot into
+  folklore. Timeouts mean one thing on both sides of the seam: `wait_for` fires
+  *inside* the loop, where the machinery can abandon a query in flight, and the
+  caller waits that plus a grace for the thread hop — one error, either way. A
+  callback that raises is logged and never reaches the loop, which is
+  `DnsServer._ResponderFailed`'s rule wearing a client's clothes. A raising
+  `__exit__` closes anyway, `close()` from the engine's own loop thread refuses
+  rather than deadlocks, and an engine nobody closed is closed at interpreter
+  exit. **No `rfc-map.md` row**: no document governs a thread, and the row says
+  so. Rule four — nothing this seam refuses is left behind — is the claim that
+  moved under review. The first draft swept asyncio's private queues, reading
+  `loop._closed_attribute` and `handle._args[0]`; neither exists
+  (`run_coroutine_threadsafe` carries the coroutine in a closure it builds), so
+  the sweep silently found nothing while promising it had, and the second draft's
+  fix was wrong in a different way: sweeping *before* the teardown's drain closed
+  coroutines asyncio still meant to run. The engine now keeps its own ledger of
+  the wrappers it built — registered and handed off inside one critical section,
+  forgotten the moment the loop starts running them, swept once the loop is closed
+  — and a caller whose work will never run is refused by name instead of left
+  holding a future that cannot resolve. The suite is warning-clean at the end of
+  that change, which is the only honest way to measure the promise. 25 tests in
+  `tests/test_engine.py`, 100% of the module, and one fix to a test the seam did
+  not write: `test_shutdown_cancels_pending_tasks_rather_than_abandoning_them`
+  submitted and closed in the same breath, which is a race over whether the work
+  ever started, not a task mid-await; it now waits for the start and also asserts
+  the caller learns about the cancellation. An example defers to W2 on the U5
+  precedent (a seam with no facade is a threading demo, not a DNS demo).
+
 - **Authoritative serving: the first leg of the U6 arc.**
   `namespy/zone.py` loads an RFC 1035 §5.1 master file and answers the
   way RFC 1034 §4.3.2 composes them. Parsing is the section's own
