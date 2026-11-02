@@ -19,10 +19,10 @@ gh run list -L 5                  # what CI thinks about it
 | | |
 |---|---|
 | Branch | `master`, **in sync with `origin/master`** as of increment AA's push (the split history and increments U–AA are all landed and CI-green) — pushes run the branch-protected 10 required checks, strict |
-| Suite | 1998 passed, 0 failed, 6 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements). Five of the six skips are `test_stub_doh.py`'s HTTP/2 rows ("needs the doh extra") and the sixth is the crypto-absent case: this box has no `h2`, CI's matrix jobs do, so the counts there read 2003/1 — and that absence is why local coverage measures 90% against CI's 91% |
+| Suite | 2009 passed, 0 failed, 6 skipped; clean under `python -O` too (the pytest "assertions stripped" notice there is pytest talking about itself, not this code — the library contains zero `assert` statements). Five of the six skips are `test_stub_doh.py`'s HTTP/2 rows ("needs the doh extra") and the sixth is the crypto-absent case: this box has no `h2`, CI's matrix jobs do, so the counts there read 2014/1 — and that absence is why local coverage measures 90% against CI's 91% |
 | Coverage | 91% measured with `coverage run -m pytest` (it drifts by a few hundredths between runs, since some transport-retry branches depend on timing); floor 80 lives in `pyproject.toml`, and CI passes `--cov` — the ratchet comment asks for it to be raised only from numbers CI itself reports, so it stays at 80 |
 | Features | codec, resolver, CLI, truncation/TCP, **EDNS(0) incl. §6.2.2 fallback** (`--no-edns` to disable), **EDNS options** — NSID (`--nsid` / `--advertise-nsid`), COOKIE, Padding, per-server payload sizes (`tests/test_edns.py`) — and **Extended DNS Errors** (RFC 8914) composed by the server and consumed by the resolver and the CLI (`tests/test_edns_error.py`), and **SVCB/HTTPS RDATA** (RFC 9460) decoded into `SvcParams` with `alpn`/`dohpath`, `keyNNNNN` for unregistered keys and §2.4 selection (`namespy/svcb.py`; `tests/test_svcb_rdata.py`, `tests/test_svcb_wire.py`, `tests/test_svcb_presentation.py`), and **MQTYPE** (RFC 10029) in both roles — both options composed and parsed, §3.3's refusals enforced on send and on receive, §3.4's combination merging the extra QTYPEs into one reply and returning the MQTYPE-Response (`namespy/mqtype.py`, `namespy/server.py`; `tests/test_mqtype.py`, `tests/test_server.py`), **and** asked, read and re-asked by the resolver, so one walk answers A + AAAA + HTTPS (`namespy/bundle.py`, `RecursiveResolver.resolve_bundle`, CLI `--mqtype`; `tests/test_bundle.py`, `tests/test_resolver_mqtype.py`), and **the NXDOMAIN cut** (RFC 8020) — `NxdomainPolicy` (`ALWAYS`/`NEVER`/`VALIDATED`) over the QTYPE-free `DnsCache.nxdomain_at()` in both backends, consulted at every hop, with `--no-nxdomain-cut` on the CLI and `NXDOMAIN cut:` in both the trace and the answer (`tests/test_nxdomain_cut.py`, plus the new rows in `tests/test_cache.py`), and the **first leg of DNSSEC** (RFC 4034) — `DNSKEY` and `DS` codecs plus the key tag and DS-digest arithmetic in `namespy/dnssec.py`, with no new dependency: the digests are `hashlib`, and the two published vectors in the RFC are the tests (`tests/test_dnssec_codecs.py`), and **the DNSSEC proof records** (RFC 4034 §3–§4, RFC 5155 §3–§4) — `RRSIG`, `NSEC`, `NSEC3` and `NSEC3PARAM` codecs with type bit maps, the NSEC3 hash and §10.3's iteration ceiling, again with no new dependency (`tests/test_dnssec_proofs.py`), and **the serve side grew a ladder** — special-use names (RFCs 6761/6762/7686) are refused to walk, `DnsServer.bind()` responders and the reflexive zone answer from the socket (increment V), DNS over TLS works in both directions (`--serve-dot`, `--forward-dot`; increment W), `--filter` refuses by policy with RFC 8914 §4.16–§4.19's codes and nothing else (increment X), and `--serve-query-log` signs every answer as one JSON line naming the rung it came off (increment Y), and `--rbl`/`--ptr` read blocklist zones and reverse trees through the same reversal, keeping listed/not-listed/unknown three separate answers down to the exit code (increment Z, `namespy/rbl.py`, `examples/blocklist.py`), and `--zone FILE` makes the server authoritative for RFC 1035 §5.1 master files with RFC 1034 §4.3.2 answers — AA, real referrals, synthesized wildcards, the query log's `zone` rung (increment AA, `namespy/zone.py`; U6's transfer leg follows), and **the engine seam** (roadmap W1, increment AB) — `namespy/engine.py` is the adapter between asyncio and callers who do not speak it: one engine (a daemon thread owning one private loop), three drives (`await`, blocking via `run_coroutine_threadsafe`, and plain-callable `on_done(future)`), the nested-loop trap fixed by construction and pinned as behavior with `asyncio.run`'s refusal as the negative control, one `TimeoutError` from either arm of the seam, a raising callback logged instead of allowed to reach the loop, `close()` refusing to deadlock from the loop's own thread, and a ledger of every wrapper the seam built so a submission it will never run is closed and refused by name rather than left pending (`tests/test_engine.py`, 25 tests, 100% of the module, suite warning-clean) |
-| Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes. **The third horizon (rows W1–W10)** landed this round: composition and researcher tooling — engine seam with sync/callback drives, apps tier (route table, forwarder, validating stub, bulk resolver with DNSSEC-aware negatives, audit battery, tunnel stats/honeypot), entry-point dispatcher; ordering rationale in [`docs/strategy.md`](strategy.md) (tracked); its raw survey evidence in `docs/research.md` (**gitignored working note** — third-party claims age faster than roadmap rows; verify rule-8 before any anchor there reaches code or tracked prose). **W1, W2 and W3 are ✅** (increments AB, AC and AD). **W4** (`namespy/apps/forwarder.py`: `Forwarder` — composes `Stub` + `RouteTable` + the server's relay, zero new core code; the composability proof the strategy rests on) is next; W2's own commit put the one-liner into README's library section and opened `namespy/apps/` as the composition tier's home |
+| Planning | [`docs/roadmap.md`](roadmap.md) is the completeness matrix and the roadmap — update the row in the same commit as any behaviour change it describes. **The third horizon (rows W1–W10)** landed this round: composition and researcher tooling — engine seam with sync/callback drives, apps tier (route table, forwarder, validating stub, bulk resolver with DNSSEC-aware negatives, audit battery, tunnel stats/honeypot), entry-point dispatcher; ordering rationale in [`docs/strategy.md`](strategy.md) (tracked); its raw survey evidence in `docs/research.md` (**gitignored working note** — third-party claims age faster than roadmap rows; verify rule-8 before any anchor there reaches code or tracked prose). **W1, W2, W3 and W4 are ✅** (increments AB, AC, AD and AE). **W5** (interception and hosts honesty: a `bind()` redirect + block-with-EDE, a hosts-file serve adapter, and client-side hosts consultation that *says so* — the increment that finally fills the `hosts`/`policy` provenance placeholders W2's `lookup()` left honest-empty) is next; the composition tier now has all three client/server nouns named (`lookup`, `Stub`, `Forwarder`) plus the `RouteTable`, each a pure composition over shipped core |
 | Lint / types | `ruff check` + `ruff format --check` clean; `mypy namespy` exits 0 |
 | CI | `ci.yml` (lint, 3.12/3.13 × Ubuntu/Windows, `-O` run, distribution audit), `security.yml` (CodeQL security-extended, dependency-review, pip-audit), `socket.yml` (Socket.dev firewall on installs) — all green on `master` |
 | Release | `release.yml` wired end-to-end: tag → build → attest → trusted-publish to PyPI → GitHub Release. **One manual step away — see checklist below.** |
@@ -180,7 +180,52 @@ cd D:\code\namespy
 - `SqliteDnsCache` does synchronous disk I/O on the event loop (latency, not
   correctness); a live-network test tier would lift `resolver.py` coverage.
 
-## Latest round: the route table (roadmap W3, increment AD)
+## Latest round: the forwarder, named (roadmap W4, increment AE)
+
+`namespy/apps/forwarder.py` turns the forwarding server that had only ever existed
+inside `__main__`'s `serve()` body into an embeddable handle — `Forwarder(upstreams,
+listen=..., serve_tcp=True)` with `serve()` → `.stop()`/`.stats()`. This is the
+composability proof `docs/strategy.md` stakes the third horizon on: **zero new core
+code.** It assembles a `DnsServer` whose forwarder rung answers every query via a
+`StubResolver` before recursion — the stub owns the walk-upstream behavior, the
+server owns the relay (client ID and question echoed, `AA` cleared, silence answered
+with RFC 8914's EDE 22 "No Reachable Authority") — plus the BCP 235 TCP listener.
+
+**The reuse trick, and why it needed no core change.** `DnsServer`'s forwarder is
+configured through `dot_upstreams`, but the constructor forces the `dot` transport
+only on *text* it parses — a non-string `Upstream` passes through unchanged. So
+`Forwarder` hands the server pre-built `Upstream` objects and the *same* relay speaks
+the stub's whole udp/tcp/dot/doh range. `DnsServer` also type-checks for a
+`RecursiveResolver` as its last-resort rung; in forwarding mode the forwarder answers
+first and that resolver never walks, but it is constructed because the check asks —
+recorded in the docstring rather than hidden.
+
+**`stats()` without inventing core counters.** The server keeps no counters, and
+adding any would be new core code, so `Forwarder` always attaches an in-memory
+`QueryLog` sink (a stdlib file-like) and summarizes the `origin` rungs the log already
+writes — `served`, `by_origin`, `servfail`. No counter field, no core change.
+
+**The test-shape trap.** Driving the composed server means binding a real
+`DnsServer`/`RecursiveResolver` onto fake transports (`test_cli.py`'s endpoint-patch
+pattern), then awaiting `respond_to_packet` directly on the engine loop — the v6
+bring-up factory returns a sink (it is neither `DnsServer` nor `RecursiveResolver`).
+The relay reads `response.RCODE` on the way to its debug log, so a canned answer must
+carry it; and the EDE option is an `EdnsOption` whose info code is `data[:2]`, not a
+named field — asserted by decoding, not by inventing an attribute.
+
+- **Files:** `namespy/apps/forwarder.py` (new), `tests/test_apps_forwarder.py` (new,
+  11 tests), `namespy/apps/__init__.py` (export), `README.md` (a `Forwarder` example
+  beside the `Stub`/`RouteTable` ones), `docs/roadmap.md` (W4 ✅, four of ten shipped),
+  `CHANGELOG.md` (W4 entry). `docs/rfc-map.md` gained no row (composition only — the
+  W1/W2/W3 precedent).
+- **Checks:** 2009 passed, 6 skipped in the local env (was 1998) and clean under
+  `-O`; the W4 tests bind no socket and open no port. ruff clean across `namespy` and
+  `tests`; `mypy namespy` Success (40 files, was 39); forwarder 88% in isolation,
+  floor met without weakening a test for a branch.
+- **CI:** the branch line below follows the push — the W4 suite count is asserted
+  against this environment and confirmed by CI on push.
+
+## An earlier round: the route table (roadmap W3, increment AD)
 
 Shipped: the third row of the third horizon, and the second noun the survey called
 load-bearing. `namespy/apps/routing.py` is conditional forwarding -- dnsmasq's

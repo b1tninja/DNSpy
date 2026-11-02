@@ -188,7 +188,21 @@ print(decision.route.zone, decision.exclusive)  # internal.example  True  (defau
 print(table.route("example.com").upstreams)  # 1.1.1.1 — only the general path matched
 ```
 
-Underneath both, the machinery is explicit. `RecursiveResolver` is an `asyncio.Protocol`: it owns a datagram endpoint and you
+To run that table as a server, `namespy.apps.Forwarder` is the named composition —
+a `DnsServer` front relaying to a `StubResolver` (client ID and question echoed,
+`AA` cleared, silence answered with EDE 22), over UDP and TCP, with zero new core
+code. It is the same objects, now an embeddable handle:
+
+```python
+from namespy.apps import Forwarder
+
+fwd = Forwarder(["1.1.1.1", "9.9.9.9"])   # forwards everything to these recursors
+fwd.serve()                                # binds 127.0.0.1:53 (UDP + TCP)
+print(fwd.stats())                         # {'served': n, 'by_origin': {'forward': n}, 'servfail': 0}
+fwd.stop()
+```
+
+Underneath all of them, the machinery is explicit. `RecursiveResolver` is an `asyncio.Protocol`: it owns a datagram endpoint and you
 await `resolve()`.
 
 ```python

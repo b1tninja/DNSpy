@@ -23,6 +23,10 @@ The facades that ship so far:
 * :class:`namespy.apps.routing.RouteTable` (W3) -- conditional forwarding: a
   longest-suffix table of ``zone -> upstreams`` where a zone match excludes the
   general path, the one noun every production resolver grew and no RFC defines.
+* :class:`namespy.apps.forwarder.Forwarder` (W4) -- a named forwarding-server
+  handle (``serve`` / ``stop`` / ``stats``) that composes ``DnsServer``'s relay and
+  ``StubResolver``'s upstream walk with zero new core code -- the composability
+  proof the strategy rests on.
 
 None of them touches the network at import time, and none resolves a name for you
 that you did not ask about: the list of servers still arrives from outside, which
@@ -31,11 +35,13 @@ is the stub's stance since RFC 1034 section 5.3.1.
 
 from __future__ import annotations
 
+from .forwarder import Forwarder
 from .lookup import LookupResult, Provenance, lookup
 from .routing import Route, RouteTable, RoutingDecision
 from .stub import Stub
 
 __all__ = [
+    "Forwarder",
     "LookupResult",
     "Provenance",
     "Route",

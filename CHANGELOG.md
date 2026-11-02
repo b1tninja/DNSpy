@@ -31,6 +31,24 @@ nothing has been tagged or published yet, so `master` is the only version.
 
 ### Added
 
+- **The forwarder, named (roadmap W4, increment AE).** `namespy/apps/forwarder.py`
+  turns the forwarding server that only lived inside `__main__`'s `serve()` body
+  into an embeddable handle — `Forwarder(upstreams, listen=..., serve_tcp=True)`
+  with `serve()` → `.stop()`/`.stats()`. It is the composability proof
+  `docs/strategy.md` stakes the tier on: **zero new core code.** It assembles a
+  `DnsServer` whose forwarder rung answers every query via a `StubResolver` before
+  recursion (the stub owns the walk-upstream behavior; the server owns the relay —
+  client ID and question echoed, `AA` cleared, silence answered with RFC 8914's EDE
+  22 "No Reachable Authority"), plus the BCP 235 TCP listener. The reuse trick that
+  keeps it honest: `DnsServer`'s `dot_upstreams` forces the `dot` transport only on
+  text it parses, so `Forwarder` hands it pre-built `Upstream` objects and the same
+  relay speaks the stub's whole udp/tcp/dot/doh range; the recursive resolver the
+  constructor type-checks for is the last-resort rung the forwarder never reaches.
+  `stats()` reads an always-attached in-memory `QueryLog` sink rather than adding
+  counters the server does not have. No new RFC anchor, so `rfc-map.md` gained
+  nothing (the W1/W2/W3 precedent). 11 tests, `tests/test_apps_forwarder.py`; full
+  suite 2009 passed, 6 skipped, clean under `-O`.
+
 - **The route table: conditional forwarding (roadmap W3, increment AD).**
   `namespy/apps/routing.py` names the one noun every production resolver grew and
   no RFC defines — dnsmasq's `--server=/zone/ip` family, so the module is
