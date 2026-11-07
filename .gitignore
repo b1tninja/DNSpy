@@ -13,6 +13,7 @@ last_resolution.md
 # Editor/agent scratch. Plans and workspace state are local working notes, not
 # project history; committing them made diffs noisy and conflicted constantly.
 .cursor/
+.continue/
 .vscode/
 .idea/
 

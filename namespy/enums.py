@@ -257,7 +257,7 @@ class DnsRType(_TypeMixin, IntEnum):
     DHCID = 49  # RFC 4701
     NSEC3 = 50  # RFC 5155 section 3
     NSEC3PARAM = 51  # RFC 5155 section 4
-    TLSA = 52  # RFC 6698 section 3
+    TLSA = 52  # RFC 6698 section 7.1
     SMIMEA = 53  # RFC 8162 -- was listed as unassigned here
     HIP = 55  # RFC 8005
     NINFO = 56
