@@ -144,9 +144,10 @@ jobs:
           path: dist/
       # The GitHub Release is the human-facing artifact page, and it only
       # appears after PyPI accepted the files: a failed publish leaves no
-      # half-release pointing at binaries that are not on PyPI.
+      # half-release pointing at binaries that are not on PyPI. This job has no
+      # checkout, so gh cannot infer the repository from .git: name it.
       - name: Publish the release
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
 
